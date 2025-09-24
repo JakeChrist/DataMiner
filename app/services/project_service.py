@@ -250,6 +250,95 @@ class ProjectService(QObject):
         self._config.save(data)
 
     # ------------------------------------------------------------------
+    # Corpus root helpers
+    def list_corpus_roots(self, project_id: int) -> list[str]:
+        """Return a list of indexed corpus root folders for ``project_id``."""
+
+        data = self._config.load()
+        if not isinstance(data, dict):
+            return []
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            return []
+        corpus = projects.get("corpus_roots")
+        if not isinstance(corpus, dict):
+            return []
+        roots = corpus.get(str(project_id))
+        if not isinstance(roots, list):
+            return []
+        normalized: list[str] = []
+        for entry in roots:
+            if not isinstance(entry, str):
+                continue
+            normalized.append(str(Path(entry).resolve()))
+        return normalized
+
+    def add_corpus_root(self, project_id: int, path: str | Path) -> None:
+        """Persist ``path`` as an indexed corpus root for ``project_id``."""
+
+        normalized = str(Path(path).resolve())
+        with self._lock:
+            data = self._config.load()
+            if not isinstance(data, dict):
+                data = {}
+            projects = data.setdefault("projects", {})
+            if not isinstance(projects, dict):
+                projects = {}
+                data["projects"] = projects
+            corpus = projects.setdefault("corpus_roots", {})
+            if not isinstance(corpus, dict):
+                corpus = {}
+                projects["corpus_roots"] = corpus
+            roots = corpus.setdefault(str(project_id), [])
+            if not isinstance(roots, list):
+                roots = []
+                corpus[str(project_id)] = roots
+            if normalized not in roots:
+                roots.append(normalized)
+            self._config.save(data)
+
+    def remove_corpus_root(self, project_id: int, path: str | Path) -> None:
+        """Remove ``path`` from the stored corpus roots for ``project_id``."""
+
+        normalized = str(Path(path).resolve())
+        with self._lock:
+            data = self._config.load()
+            if not isinstance(data, dict):
+                return
+            projects = data.get("projects")
+            if not isinstance(projects, dict):
+                return
+            corpus = projects.get("corpus_roots")
+            if not isinstance(corpus, dict):
+                return
+            roots = corpus.get(str(project_id))
+            if not isinstance(roots, list):
+                return
+            filtered = [root for root in roots if isinstance(root, str) and str(Path(root).resolve()) != normalized]
+            if filtered:
+                corpus[str(project_id)] = filtered
+            else:
+                corpus.pop(str(project_id), None)
+            self._config.save(data)
+
+    def clear_corpus_roots(self, project_id: int) -> None:
+        """Remove all stored corpus roots for ``project_id``."""
+
+        with self._lock:
+            data = self._config.load()
+            if not isinstance(data, dict):
+                return
+            projects = data.get("projects")
+            if not isinstance(projects, dict):
+                return
+            corpus = projects.get("corpus_roots")
+            if not isinstance(corpus, dict):
+                return
+            if str(project_id) in corpus:
+                corpus.pop(str(project_id), None)
+                self._config.save(data)
+
+    # ------------------------------------------------------------------
     # Internal helpers
     def _ensure_default_project(self) -> None:
         if self.projects.list():
@@ -300,9 +389,16 @@ class ProjectService(QObject):
         projects = data.get("projects")
         if not isinstance(projects, dict):
             return
+        modified = False
         conversation = projects.get("conversation")
         if isinstance(conversation, dict) and str(project_id) in conversation:
             conversation.pop(str(project_id), None)
+            modified = True
+        corpus = projects.get("corpus_roots")
+        if isinstance(corpus, dict) and str(project_id) in corpus:
+            corpus.pop(str(project_id), None)
+            modified = True
+        if modified:
             self._config.save(data)
 
     def _project_storage_dir(self, project_id: int) -> Path:

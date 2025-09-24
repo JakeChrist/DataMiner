@@ -14,7 +14,7 @@ pytest.importorskip(
 )
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtWidgets import QApplication, QSplitter
+from PyQt6.QtWidgets import QApplication, QSplitter, QPushButton
 
 from app.config import ConfigManager
 from app.services.conversation_manager import ReasoningVerbosity
@@ -152,6 +152,11 @@ def test_main_window_splitter_layout(qt_app, tmp_path, monkeypatch, project_serv
     assert sum(sizes) > 0
     assert sizes[1] >= sizes[0]
     assert sizes[1] >= sizes[2]
+    index_button = window.findChild(QPushButton, "indexFolderButton")
+    assert index_button is not None
+    rescan_button = window.findChild(QPushButton, "rescanCorpusButton")
+    assert rescan_button is not None
+    assert not rescan_button.isEnabled()
     window.close()
 
 

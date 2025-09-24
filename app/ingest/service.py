@@ -14,6 +14,7 @@ from app.ingest.parsers import ParserError, parse_file
 from app.storage import (
     BackgroundTaskLogRepository,
     DatabaseManager,
+    DocumentRepository,
     IngestDocumentRepository,
 )
 
@@ -87,6 +88,7 @@ class IngestService:
         self.db = db
         self.repo = BackgroundTaskLogRepository(db)
         self.documents = IngestDocumentRepository(db)
+        self.project_documents = DocumentRepository(db)
         self._queue: "queue.Queue[Optional[int]]" = queue.Queue()
         self._jobs: dict[int, IngestJob] = {}
         self._jobs_lock = threading.RLock()
@@ -572,6 +574,7 @@ class IngestService:
         job.summary["errors"] = job.errors
         job.state.pop("known_files_snapshot", None)
         job.state["processed_files"] = []
+        self._sync_project_documents(job)
         self._persist(job, status=TaskStatus.COMPLETED, completed=True)
 
     def _check_pause_cancel(self, job: IngestJob) -> None:
@@ -610,6 +613,86 @@ class IngestService:
             "summary": dict(job.summary),
             "state": self._serialize_state(job.state),
         }
+
+    def _sync_project_documents(self, job: IngestJob) -> None:
+        project_id = job.params.get("project_id")
+        if not isinstance(project_id, int):
+            return
+
+        repo = self.project_documents
+        try:
+            connection = repo.db.connect()
+            project_exists = connection.execute(
+                "SELECT 1 FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if project_exists is None:
+                return
+            existing_docs = {
+                str(Path(doc["source_path"]).resolve()): doc
+                for doc in repo.list_for_project(project_id)
+                if doc.get("source_path")
+            }
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        known_files_param = job.summary.get("known_files", {})
+        if not isinstance(known_files_param, dict):
+            known_files_param = {}
+
+        normalized_known: dict[str, dict[str, Any]] = {}
+        for path, metadata in known_files_param.items():
+            if not isinstance(path, str):
+                continue
+            normalized_path = str(Path(path).resolve())
+            data = dict(metadata) if isinstance(metadata, dict) else {}
+            normalized_known[normalized_path] = data
+            document = existing_docs.get(normalized_path)
+            payload = {"file": data}
+            if document is None:
+                title = Path(normalized_path).stem or Path(normalized_path).name
+                try:
+                    repo.create(
+                        project_id,
+                        title,
+                        source_type="file",
+                        source_path=normalized_path,
+                        metadata=payload,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    continue
+            else:
+                updates: dict[str, Any] = {}
+                if document.get("source_path") != normalized_path:
+                    updates["source_path"] = normalized_path
+                current_meta = document.get("metadata") or {}
+                if current_meta.get("file") != data:
+                    updates["metadata"] = payload
+                if updates:
+                    try:
+                        repo.update(document["id"], **updates)
+                    except Exception:  # pragma: no cover - defensive
+                        continue
+
+        removed_paths: set[str] = set()
+        removed = job.summary.get("removed")
+        if isinstance(removed, (list, tuple, set)):
+            for entry in removed:
+                if not isinstance(entry, str):
+                    continue
+                removed_paths.add(str(Path(entry).resolve()))
+
+        if removed_paths:
+            for document in repo.list_for_project(project_id):
+                source_path = document.get("source_path")
+                if not source_path:
+                    continue
+                normalized = str(Path(source_path).resolve())
+                if normalized in removed_paths:
+                    try:
+                        repo.delete(document["id"])
+                    except Exception:  # pragma: no cover - defensive
+                        continue
 
     @staticmethod
     def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:

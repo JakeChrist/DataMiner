@@ -13,7 +13,12 @@ if str(ROOT) not in sys.path:
 import pytest
 
 from app.ingest.service import IngestService, TaskStatus
-from app.storage import DatabaseManager, IngestDocumentRepository
+from app.storage import (
+    DatabaseManager,
+    DocumentRepository,
+    IngestDocumentRepository,
+    ProjectRepository,
+)
 
 
 @pytest.fixture()
@@ -77,6 +82,36 @@ def test_folder_crawl_tracks_progress_and_summary(tmp_path: Path, db_manager: Da
     assert stored["preview"].startswith("alpha")
     assert stored["needs_ocr"] is False
     assert any(status == TaskStatus.COMPLETED for _, status in updates)
+
+    service.shutdown()
+
+
+def test_completed_job_populates_document_repository(
+    tmp_path: Path, db_manager: DatabaseManager
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    tracked = root / "tracked.txt"
+    payload = "indexed payload"
+    tracked.write_text(payload, encoding="utf-8")
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    projects = ProjectRepository(db_manager)
+    project = projects.create("Test Project")
+    project_id = int(project["id"])
+    job_id = service.queue_folder_crawl(project_id, root, include=["*.txt"])
+    assert service.wait_for_completion(job_id, timeout=5.0)
+
+    repo = DocumentRepository(db_manager)
+    documents = repo.list_for_project(project_id)
+    assert len(documents) == 1
+    document = documents[0]
+    assert document["source_path"] == str(tracked.resolve())
+    assert document["metadata"]["file"]["size"] == tracked.stat().st_size
+
+    remove_job = service.queue_remove(project_id, root, [tracked])
+    assert service.wait_for_completion(remove_job, timeout=5.0)
+    assert repo.list_for_project(project_id) == []
 
     service.shutdown()
 

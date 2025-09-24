@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import threading
 from functools import partial
 from importlib import metadata
-from typing import Callable
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
 from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -20,43 +22,29 @@ from PyQt6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QProgressBar,
-    QPushButton,
     QShortcut,
     QSplitter,
     QStatusBar,
     QTextBrowser,
-    QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
+from ..services.conversation_manager import (
+    ConnectionState,
+    ConversationManager,
+    ConversationTurn,
+    LMStudioError,
+    ReasoningVerbosity,
+    ResponseMode,
+)
+from ..services.conversation_settings import ConversationSettings
 from ..services.lmstudio_client import LMStudioClient
 from ..services.progress_service import ProgressService, ProgressUpdate
 from ..services.settings_service import SettingsService
-
-
-class ChatInput(QTextEdit):
-    """Text edit that emits a signal when the user submits a message."""
-
-    def __init__(self, on_send: Callable[[str], None], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._on_send = on_send
-        self.setPlaceholderText("Type your question...")
-        self.setAcceptRichText(False)
-
-    def keyPressEvent(self, event) -> None:  # type: ignore[override]
-        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                super().keyPressEvent(event)
-                return
-            text = self.toPlainText().strip()
-            if text:
-                self._on_send(text)
-                self.clear()
-            event.accept()
-            return
-        super().keyPressEvent(event)
+from .answer_view import AnswerView
+from .question_input_widget import QuestionInputWidget
 
 
 class ToastWidget(QFrame):
@@ -136,6 +124,12 @@ class MainWindow(QMainWindow):
         self._create_actions()
         self._create_menus_and_toolbar()
         self._create_status_bar()
+        self.conversation_settings = ConversationSettings()
+        self._conversation_manager = ConversationManager(self.lmstudio_client)
+        self._turns: list[ConversationTurn] = []
+        self._connection_unsubscribe = self._conversation_manager.add_connection_listener(
+            self._on_connection_state_changed
+        )
         self._create_layout()
         self._connect_services()
         self._toast = ToastWidget(self)
@@ -161,9 +155,6 @@ class MainWindow(QMainWindow):
 
         self.toggle_theme_action = QAction("Toggle Theme", self)
         self.toggle_theme_action.triggered.connect(self.settings_service.toggle_theme)
-
-        self.send_button = QPushButton("Send", self)
-        self.send_button.clicked.connect(self._handle_send)
 
     def _create_menus_and_toolbar(self) -> None:
         menubar = QMenuBar(self)
@@ -216,25 +207,26 @@ class MainWindow(QMainWindow):
         self._corpus_list.addItems(["All Documents", "Recent", "Favorites"])
         splitter.addWidget(self._corpus_list)
 
-        # Center panel - chat conversation
+        # Center panel - conversation and controls
         chat_panel = QWidget(splitter)
         chat_layout = QVBoxLayout(chat_panel)
         chat_layout.setContentsMargins(8, 8, 8, 8)
         chat_layout.setSpacing(8)
-        self._chat_log = QTextBrowser(chat_panel)
-        self._chat_log.setObjectName("chatArea")
-        self._chat_log.setOpenLinks(False)
-        self._chat_log.setPlaceholderText("Conversation will appear here.")
-        chat_layout.addWidget(self._chat_log, 1)
 
-        input_container = QFrame(chat_panel)
-        input_layout = QHBoxLayout(input_container)
-        input_layout.setContentsMargins(0, 0, 0, 0)
-        input_layout.setSpacing(6)
-        self._chat_input = ChatInput(self._handle_send, input_container)
-        input_layout.addWidget(self._chat_input, 1)
-        input_layout.addWidget(self.send_button)
-        chat_layout.addWidget(input_container)
+        self.answer_view = AnswerView(
+            settings=self.conversation_settings,
+            progress_service=self.progress_service,
+            parent=chat_panel,
+        )
+        self.answer_view.setObjectName("answerView")
+        chat_layout.addWidget(self.answer_view, 1)
+
+        self._controls_frame = self._create_conversation_controls(chat_panel)
+        chat_layout.addWidget(self._controls_frame)
+
+        self.question_input = QuestionInputWidget(chat_panel)
+        self.question_input.ask_requested.connect(self._handle_ask)
+        chat_layout.addWidget(self.question_input)
         splitter.addWidget(chat_panel)
 
         # Right panel - evidence viewer
@@ -253,6 +245,56 @@ class MainWindow(QMainWindow):
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_corpus)
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self._copy_chat_text)
+        self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+    def _create_conversation_controls(self, parent: QWidget) -> QFrame:
+        frame = QFrame(parent)
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        reasoning_label = QLabel("Reasoning:", frame)
+        layout.addWidget(reasoning_label)
+
+        self._verbosity_combo = QComboBox(frame)
+        for option in ReasoningVerbosity:
+            self._verbosity_combo.addItem(option.name.title(), userData=option)
+        index = self._verbosity_combo.findData(self.conversation_settings.reasoning_verbosity)
+        if index >= 0:
+            self._verbosity_combo.setCurrentIndex(index)
+        self._verbosity_combo.currentIndexChanged.connect(self._on_reasoning_verbosity_changed)
+        layout.addWidget(self._verbosity_combo)
+
+        self._plan_checkbox = QCheckBox("Show plan", frame)
+        self._plan_checkbox.setObjectName("togglePlan")
+        self._plan_checkbox.setChecked(self.conversation_settings.show_plan)
+        self._plan_checkbox.toggled.connect(self.conversation_settings.set_show_plan)
+        layout.addWidget(self._plan_checkbox)
+
+        self._assumptions_checkbox = QCheckBox("Show assumptions", frame)
+        self._assumptions_checkbox.setObjectName("toggleAssumptions")
+        self._assumptions_checkbox.setChecked(self.conversation_settings.show_assumptions)
+        self._assumptions_checkbox.toggled.connect(self.conversation_settings.set_show_assumptions)
+        layout.addWidget(self._assumptions_checkbox)
+
+        layout.addStretch(1)
+
+        self._sources_only_checkbox = QCheckBox("Sources only", frame)
+        self._sources_only_checkbox.setObjectName("toggleSourcesOnly")
+        self._sources_only_checkbox.setChecked(self.conversation_settings.sources_only_mode)
+        self._sources_only_checkbox.toggled.connect(self._on_sources_only_toggled)
+        layout.addWidget(self._sources_only_checkbox)
+
+        self.conversation_settings.reasoning_verbosity_changed.connect(self._sync_reasoning_combo)
+        self.conversation_settings.show_plan_changed.connect(self._sync_plan_checkbox)
+        self.conversation_settings.show_assumptions_changed.connect(
+            self._sync_assumptions_checkbox
+        )
+        self.conversation_settings.sources_only_mode_changed.connect(
+            self._sync_sources_checkbox
+        )
+
+        return frame
 
     # ------------------------------------------------------------------
     def _connect_services(self) -> None:
@@ -263,26 +305,120 @@ class MainWindow(QMainWindow):
         self.progress_service.progress_finished.connect(self._on_progress_finished)
         self.progress_service.toast_requested.connect(self._show_toast)
 
+    def _on_reasoning_verbosity_changed(self, index: int) -> None:
+        data = self._verbosity_combo.itemData(index)
+        if isinstance(data, ReasoningVerbosity):
+            self.conversation_settings.set_reasoning_verbosity(data)
+
+    def _sync_reasoning_combo(self, verbosity: ReasoningVerbosity) -> None:
+        index = self._verbosity_combo.findData(verbosity)
+        if index >= 0 and index != self._verbosity_combo.currentIndex():
+            self._verbosity_combo.blockSignals(True)
+            self._verbosity_combo.setCurrentIndex(index)
+            self._verbosity_combo.blockSignals(False)
+
+    def _sync_plan_checkbox(self, enabled: bool) -> None:
+        if self._plan_checkbox.isChecked() != enabled:
+            self._plan_checkbox.blockSignals(True)
+            self._plan_checkbox.setChecked(enabled)
+            self._plan_checkbox.blockSignals(False)
+
+    def _sync_assumptions_checkbox(self, enabled: bool) -> None:
+        if self._assumptions_checkbox.isChecked() != enabled:
+            self._assumptions_checkbox.blockSignals(True)
+            self._assumptions_checkbox.setChecked(enabled)
+            self._assumptions_checkbox.blockSignals(False)
+
+    def _on_sources_only_toggled(self, enabled: bool) -> None:
+        self.conversation_settings.set_sources_only_mode(enabled)
+
+    def _sync_sources_checkbox(self, enabled: bool) -> None:
+        if self._sources_only_checkbox.isChecked() != enabled:
+            self._sources_only_checkbox.blockSignals(True)
+            self._sources_only_checkbox.setChecked(enabled)
+            self._sources_only_checkbox.blockSignals(False)
+
     # ------------------------------------------------------------------
-    def _handle_send(self, text: str | None = None) -> None:
-        text = text or self._chat_input.toPlainText().strip()
-        if not text:
+    def _handle_ask(self, text: str) -> None:
+        if not text.strip():
             return
-        self._chat_log.append(f"<b>You:</b> {text}")
-        self._chat_input.clear()
-        self.progress_service.start("chat-send", "Sending message...")
-        self.progress_service.notify("Message queued", level="info")
-        QTimer.singleShot(400, lambda: self.progress_service.finish("chat-send", "Message sent"))
+
+        state = self._conversation_manager.connection_state
+        if not state.connected:
+            self._update_question_prerequisites(state)
+            self.progress_service.notify(
+                state.message or "LMStudio is unavailable.", level="error", duration_ms=4000
+            )
+            return
+
+        self.question_input.set_busy(True)
+        self.progress_service.start("chat-send", "Submitting question...")
+        asked_at = datetime.now()
+        try:
+            turn = self._conversation_manager.ask(
+                text,
+                reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
+                response_mode=self.conversation_settings.response_mode,
+            )
+        except LMStudioError as exc:
+            self.progress_service.finish("chat-send", "Send failed")
+            self.progress_service.notify(str(exc) or "Failed to contact LMStudio", level="error")
+            self.question_input.set_busy(False)
+            self._update_question_prerequisites(self._conversation_manager.connection_state)
+            return
+
+        answered_at = datetime.now()
+        turn.asked_at = asked_at
+        turn.answered_at = answered_at
+        turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
+        turn.token_usage = self._extract_token_usage(turn)
+        self._turns.append(turn)
+        self.answer_view.add_turn(turn)
+        self._update_evidence_panel(turn)
+        self.progress_service.finish("chat-send", "Answer received")
+        self.question_input.set_busy(False)
+        self._update_question_prerequisites(self._conversation_manager.connection_state)
 
     def _focus_corpus(self) -> None:
         self._corpus_list.setFocus()
 
     def _copy_chat_text(self) -> None:
-        selected = self._chat_log.textCursor().selectedText()
-        if not selected:
-            selected = self._chat_log.toPlainText()
-        QApplication.clipboard().setText(selected)
-        self.progress_service.notify("Chat copied to clipboard", level="info", duration_ms=2000)
+        text = self.answer_view.to_plain_text()
+        QApplication.clipboard().setText(text)
+        self.progress_service.notify("Conversation copied", level="info", duration_ms=2000)
+
+    def _extract_token_usage(self, turn: ConversationTurn) -> dict[str, int] | None:
+        raw = turn.raw_response if isinstance(turn.raw_response, dict) else None
+        usage = raw.get("usage") if raw else None
+        if not isinstance(usage, dict):
+            return None
+        parsed: dict[str, int] = {}
+        for key, value in usage.items():
+            try:
+                parsed[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return parsed or None
+
+    def _update_evidence_panel(self, turn: ConversationTurn) -> None:
+        if not turn.citations:
+            self._evidence_panel.setPlainText("No citations provided.")
+            return
+        lines = []
+        for index, citation in enumerate(turn.citations, start=1):
+            lines.append(f"{index}. {citation}")
+        self._evidence_panel.setPlainText("\n".join(lines))
+
+    def _update_question_prerequisites(self, state: ConnectionState) -> None:
+        message = state.message if not state.connected else None
+        self.question_input.set_prerequisites_met(state.connected, message)
+
+    def _on_connection_state_changed(self, state: ConnectionState) -> None:
+        text = "LMStudio: Connected" if state.connected else "LMStudio: Offline"
+        self._lmstudio_indicator.setText(text)
+        if state.message:
+            self.statusBar().showMessage(state.message, 4000)
+        self._update_question_prerequisites(state)
 
     # ------------------------------------------------------------------
     def _open_settings(self) -> None:
@@ -350,6 +486,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         if hasattr(self, "_health_timer"):
             self._health_timer.stop()
+        unsubscribe = getattr(self, "_connection_unsubscribe", None)
+        if callable(unsubscribe):
+            try:
+                unsubscribe()
+            except Exception:
+                pass
         return super().closeEvent(event)
 
 

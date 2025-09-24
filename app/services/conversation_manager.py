@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -112,6 +113,11 @@ class ConversationTurn:
     reasoning: dict[str, Any] | None = None
     reasoning_artifacts: ReasoningArtifacts | None = None
     response_mode: ResponseMode = ResponseMode.GENERATIVE
+    asked_at: datetime | None = None
+    answered_at: datetime | None = None
+    latency_ms: int | None = None
+    token_usage: dict[str, int] | None = None
+    raw_response: dict[str, Any] | None = None
 
     @property
     def reasoning_bullets(self) -> list[str]:
@@ -247,6 +253,7 @@ class ConversationManager:
             reasoning=response.reasoning,
             reasoning_artifacts=artifacts,
             response_mode=response_mode,
+            raw_response=response.raw_response,
         )
         self.turns.append(turn)
         return turn

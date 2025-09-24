@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMenuBar,
     QMessageBox,
+    QPushButton,
     QProgressBar,
     QSplitter,
     QStatusBar,
@@ -159,6 +160,7 @@ class MainWindow(QMainWindow):
         self._active_card: TurnCardWidget | None = None
         self._has_documents: bool = False
         self._toast = ToastWidget(self)
+        self._rescan_button: QPushButton | None = None
         self._create_layout()
         self._connect_services()
         self.settings_service.apply_theme()
@@ -311,12 +313,47 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         root_layout.addWidget(splitter)
 
-        # Left panel - corpus selector
-        self._corpus_tree = QTreeWidget(splitter)
+        # Left panel - corpus selector and ingest controls
+        corpus_panel = QWidget(splitter)
+        corpus_layout = QVBoxLayout(corpus_panel)
+        corpus_layout.setContentsMargins(8, 8, 8, 8)
+        corpus_layout.setSpacing(8)
+
+        controls_frame = QFrame(corpus_panel)
+        controls_frame.setObjectName("corpusControls")
+        controls_layout = QVBoxLayout(controls_frame)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+
+        controls_label = QLabel("Document corpus", controls_frame)
+        controls_label.setObjectName("corpusLabel")
+        controls_layout.addWidget(controls_label)
+
+        add_folder_button = QPushButton("Index Folder…", controls_frame)
+        add_folder_button.setObjectName("indexFolderButton")
+        add_folder_button.clicked.connect(lambda: self.add_folder_action.trigger())
+        controls_layout.addWidget(add_folder_button)
+
+        add_files_button = QPushButton("Index Files…", controls_frame)
+        add_files_button.setObjectName("indexFilesButton")
+        add_files_button.clicked.connect(lambda: self.add_files_action.trigger())
+        controls_layout.addWidget(add_files_button)
+
+        self._rescan_button = QPushButton("Rescan Indexed Folders", controls_frame)
+        self._rescan_button.setObjectName("rescanCorpusButton")
+        self._rescan_button.setEnabled(False)
+        self._rescan_button.clicked.connect(lambda: self.rescan_corpus_action.trigger())
+        controls_layout.addWidget(self._rescan_button)
+
+        controls_layout.addStretch(1)
+        corpus_layout.addWidget(controls_frame)
+
+        self._corpus_tree = QTreeWidget(corpus_panel)
         self._corpus_tree.setObjectName("corpusSelector")
         self._corpus_tree.setHeaderHidden(True)
         self._corpus_tree.setIndentation(16)
-        splitter.addWidget(self._corpus_tree)
+        corpus_layout.addWidget(self._corpus_tree, 1)
+        splitter.addWidget(corpus_panel)
 
         # Center panel - conversation and controls
         chat_panel = QWidget(splitter)
@@ -806,9 +843,13 @@ class MainWindow(QMainWindow):
             project_id = self.project_service.active_project_id
         except RuntimeError:
             self.rescan_corpus_action.setEnabled(False)
+            if self._rescan_button is not None:
+                self._rescan_button.setEnabled(False)
             return
         roots = self.project_service.list_corpus_roots(project_id)
         self.rescan_corpus_action.setEnabled(bool(roots))
+        if self._rescan_button is not None:
+            self._rescan_button.setEnabled(bool(roots))
 
     def _prompt_new_project(self) -> None:
         name, ok = QInputDialog.getText(

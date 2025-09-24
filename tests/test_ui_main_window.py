@@ -17,6 +17,7 @@ from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import QApplication, QSplitter, QPushButton
 
 from app.config import ConfigManager
+from app.ingest.parsers import SUPPORTED_PATTERNS
 from app.services.conversation_manager import ReasoningVerbosity
 from app.services.progress_service import ProgressService
 from app.services.settings_service import SettingsService
@@ -158,6 +159,34 @@ def test_main_window_splitter_layout(qt_app, tmp_path, monkeypatch, project_serv
     assert rescan_button is not None
     assert not rescan_button.isEnabled()
     window.close()
+
+
+def test_main_window_ingest_patterns_match_parsers(
+    qt_app, tmp_path, monkeypatch, project_service
+) -> None:
+    settings_service = build_settings_service(tmp_path, monkeypatch)
+    progress_service = ProgressService()
+    lmstudio_client = LMStudioClient()
+    export_service = ExportService()
+    backup_service = BackupService(project_service)
+    window = MainWindow(
+        settings_service=settings_service,
+        progress_service=progress_service,
+        lmstudio_client=lmstudio_client,
+        project_service=project_service,
+        export_service=export_service,
+        backup_service=backup_service,
+        enable_health_monitor=False,
+    )
+    try:
+        patterns = window._ingest_include_patterns()
+        assert patterns == list(SUPPORTED_PATTERNS)
+
+        filter_spec = window._ingest_file_filter_spec()
+        for pattern in SUPPORTED_PATTERNS:
+            assert pattern in filter_spec
+    finally:
+        window.close()
 
 
 def test_settings_persist_theme_and_font(tmp_path, monkeypatch):

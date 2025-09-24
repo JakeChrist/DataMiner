@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..ingest.parsers import SUPPORTED_PATTERNS
 from ..ingest.service import IngestService, TaskStatus
 from ..retrieval import SearchService
 from ..services.conversation_manager import (
@@ -548,7 +549,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Corpus management
     def _ingest_include_patterns(self) -> list[str]:
-        return ["*.pdf", "*.docx", "*.txt", "*.text", "*.md", "*.markdown", "*.mkd"]
+        return list(SUPPORTED_PATTERNS)
+
+    def _ingest_file_filter_spec(self) -> str:
+        patterns = " ".join(self._ingest_include_patterns())
+        return f"Documents ({patterns});;All Files (*)"
 
     def _add_folder_to_corpus(self, _checked: bool = False) -> None:
         project = self.project_service.active_project()
@@ -589,9 +594,7 @@ class MainWindow(QMainWindow):
 
     def _add_files_to_corpus(self, _checked: bool = False) -> None:
         project = self.project_service.active_project()
-        filter_spec = (
-            "Documents (*.pdf *.docx *.txt *.text *.md *.markdown *.mkd);;All Files (*)"
-        )
+        filter_spec = self._ingest_file_filter_spec()
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Files to Index",

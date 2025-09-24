@@ -43,8 +43,9 @@ Use the File → Corpus menu (or the toolbar shortcut) to load sources into the
 active project:
 
 1. Choose **Add Folder to Corpus…** to select an entire directory. All
-   supported files (`.pdf`, `.docx`, `.txt`, `.md`) inside the folder are queued
-   for background indexing.
+   supported files (`.pdf`, `.docx`, `.txt/.text`, `.md/.markdown/.mkd`,
+   `.html/.htm`, `.py/.pyw`, `.m`, `.cpp`) inside the folder are queued for
+   background indexing.
 2. Choose **Add Files to Corpus…** to index specific files without adding the
    surrounding folder.
 3. The status bar reports progress while files are parsed. When indexing

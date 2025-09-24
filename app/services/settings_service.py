@@ -44,7 +44,11 @@ class SettingsService(QObject):
         """Reload settings from disk."""
 
         data = self._config.load()
-        ui_settings = data.get("ui") if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        ui_settings = data.get("ui", {})
+        if not isinstance(ui_settings, dict):
+            ui_settings = {}
         theme = str(ui_settings.get("theme", DEFAULT_THEME)).lower()
         if theme not in {"light", "dark"}:
             theme = DEFAULT_THEME
@@ -63,7 +67,9 @@ class SettingsService(QObject):
         data = self._config.load()
         if not isinstance(data, dict):
             data = {}
-        ui_data = data.get("ui") if isinstance(data.get("ui"), dict) else {}
+        ui_data = data.get("ui")
+        if not isinstance(ui_data, dict):
+            ui_data = {}
         ui_data.update(
             {
                 "theme": self._settings.theme,

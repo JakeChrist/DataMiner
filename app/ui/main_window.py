@@ -154,16 +154,16 @@ class MainWindow(QMainWindow):
         self._connection_unsubscribe = self._conversation_manager.add_connection_listener(
             self._on_connection_state_changed
         )
-        self._create_layout()
-        self._connect_services()
-        self._toast = ToastWidget(self)
-        self.settings_service.apply_theme()
-        self.settings_service.apply_font_scale()
-        self._update_lmstudio_status()
         self._current_retrieval_scope: dict[str, list[str]] = {"include": [], "exclude": []}
         self._last_question: str | None = None
         self._active_card: TurnCardWidget | None = None
         self._has_documents: bool = False
+        self._toast = ToastWidget(self)
+        self._create_layout()
+        self._connect_services()
+        self.settings_service.apply_theme()
+        self.settings_service.apply_font_scale()
+        self._update_lmstudio_status()
         self.project_service.projects_changed.connect(self._on_projects_changed)
         self.project_service.active_project_changed.connect(self._on_active_project_changed)
         self._initialise_project_state()

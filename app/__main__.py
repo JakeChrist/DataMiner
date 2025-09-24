@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import sys
 
-from PyQt6.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import QApplication
 
 from .logging import setup_logging
+from .services.lmstudio_client import LMStudioClient
+from .services.progress_service import ProgressService
+from .services.settings_service import SettingsService
+from .ui import MainWindow
 
 
 def main() -> None:
@@ -17,9 +21,15 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("DataMiner")
 
-    window = QLabel("DataMiner is running.")
-    window.setWindowTitle("DataMiner")
-    window.resize(400, 200)
+    settings_service = SettingsService()
+    progress_service = ProgressService()
+    lmstudio_client = LMStudioClient()
+
+    window = MainWindow(
+        settings_service=settings_service,
+        progress_service=progress_service,
+        lmstudio_client=lmstudio_client,
+    )
     window.show()
 
     logger.info("Application started")

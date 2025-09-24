@@ -1,3 +1,5 @@
 """UI components for the DataMiner application."""
 
-__all__: list[str] = []
+from .main_window import MainWindow
+
+__all__ = ["MainWindow"]

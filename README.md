@@ -37,6 +37,23 @@ configuration directory (`%APPDATA%/DataMiner` on Windows or
 `~/.config/DataMiner` on Linux/macOS). All functionality operates locally; the
 application performs no network calls or telemetry by default.
 
+## Loading a Corpus of Documents
+
+Use the File → Corpus menu (or the toolbar shortcut) to load sources into the
+active project:
+
+1. Choose **Add Folder to Corpus…** to select an entire directory. All
+   supported files (`.pdf`, `.docx`, `.txt`, `.md`) inside the folder are queued
+   for background indexing.
+2. Choose **Add Files to Corpus…** to index specific files without adding the
+   surrounding folder.
+3. The status bar reports progress while files are parsed. When indexing
+   completes the left-hand *Corpus* panel lists the discovered folders and
+   documents. Asking questions remains disabled until at least one document has
+   been indexed.
+4. After documents change on disk, use **Rescan Indexed Folders** to refresh
+   the stored corpus without reselecting directories.
+
 ## Project Structure
 
 ```

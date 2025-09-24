@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 from datetime import datetime
 from functools import partial
 from importlib import metadata
@@ -21,7 +22,6 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLineEdit,
     QLabel,
-    QListWidget,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -30,10 +30,13 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from ..ingest.service import IngestService, TaskStatus
 from ..services.conversation_manager import (
     ConnectionState,
     ConversationManager,
@@ -43,6 +46,7 @@ from ..services.conversation_manager import (
     ResponseMode,
 )
 from ..services.conversation_settings import ConversationSettings
+from ..services.document_hierarchy import DocumentHierarchyService
 from ..services.lmstudio_client import LMStudioClient
 from ..services.progress_service import ProgressService, ProgressUpdate
 from ..services.project_service import ProjectRecord, ProjectService
@@ -121,6 +125,8 @@ class MainWindow(QMainWindow):
         progress_service: ProgressService,
         lmstudio_client: LMStudioClient,
         project_service: ProjectService,
+        ingest_service: IngestService,
+        document_hierarchy: DocumentHierarchyService,
         export_service: ExportService,
         backup_service: BackupService,
         enable_health_monitor: bool = True,
@@ -130,6 +136,8 @@ class MainWindow(QMainWindow):
         self.progress_service = progress_service
         self.lmstudio_client = lmstudio_client
         self.project_service = project_service
+        self.ingest_service = ingest_service
+        self.document_hierarchy = document_hierarchy
         self.export_service = export_service
         self.backup_service = backup_service
         self.enable_health_monitor = enable_health_monitor
@@ -141,6 +149,8 @@ class MainWindow(QMainWindow):
         self._conversation_manager = ConversationManager(self.lmstudio_client)
         self._turns: list[ConversationTurn] = []
         self._project_sessions: dict[int, dict[str, Any]] = {}
+        self._ingest_jobs: dict[int, dict[str, Any]] = {}
+        self._ingest_updates: "queue.Queue[tuple[int, dict[str, Any]]]" = queue.Queue()
         self._connection_unsubscribe = self._conversation_manager.add_connection_listener(
             self._on_connection_state_changed
         )
@@ -153,9 +163,15 @@ class MainWindow(QMainWindow):
         self._current_retrieval_scope: dict[str, list[str]] = {"include": [], "exclude": []}
         self._last_question: str | None = None
         self._active_card: TurnCardWidget | None = None
+        self._has_documents: bool = False
         self.project_service.projects_changed.connect(self._on_projects_changed)
         self.project_service.active_project_changed.connect(self._on_active_project_changed)
         self._initialise_project_state()
+        self._ingest_unsubscribe = self.ingest_service.subscribe(self._enqueue_ingest_update)
+        self._ingest_timer = QTimer(self)
+        self._ingest_timer.setInterval(150)
+        self._ingest_timer.timeout.connect(self._drain_ingest_updates)
+        self._ingest_timer.start()
         if self.enable_health_monitor:
             self._health_timer = QTimer(self)
             self._health_timer.timeout.connect(self._update_lmstudio_status)
@@ -210,6 +226,16 @@ class MainWindow(QMainWindow):
         self.export_html_action.setEnabled(False)
         self.export_snippet_action.setEnabled(False)
 
+        self.add_folder_action = QAction("Add Folder to Corpus…", self)
+        self.add_folder_action.triggered.connect(self._add_folder_to_corpus)
+
+        self.add_files_action = QAction("Add Files to Corpus…", self)
+        self.add_files_action.triggered.connect(self._add_files_to_corpus)
+
+        self.rescan_corpus_action = QAction("Rescan Indexed Folders", self)
+        self.rescan_corpus_action.triggered.connect(self._rescan_corpus)
+        self.rescan_corpus_action.setEnabled(False)
+
     def _create_menus_and_toolbar(self) -> None:
         menubar = QMenuBar(self)
         self.setMenuBar(menubar)
@@ -221,6 +247,12 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.rename_project_action)
         file_menu.addAction(self.delete_project_action)
         file_menu.addAction(self.remove_project_data_action)
+        file_menu.addSeparator()
+        corpus_menu = file_menu.addMenu("Corpus")
+        corpus_menu.addAction(self.add_folder_action)
+        corpus_menu.addAction(self.add_files_action)
+        corpus_menu.addSeparator()
+        corpus_menu.addAction(self.rescan_corpus_action)
         file_menu.addSeparator()
         file_menu.addAction(self.reveal_storage_action)
         file_menu.addSeparator()
@@ -252,6 +284,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._project_combo)
         toolbar.addSeparator()
         toolbar.addAction(self.new_project_action)
+        toolbar.addAction(self.add_folder_action)
         toolbar.addAction(self.backup_action)
         self.addToolBar(toolbar)
 
@@ -279,10 +312,11 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(splitter)
 
         # Left panel - corpus selector
-        self._corpus_list = QListWidget(splitter)
-        self._corpus_list.setObjectName("corpusSelector")
-        self._corpus_list.addItems(["All Documents", "Recent", "Favorites"])
-        splitter.addWidget(self._corpus_list)
+        self._corpus_tree = QTreeWidget(splitter)
+        self._corpus_tree.setObjectName("corpusSelector")
+        self._corpus_tree.setHeaderHidden(True)
+        self._corpus_tree.setIndentation(16)
+        splitter.addWidget(self._corpus_tree)
 
         # Center panel - conversation and controls
         chat_panel = QWidget(splitter)
@@ -389,6 +423,8 @@ class MainWindow(QMainWindow):
             self._evidence_panel.clear()
         self._update_export_actions()
         self.export_snippet_action.setEnabled(self._evidence_panel.selected_index is not None)
+        self._refresh_corpus_view()
+        self._update_corpus_actions()
 
     def _snapshot_conversation_settings(self) -> dict[str, Any]:
         return {
@@ -448,6 +484,330 @@ class MainWindow(QMainWindow):
         slug = "-".join(filter(None, safe.split("-"))) or "project"
         base = Path(self.project_service.storage_root)
         return str(base / f"{slug}{suffix}")
+
+    # ------------------------------------------------------------------
+    # Corpus management
+    def _ingest_include_patterns(self) -> list[str]:
+        return ["*.pdf", "*.docx", "*.txt", "*.text", "*.md", "*.markdown", "*.mkd"]
+
+    def _add_folder_to_corpus(self) -> None:
+        project = self.project_service.active_project()
+        roots = self.project_service.list_corpus_roots(project.id)
+        initial = roots[-1] if roots else ""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Index",
+            initial,
+        )
+        if not folder:
+            return
+        include = self._ingest_include_patterns()
+        try:
+            job_id = self.ingest_service.queue_folder_crawl(
+                project.id,
+                folder,
+                include=include,
+            )
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(
+                self,
+                "Add Folder",
+                str(exc) or "Unable to start indexing for the selected folder.",
+            )
+            return
+        folder_name = Path(folder).name or Path(folder).resolve().name or folder
+        description = f"Indexing {folder_name}"
+        self._register_ingest_job(
+            job_id,
+            project_id=project.id,
+            description=description,
+            root=folder,
+        )
+        self.project_service.add_corpus_root(project.id, folder)
+        self._update_corpus_actions()
+        self._show_toast("Folder queued for indexing.", level="info", duration_ms=2500)
+
+    def _add_files_to_corpus(self) -> None:
+        project = self.project_service.active_project()
+        filter_spec = (
+            "Documents (*.pdf *.docx *.txt *.text *.md *.markdown *.mkd);;All Files (*)"
+        )
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Files to Index",
+            "",
+            filter_spec,
+        )
+        if not files:
+            return
+        include = self._ingest_include_patterns()
+        try:
+            job_id = self.ingest_service.queue_file_add(
+                project.id,
+                files,
+                include=include,
+            )
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(
+                self,
+                "Add Files",
+                str(exc) or "Unable to start indexing for the selected files.",
+            )
+            return
+        description = f"Indexing {len(files)} file(s)"
+        root = str(Path(files[0]).resolve().parent)
+        self._register_ingest_job(
+            job_id,
+            project_id=project.id,
+            description=description,
+            root=root,
+        )
+        self._show_toast("Files queued for indexing.", level="info", duration_ms=2500)
+
+    def _rescan_corpus(self) -> None:
+        project = self.project_service.active_project()
+        roots = self.project_service.list_corpus_roots(project.id)
+        if not roots:
+            QMessageBox.information(
+                self,
+                "Rescan Corpus",
+                "No indexed folders are available to rescan.",
+            )
+            return
+        include = self._ingest_include_patterns()
+        queued = 0
+        for root in roots:
+            try:
+                job_id = self.ingest_service.queue_rescan(
+                    project.id,
+                    root,
+                    include=include,
+                )
+            except Exception as exc:  # pragma: no cover - user feedback path
+                QMessageBox.warning(
+                    self,
+                    "Rescan Corpus",
+                    f"Failed to queue rescan for {root}: {exc}",
+                )
+                continue
+            root_name = Path(root).name or Path(root).resolve().name or root
+            description = f"Rescanning {root_name}"
+            self._register_ingest_job(
+                job_id,
+                project_id=project.id,
+                description=description,
+                root=root,
+            )
+            queued += 1
+        if queued:
+            self._show_toast(
+                f"Queued rescan for {queued} folder(s).",
+                level="info",
+                duration_ms=2500,
+            )
+
+    def _register_ingest_job(
+        self,
+        job_id: int,
+        *,
+        project_id: int,
+        description: str,
+        root: str | None = None,
+    ) -> None:
+        task_id = f"ingest-{job_id}"
+        self._ingest_jobs[job_id] = {
+            "task_id": task_id,
+            "project_id": project_id,
+            "description": description,
+            "root": root,
+        }
+        self.progress_service.start(task_id, description)
+
+    def _enqueue_ingest_update(self, job_id: int, payload: dict[str, Any]) -> None:
+        self._ingest_updates.put((job_id, payload))
+
+    def _drain_ingest_updates(self) -> None:
+        while True:
+            try:
+                job_id, payload = self._ingest_updates.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_ingest_update(job_id, payload)
+
+    def _handle_ingest_update(self, job_id: int, payload: dict[str, Any]) -> None:
+        job_info = self._ingest_jobs.get(job_id)
+        if job_info is None:
+            return
+        task_id = job_info["task_id"]
+        description = job_info.get("description", "Indexing corpus")
+        status = payload.get("status")
+        progress = payload.get("progress", {}) if isinstance(payload, dict) else {}
+        total = int(progress.get("total", 0) or 0)
+        processed = int(progress.get("processed", 0) or 0)
+        if status == TaskStatus.RUNNING:
+            message = (
+                f"{description} ({processed}/{total})" if total else description
+            )
+            percent = (processed / total * 100.0) if total else None
+            self.progress_service.update(task_id, message=message, percent=percent)
+            return
+        if status == TaskStatus.PAUSED:
+            message = f"{description} (paused)"
+            self.progress_service.update(task_id, message=message, indeterminate=True)
+            return
+        if status not in TaskStatus.FINAL:
+            return
+
+        summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
+        errors = payload.get("errors") or summary.get("errors")
+
+        if status == TaskStatus.COMPLETED:
+            self.progress_service.finish(task_id, f"{description} complete")
+            self._apply_ingest_results(job_info, payload)
+            success = int(summary.get("success_count", 0) or 0)
+            removed = summary.get("removed") or []
+            details = f"Indexed {success} document(s)"
+            if removed:
+                details += f", removed {len(removed)}"
+            self._show_toast(details + ".", level="info", duration_ms=3500)
+        elif status == TaskStatus.CANCELLED:
+            self.progress_service.finish(task_id, f"{description} cancelled")
+            self._show_toast("Ingest cancelled.", level="warning", duration_ms=3000)
+        elif status == TaskStatus.FAILED:
+            self.progress_service.finish(task_id, f"{description} failed")
+            message = "; ".join(str(err) for err in errors) if errors else "Ingest failed"
+            self._show_toast(message, level="error", duration_ms=5000)
+        self._ingest_jobs.pop(job_id, None)
+
+    def _apply_ingest_results(self, job_info: dict[str, Any], payload: dict[str, Any]) -> None:
+        project_id = job_info.get("project_id")
+        if not isinstance(project_id, int):
+            return
+        summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
+        known_files = summary.get("known_files", {}) if isinstance(summary, dict) else {}
+        removed = summary.get("removed", []) if isinstance(summary, dict) else []
+        self._sync_documents_with_known_files(project_id, known_files, removed)
+        self._refresh_corpus_view()
+        self._update_corpus_actions()
+
+    def _sync_documents_with_known_files(
+        self,
+        project_id: int,
+        known_files: Any,
+        removed: Any,
+    ) -> None:
+        repo = self.project_service.documents
+        existing_docs = {
+            str(Path(doc["source_path"]).resolve()): doc
+            for doc in repo.list_for_project(project_id)
+            if doc.get("source_path")
+        }
+        normalized_known: dict[str, dict[str, Any]] = {}
+        if isinstance(known_files, dict):
+            for path, metadata in known_files.items():
+                if not isinstance(path, str):
+                    continue
+                normalized_path = str(Path(path).resolve())
+                normalized_known[normalized_path] = (
+                    dict(metadata) if isinstance(metadata, dict) else {}
+                )
+                document = existing_docs.get(normalized_path)
+                payload = {"file": normalized_known[normalized_path]}
+                if document is None:
+                    title = Path(normalized_path).stem or Path(normalized_path).name
+                    repo.create(
+                        project_id,
+                        title,
+                        source_type="file",
+                        source_path=normalized_path,
+                        metadata=payload,
+                    )
+                else:
+                    updates: dict[str, Any] = {}
+                    if document.get("source_path") != normalized_path:
+                        updates["source_path"] = normalized_path
+                    current_meta = document.get("metadata") or {}
+                    if current_meta.get("file") != normalized_known[normalized_path]:
+                        updates["metadata"] = payload
+                    if updates:
+                        repo.update(document["id"], **updates)
+        removed_paths = []
+        if isinstance(removed, (list, tuple, set)):
+            removed_paths = [str(Path(path).resolve()) for path in removed if isinstance(path, str)]
+        if removed_paths:
+            for document in repo.list_for_project(project_id):
+                source_path = document.get("source_path")
+                if not source_path:
+                    continue
+                normalized = str(Path(source_path).resolve())
+                if normalized in removed_paths:
+                    repo.delete(document["id"])
+
+    def _refresh_corpus_view(self) -> None:
+        self._corpus_tree.clear()
+        try:
+            project_id = self.project_service.active_project_id
+        except RuntimeError:
+            self._has_documents = False
+            self._corpus_tree.setEnabled(False)
+            return
+        documents = self.project_service.documents.list_for_project(project_id)
+        self._has_documents = bool(documents)
+        if not documents:
+            placeholder = QTreeWidgetItem(["No documents indexed"])
+            placeholder.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self._corpus_tree.addTopLevelItem(placeholder)
+            self._corpus_tree.setEnabled(False)
+            return
+        self._corpus_tree.setEnabled(True)
+        tree = self.document_hierarchy.build_folder_tree(project_id)
+        label_path = tree.get("path")
+        if label_path:
+            try:
+                root_label = Path(label_path).name or str(Path(label_path))
+            except Exception:
+                root_label = str(label_path)
+        else:
+            root_label = self.project_service.active_project().name or "Corpus"
+        if not root_label:
+            root_label = "Corpus"
+        root_item = QTreeWidgetItem([root_label])
+        if label_path:
+            root_item.setToolTip(0, str(label_path))
+        self._corpus_tree.addTopLevelItem(root_item)
+        self._populate_corpus_tree(root_item, tree)
+        root_item.setExpanded(True)
+        self._corpus_tree.resizeColumnToContents(0)
+        self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+    def _populate_corpus_tree(self, parent: QTreeWidgetItem, node: dict[str, Any]) -> None:
+        for child in node.get("children", []):
+            name = child.get("name") or "(root)"
+            item = QTreeWidgetItem([name])
+            path = child.get("path")
+            if path:
+                item.setToolTip(0, str(path))
+            parent.addChild(item)
+            self._populate_corpus_tree(item, child)
+        for document in node.get("documents", []):
+            source_path = document.get("source_path")
+            title = document.get("title")
+            if not title and source_path:
+                title = Path(source_path).name
+            title = title or "Untitled"
+            item = QTreeWidgetItem([title])
+            if source_path:
+                item.setToolTip(0, str(source_path))
+            parent.addChild(item)
+
+    def _update_corpus_actions(self) -> None:
+        try:
+            project_id = self.project_service.active_project_id
+        except RuntimeError:
+            self.rescan_corpus_action.setEnabled(False)
+            return
+        roots = self.project_service.list_corpus_roots(project_id)
+        self.rescan_corpus_action.setEnabled(bool(roots))
 
     def _prompt_new_project(self) -> None:
         name, ok = QInputDialog.getText(
@@ -536,6 +896,8 @@ class MainWindow(QMainWindow):
         self._update_export_actions()
         self._update_session(turns=[], scope=self._current_retrieval_scope, last_question=None)
         self._show_toast("Project data removed.", level="info", duration_ms=3000)
+        self._refresh_corpus_view()
+        self._update_corpus_actions()
 
     def _create_backup(self) -> None:
         default_path = self._build_default_export_path("-backup.zip")
@@ -784,7 +1146,7 @@ class MainWindow(QMainWindow):
         self._ask_question(text, triggered_by_scope=False)
 
     def _focus_corpus(self) -> None:
-        self._corpus_list.setFocus()
+        self._corpus_tree.setFocus()
 
     def _copy_chat_text(self) -> None:
         text = self.answer_view.to_plain_text()
@@ -896,8 +1258,12 @@ class MainWindow(QMainWindow):
             self._ask_question(self._last_question, triggered_by_scope=True)
 
     def _update_question_prerequisites(self, state: ConnectionState) -> None:
+        ok = state.connected
         message = state.message if not state.connected else None
-        self.question_input.set_prerequisites_met(state.connected, message)
+        if ok and not self._has_documents:
+            ok = False
+            message = "Index at least one document to enable questions."
+        self.question_input.set_prerequisites_met(ok, message)
 
     def _on_connection_state_changed(self, state: ConnectionState) -> None:
         text = "LMStudio: Connected" if state.connected else "LMStudio: Offline"
@@ -972,10 +1338,18 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         if hasattr(self, "_health_timer"):
             self._health_timer.stop()
+        if hasattr(self, "_ingest_timer"):
+            self._ingest_timer.stop()
         unsubscribe = getattr(self, "_connection_unsubscribe", None)
         if callable(unsubscribe):
             try:
                 unsubscribe()
+            except Exception:
+                pass
+        ingest_unsubscribe = getattr(self, "_ingest_unsubscribe", None)
+        if callable(ingest_unsubscribe):
+            try:
+                ingest_unsubscribe()
             except Exception:
                 pass
         try:

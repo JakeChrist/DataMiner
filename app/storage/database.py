@@ -639,6 +639,41 @@ class IngestDocumentRepository(BaseRepository):
         ).fetchall()
         return [record for record in (self._decode_document_row(row) for row in rows) if record]
 
+    def delete_by_paths(self, paths: Iterable[str | Path]) -> int:
+        """Remove all ingest records associated with ``paths``.
+
+        Returns the number of rows deleted across both the ingest table and the
+        associated FTS index. Paths are normalised to absolute form before
+        matching so callers can provide either relative or absolute values.
+        """
+
+        normalized = [str(Path(path).resolve()) for path in paths]
+        unique_paths = list(dict.fromkeys(normalized))
+        if not unique_paths:
+            return 0
+
+        removed = 0
+        with self.transaction() as connection:
+            for path in unique_paths:
+                rows = connection.execute(
+                    "SELECT id FROM ingest_documents WHERE path = ?",
+                    (path,),
+                ).fetchall()
+                document_ids = [int(row["id"]) for row in rows]
+                if not document_ids:
+                    continue
+                placeholders = ",".join("?" for _ in document_ids)
+                connection.execute(
+                    f"DELETE FROM ingest_document_index WHERE rowid IN ({placeholders})",
+                    document_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM ingest_documents WHERE id IN ({placeholders})",
+                    document_ids,
+                )
+                removed += len(document_ids)
+        return removed
+
     def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         rows = self.db.connect().execute(
             """

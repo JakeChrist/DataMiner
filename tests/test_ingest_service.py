@@ -103,15 +103,18 @@ def test_completed_job_populates_document_repository(
     assert service.wait_for_completion(job_id, timeout=5.0)
 
     repo = DocumentRepository(db_manager)
+    ingest_repo = IngestDocumentRepository(db_manager)
     documents = repo.list_for_project(project_id)
     assert len(documents) == 1
     document = documents[0]
     assert document["source_path"] == str(tracked.resolve())
     assert document["metadata"]["file"]["size"] == tracked.stat().st_size
+    assert ingest_repo.get_latest_by_path(tracked) is not None
 
     remove_job = service.queue_remove(project_id, root, [tracked])
     assert service.wait_for_completion(remove_job, timeout=5.0)
     assert repo.list_for_project(project_id) == []
+    assert ingest_repo.get_latest_by_path(tracked) is None
 
     service.shutdown()
 
@@ -149,6 +152,10 @@ def test_rescan_detects_changes_and_removals(tmp_path: Path, db_manager: Databas
     assert str(file_a.resolve()) in known_files
     assert str(file_c.resolve()) in known_files
     assert str(file_b.resolve()) not in known_files
+    ingest_repo = IngestDocumentRepository(db_manager)
+    assert ingest_repo.get_latest_by_path(file_b) is None
+    assert ingest_repo.get_latest_by_path(file_a) is not None
+    assert ingest_repo.get_latest_by_path(file_c) is not None
 
     service.shutdown()
 

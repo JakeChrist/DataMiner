@@ -412,13 +412,16 @@ class IngestService:
                 job.summary.setdefault("removed", []).extend(removed)
                 for path in removed:
                     known_files.pop(path, None)
+                self.documents.delete_by_paths(removed)
         job.state["processed_files"] = processed_files
         job.state["pending_files"] = files
 
     def _handle_path(self, job: IngestJob, path: Path) -> dict[str, Any]:
         if job.job_type == "remove":
             normalized = self._normalize_path(path)
-            return {"status": "removed", "metadata": {"path": normalized}}
+            removed = self.documents.delete_by_paths([normalized])
+            metadata = {"path": normalized, "removed_versions": removed}
+            return {"status": "removed", "metadata": metadata}
 
         if not path.exists():
             return {

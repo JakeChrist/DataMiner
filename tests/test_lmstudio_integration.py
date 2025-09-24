@@ -13,6 +13,8 @@ from app.services import (
     LMStudioClient,
     LMStudioConnectionError,
     LMStudioError,
+    ReasoningVerbosity,
+    ResponseMode,
 )
 
 
@@ -26,6 +28,47 @@ def _default_chat_response(payload: dict[str, object]) -> dict[str, object]:
             question = ""
     else:
         question = ""
+    reasoning_options = payload.get("reasoning")
+    if not isinstance(reasoning_options, dict):
+        reasoning_options = {}
+    verbosity = str(reasoning_options.get("verbosity", "brief"))
+    include_plan = bool(reasoning_options.get("include_plan", True))
+    summary_bullets: list[str]
+    if verbosity == "minimal":
+        summary_bullets = ["Check context"]
+    elif verbosity == "extended":
+        summary_bullets = [
+            "Check context",
+            "Draft response",
+            "Verify citations",
+        ]
+    else:
+        summary_bullets = ["Check context", "Draft response"]
+    plan_items: list[dict[str, str]] = []
+    if include_plan:
+        base_plan = [
+            {"step": "Gather evidence", "status": "complete"},
+            {"step": "Compose answer", "status": "pending"},
+            {"step": "Review assumptions", "status": "pending"},
+        ]
+        max_items = reasoning_options.get("max_plan_items")
+        if isinstance(max_items, int):
+            plan_items = base_plan[: max(0, max_items)]
+        else:
+            plan_items = base_plan
+    reasoning_metadata = {
+        "summary_bullets": summary_bullets,
+        "plan": plan_items,
+        "assumptions": {
+            "used": ["Assuming a concise summary is acceptable."],
+            "should_ask": False,
+            "rationale": "Request already specifies a summary format.",
+        },
+        "self_check": {"passed": True, "flags": []},
+    }
+    content = f"Echo: {question}"
+    if payload.get("response_mode") == ResponseMode.SOURCES_ONLY.value:
+        content = "Facts:\n- detail one (doc1)\n- detail two (doc2)"
     return {
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -35,10 +78,10 @@ def _default_chat_response(payload: dict[str, object]) -> dict[str, object]:
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": f"Echo: {question}",
+                    "content": content,
                     "metadata": {
                         "citations": [{"source": "doc1", "snippet": "alpha"}],
-                        "reasoning": {"steps": ["Review context", "Respond"]},
+                        "reasoning": reasoning_metadata,
                     },
                 },
                 "finish_reason": "stop",
@@ -142,16 +185,29 @@ def test_lmstudio_client_and_conversation_manager_success(lmstudio_server: tuple
         "What is the summary?",
         context_snippets=["Document A: important details."],
         preset=AnswerLength.BRIEF,
+        reasoning_verbosity=ReasoningVerbosity.BRIEF,
     )
 
     assert turn.answer.startswith("Echo:")
     assert turn.citations
-    assert turn.reasoning == {"steps": ["Review context", "Respond"]}
+    assert turn.response_mode is ResponseMode.GENERATIVE
+    assert turn.reasoning_artifacts is not None
+    assert turn.reasoning_bullets
+    assert "Check context" in turn.reasoning_bullets[0]
+    assert turn.plan
+    assert turn.plan[0].is_complete
+    assert turn.assumptions
+    assert turn.assumption_decision is not None
+    assert turn.assumption_decision.mode == "assume"
+    assert turn.assumption_decision.rationale
+    assert turn.self_check is not None and turn.self_check.passed is True
 
     assert state["requests"] and isinstance(state["requests"], list)
     payload = state["requests"][0]
     assert payload["model"] == "test-model"
     assert payload["max_tokens"] == AnswerLength.BRIEF.to_request_params()["max_tokens"]
+    assert payload["reasoning"]["verbosity"] == ReasoningVerbosity.BRIEF.value
+    assert payload["reasoning"]["include_plan"] is True
     messages = payload["messages"]
     assert isinstance(messages, list)
     # Expect system prompt, plus user/assistant pairs (none yet), and new user message.
@@ -208,3 +264,76 @@ def test_conversation_manager_handles_failures_and_recovers(
     assert messages[0]["content"].startswith("First question?")
     assert messages[1]["role"] == "assistant"
 
+
+def test_reasoning_verbosity_controls_request_and_artifacts(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    client = LMStudioClient(base_url=base_url, retry_backoff=0.01)
+    manager = ConversationManager(client, context_window=0)
+
+    manager.ask("Minimal please", reasoning_verbosity=ReasoningVerbosity.MINIMAL)
+    assert state["requests"]
+    minimal_payload = state["requests"][0]
+    assert minimal_payload["reasoning"]["verbosity"] == ReasoningVerbosity.MINIMAL.value
+    assert minimal_payload["reasoning"]["include_plan"] is False
+    minimal_turn = manager.turns[-1]
+    assert minimal_turn.reasoning_bullets
+    assert len(minimal_turn.plan) == 0
+
+    manager.ask("Extended please", reasoning_verbosity=ReasoningVerbosity.EXTENDED)
+    extended_payload = state["requests"][-1]
+    assert extended_payload["reasoning"]["verbosity"] == ReasoningVerbosity.EXTENDED.value
+    assert extended_payload["reasoning"]["include_plan"] is True
+    extended_turn = manager.turns[-1]
+    assert len(extended_turn.plan) >= 2
+    assert len(extended_turn.reasoning_bullets) >= 3
+
+
+def test_sources_only_mode_tracks_clarification_and_self_check(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+
+    def _clarifying_response(payload: dict[str, object]) -> dict[str, object]:
+        base = _default_chat_response(payload)
+        choice = base["choices"][0]
+        message = choice["message"]
+        metadata = message["metadata"]
+        reasoning = metadata["reasoning"]
+        reasoning["assumptions"] = {
+            "used": [],
+            "should_ask": True,
+            "clarifying_question": "Which quarter should I analyse?",
+            "rationale": "Ambiguous timeframe for revenue.",
+        }
+        reasoning["self_check"] = {
+            "passed": False,
+            "flags": ["Needs timeframe clarification"],
+            "notes": "Unable to validate without timeframe.",
+        }
+        if payload.get("response_mode") == ResponseMode.SOURCES_ONLY.value:
+            message["content"] = "Sources only: doc1, doc2"
+        return base
+
+    state["response_template"] = _clarifying_response
+
+    client = LMStudioClient(base_url=base_url, retry_backoff=0.01)
+    manager = ConversationManager(client)
+
+    turn = manager.ask(
+        "Summarise recent revenue performance",
+        reasoning_verbosity=ReasoningVerbosity.BRIEF,
+        response_mode=ResponseMode.SOURCES_ONLY,
+    )
+
+    payload = state["requests"][-1]
+    assert payload["response_mode"] == ResponseMode.SOURCES_ONLY.value
+    assert turn.response_mode is ResponseMode.SOURCES_ONLY
+    assert turn.assumption_decision is not None
+    assert turn.assumption_decision.mode == "clarify"
+    assert turn.assumption_decision.clarifying_question
+    assert not turn.assumptions
+    assert turn.self_check is not None
+    assert turn.self_check.passed is False
+    assert any("timeframe" in flag.lower() for flag in turn.self_check.flags)

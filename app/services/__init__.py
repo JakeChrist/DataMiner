@@ -2,9 +2,15 @@
 
 from .conversation_manager import (
     AnswerLength,
+    AssumptionDecision,
     ConnectionState,
     ConversationManager,
     ConversationTurn,
+    PlanItem,
+    ReasoningArtifacts,
+    ReasoningVerbosity,
+    ResponseMode,
+    SelfCheckResult,
 )
 from .document_hierarchy import DocumentHierarchyService
 from .lmstudio_client import (
@@ -17,10 +23,16 @@ from .lmstudio_client import (
 
 __all__ = [
     "AnswerLength",
+    "AssumptionDecision",
     "ChatMessage",
     "ConnectionState",
     "ConversationManager",
     "ConversationTurn",
+    "PlanItem",
+    "ReasoningArtifacts",
+    "ReasoningVerbosity",
+    "ResponseMode",
+    "SelfCheckResult",
     "DocumentHierarchyService",
     "LMStudioClient",
     "LMStudioConnectionError",

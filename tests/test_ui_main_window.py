@@ -20,6 +20,9 @@ from app.config import ConfigManager
 from app.services.conversation_manager import ReasoningVerbosity
 from app.services.progress_service import ProgressService
 from app.services.settings_service import SettingsService
+from app.services.project_service import ProjectService
+from app.services.export_service import ExportService
+from app.services.backup_service import BackupService
 from app.ui.main_window import MainWindow
 from app.services.lmstudio_client import ChatMessage, LMStudioClient
 
@@ -39,6 +42,15 @@ def build_settings_service(tmp_path, monkeypatch) -> SettingsService:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     manager = ConfigManager(app_name="DataMinerTest", filename="ui.json")
     return SettingsService(config_manager=manager)
+
+
+@pytest.fixture()
+def project_service(tmp_path, monkeypatch) -> ProjectService:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    config = ConfigManager(app_name="DataMinerTest", filename="projects.json")
+    service = ProjectService(storage_root=tmp_path / "storage", config_manager=config)
+    yield service
+    service.shutdown()
 
 
 class DummyLMStudioClient:
@@ -116,14 +128,19 @@ class DummyLMStudioClient:
         )
 
 
-def test_main_window_splitter_layout(qt_app, tmp_path, monkeypatch):
+def test_main_window_splitter_layout(qt_app, tmp_path, monkeypatch, project_service):
     settings_service = build_settings_service(tmp_path, monkeypatch)
     progress_service = ProgressService()
     lmstudio_client = LMStudioClient()
+    export_service = ExportService()
+    backup_service = BackupService(project_service)
     window = MainWindow(
         settings_service=settings_service,
         progress_service=progress_service,
         lmstudio_client=lmstudio_client,
+        project_service=project_service,
+        export_service=export_service,
+        backup_service=backup_service,
         enable_health_monitor=False,
     )
     window.resize(1400, 900)
@@ -148,14 +165,19 @@ def test_settings_persist_theme_and_font(tmp_path, monkeypatch):
     assert reloaded.font_scale == pytest.approx(1.5)
 
 
-def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch):
+def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch, project_service):
     settings_service = build_settings_service(tmp_path, monkeypatch)
     progress_service = ProgressService()
     client = DummyLMStudioClient()
+    export_service = ExportService()
+    backup_service = BackupService(project_service)
     window = MainWindow(
         settings_service=settings_service,
         progress_service=progress_service,
         lmstudio_client=client,
+        project_service=project_service,
+        export_service=export_service,
+        backup_service=backup_service,
         enable_health_monitor=False,
     )
 
@@ -227,14 +249,19 @@ def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch):
     window.close()
 
 
-def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch):
+def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch, project_service):
     settings_service = build_settings_service(tmp_path, monkeypatch)
     progress_service = ProgressService()
     client = DummyLMStudioClient()
+    export_service = ExportService()
+    backup_service = BackupService(project_service)
     window = MainWindow(
         settings_service=settings_service,
         progress_service=progress_service,
         lmstudio_client=client,
+        project_service=project_service,
+        export_service=export_service,
+        backup_service=backup_service,
         enable_health_monitor=False,
     )
 
@@ -269,14 +296,19 @@ def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch):
     window.close()
 
 
-def test_evidence_open_in_system_app(qt_app, tmp_path, monkeypatch):
+def test_evidence_open_in_system_app(qt_app, tmp_path, monkeypatch, project_service):
     settings_service = build_settings_service(tmp_path, monkeypatch)
     progress_service = ProgressService()
     client = DummyLMStudioClient()
+    export_service = ExportService()
+    backup_service = BackupService(project_service)
     window = MainWindow(
         settings_service=settings_service,
         progress_service=progress_service,
         lmstudio_client=client,
+        project_service=project_service,
+        export_service=export_service,
+        backup_service=backup_service,
         enable_health_monitor=False,
     )
 

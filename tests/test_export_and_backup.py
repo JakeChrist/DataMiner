@@ -73,6 +73,10 @@ def test_project_service_lifecycle_and_settings(tmp_path: Path, monkeypatch: pyt
         created = service.create_project("Analysis", activate=True)
         service.save_conversation_settings(created.id, {"show_plan": True, "sources_only": True})
 
+        analysis_root = tmp_path / "analysis_corpus"
+        analysis_root.mkdir()
+        service.add_corpus_root(created.id, analysis_root)
+
         service.set_active_project(default_project.id)
         original_settings = service.load_conversation_settings(default_project.id)
         assert original_settings.get("show_plan") is False
@@ -101,6 +105,9 @@ def test_backup_restore_persists_audit_trail(
     backup = BackupService(service)
     try:
         project = service.active_project()
+        corpus_root = tmp_path / "default_corpus"
+        corpus_root.mkdir()
+        service.add_corpus_root(project.id, corpus_root)
         log = service.background_tasks.create(
             "ingest", status="running", message="Started"
         )

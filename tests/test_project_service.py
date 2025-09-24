@@ -32,6 +32,8 @@ def test_corpus_root_management(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError):
             service.get_project_storage(project.id)
 
+        assert service.export_project_database_snapshot(project.id) is None
+
         first = tmp_path / "docs"
         first.mkdir()
         service.add_corpus_root(project.id, first)
@@ -42,6 +44,8 @@ def test_corpus_root_management(tmp_path: Path) -> None:
         assert storage_path.parent.name == "projects"
         assert storage_path.parent.parent.name == ".dataminer"
         assert storage_path.parent.parent.parent == first.resolve()
+        snapshot_path = storage_path / "dataminer.db"
+        assert snapshot_path.exists()
 
         # Adding the same folder again should not create duplicates.
         service.add_corpus_root(project.id, first)

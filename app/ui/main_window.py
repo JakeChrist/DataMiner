@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 from datetime import datetime
 from functools import partial
@@ -54,9 +55,13 @@ from ..services.project_service import ProjectRecord, ProjectService
 from ..services.backup_service import BackupService
 from ..services.export_service import ExportService
 from ..services.settings_service import SettingsService
+from ..storage import DatabaseError
 from .answer_view import AnswerView, TurnCardWidget
 from .evidence_panel import EvidencePanel
 from .question_input_widget import QuestionInputWidget
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ToastWidget(QFrame):
@@ -727,6 +732,16 @@ class MainWindow(QMainWindow):
         self._sync_documents_with_known_files(project_id, known_files, removed)
         self._refresh_corpus_view()
         self._update_corpus_actions()
+        try:
+            snapshot = self.project_service.export_project_database_snapshot(project_id)
+        except DatabaseError:
+            LOGGER.exception(
+                "Failed to write database snapshot for project %s", project_id
+            )
+        else:
+            if snapshot is not None:
+                session = self._project_sessions.setdefault(project_id, {})
+                session["database_snapshot"] = str(snapshot)
 
     def _sync_documents_with_known_files(
         self,

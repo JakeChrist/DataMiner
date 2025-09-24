@@ -10,7 +10,7 @@ import threading
 from typing import Any
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
-from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence
+from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -27,7 +27,6 @@ from PyQt6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QProgressBar,
-    QShortcut,
     QSplitter,
     QStatusBar,
     QToolBar,

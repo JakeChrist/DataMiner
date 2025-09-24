@@ -13,6 +13,7 @@ pytest.importorskip(
     exc_type=ImportError,
 )
 
+from PyQt6.QtCore import QUrl
 from PyQt6.QtWidgets import QApplication, QSplitter
 
 from app.config import ConfigManager
@@ -46,6 +47,8 @@ class DummyLMStudioClient:
     def __init__(self) -> None:
         self.last_messages: list[dict] = []
         self.last_options: dict | None = None
+        self.calls = 0
+        self.last_question: str | None = None
 
     def health_check(self) -> bool:
         return True
@@ -53,6 +56,11 @@ class DummyLMStudioClient:
     def chat(self, messages, *, preset, extra_options=None) -> ChatMessage:  # type: ignore[override]
         self.last_messages = list(messages)
         self.last_options = extra_options or {}
+        self.calls += 1
+        if messages:
+            last = messages[-1]
+            if isinstance(last, dict):
+                self.last_question = str(last.get("content", ""))
         reasoning = {
             "summary_bullets": ["Reviewed document A for relevant data."],
             "plan": [
@@ -70,12 +78,30 @@ class DummyLMStudioClient:
                 "notes": "No issues detected",
             },
         }
-        metadata = {"citations": ["Doc A"], "reasoning": reasoning}
+        citations = [
+            {
+                "id": "doc-a",
+                "source": "Doc A",
+                "snippet": "<mark>Metric</mark> value is 42.",
+                "page": 5,
+                "section": "Summary",
+                "path": "/tmp/doc_a.txt",
+            },
+            {
+                "id": "doc-b",
+                "source": "Doc B",
+                "snippet": "Supporting details from Doc B.",
+                "page": 2,
+                "section": "Context",
+                "path": "/tmp/doc_b.txt",
+            },
+        ]
+        metadata = {"citations": citations, "reasoning": reasoning}
         raw_response = {
             "choices": [
                 {
                     "message": {
-                        "content": "Deterministic answer",
+                        "content": "Deterministic answer [1] references evidence [2] as well.",
                         "metadata": metadata,
                     }
                 }
@@ -83,8 +109,8 @@ class DummyLMStudioClient:
             "usage": {"prompt_tokens": 12, "completion_tokens": 24, "total_tokens": 36},
         }
         return ChatMessage(
-            content="Deterministic answer",
-            citations=["Doc A"],
+            content="Deterministic answer [1] references evidence [2] as well.",
+            citations=citations,
             reasoning=reasoning,
             raw_response=raw_response,
         )
@@ -141,7 +167,7 @@ def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch):
     first_card = window.answer_view.cards[0]
     assert first_card.question_label.text().endswith("What is the latest metric?")
     assert "Deterministic answer" in first_card.answer_browser.toPlainText()
-    assert "Doc A" in first_card.citations_label.text()
+    assert "Doc A" in first_card.citations_browser.toPlainText()
     assert first_card.reasoning_section.isVisible()
     assert first_card.plan_section.isVisible()
     assert first_card.assumptions_section.isVisible()
@@ -152,7 +178,8 @@ def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch):
     reasoning_options = client.last_options.get("reasoning", {})
     assert reasoning_options.get("verbosity") == ReasoningVerbosity.BRIEF.value
     assert reasoning_options.get("include_plan") is True
-    assert "Doc A" in window._evidence_panel.toPlainText()
+    assert window._evidence_panel.evidence_count == 2
+    assert window._evidence_panel.evidence_items[0].label.startswith("[1] Doc A")
 
     window._plan_checkbox.setChecked(False)
     window._assumptions_checkbox.setChecked(False)
@@ -196,5 +223,81 @@ def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch):
     copied_conversation = QApplication.clipboard().text()
     assert "What is the latest metric?" in copied_conversation
     assert "Only sources please" in copied_conversation
+
+    window.close()
+
+
+def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch):
+    settings_service = build_settings_service(tmp_path, monkeypatch)
+    progress_service = ProgressService()
+    client = DummyLMStudioClient()
+    window = MainWindow(
+        settings_service=settings_service,
+        progress_service=progress_service,
+        lmstudio_client=client,
+        enable_health_monitor=False,
+    )
+
+    window.question_input.set_text("Explain the metric")
+    window.question_input.ask_button.click()
+    qt_app.processEvents()
+
+    assert client.calls == 1
+    assert window._evidence_panel.evidence_count == 2
+
+    window._evidence_panel.select_index(0)
+    qt_app.processEvents()
+    assert "Metric" in window._evidence_panel.evidence_items[0].snippet_html
+    assert "Page 5" in window._evidence_panel._metadata_label.text()
+
+    first_card = window.answer_view.cards[0]
+    first_card.citations_browser.anchorClicked.emit(QUrl("cite-2"))
+    qt_app.processEvents()
+    assert window._evidence_panel.selected_index == 1
+    assert first_card.selected_citation == 2
+
+    row_widget = window._evidence_panel._list.itemWidget(window._evidence_panel._list.item(0))
+    row_widget.exclude_button.setChecked(True)
+    qt_app.processEvents()
+
+    assert client.calls >= 2
+    assert client.last_options is not None
+    retrieval = client.last_options.get("retrieval", {})
+    assert retrieval.get("exclude") == ["doc-a"]
+    assert "doc-b" in retrieval.get("include", [])
+
+    window.close()
+
+
+def test_evidence_open_in_system_app(qt_app, tmp_path, monkeypatch):
+    settings_service = build_settings_service(tmp_path, monkeypatch)
+    progress_service = ProgressService()
+    client = DummyLMStudioClient()
+    window = MainWindow(
+        settings_service=settings_service,
+        progress_service=progress_service,
+        lmstudio_client=client,
+        enable_health_monitor=False,
+    )
+
+    window.question_input.set_text("Launch source")
+    window.question_input.ask_button.click()
+    qt_app.processEvents()
+
+    called: dict[str, QUrl] = {}
+
+    def fake_open(url: QUrl) -> bool:  # pragma: no cover - executed in test
+        called["url"] = url
+        return True
+
+    monkeypatch.setattr("PyQt6.QtGui.QDesktopServices.openUrl", staticmethod(fake_open))
+
+    window._evidence_panel.select_index(0)
+    qt_app.processEvents()
+    window._evidence_panel._open_button.click()
+    qt_app.processEvents()
+
+    assert "url" in called
+    assert called["url"].toLocalFile() == "/tmp/doc_a.txt"
 
     window.close()

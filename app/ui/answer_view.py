@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import html
 from datetime import datetime
 from typing import Iterable
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -47,6 +48,8 @@ def _format_token_usage(token_usage: dict[str, int] | None) -> str:
 class TurnCardWidget(QFrame):
     """Card summarizing a single conversation turn."""
 
+    citation_activated = pyqtSignal(int)
+
     def __init__(
         self,
         turn: ConversationTurn,
@@ -71,9 +74,10 @@ class TurnCardWidget(QFrame):
 
         self.answer_browser = QTextBrowser(self)
         self.answer_browser.setReadOnly(True)
-        self.answer_browser.setOpenExternalLinks(True)
+        self.answer_browser.setOpenExternalLinks(False)
+        self.answer_browser.setOpenLinks(False)
         self.answer_browser.setObjectName("turnAnswer")
-        self.answer_browser.setPlainText(turn.answer)
+        self.answer_browser.anchorClicked.connect(self._on_anchor_clicked)
         self.answer_browser.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
         layout.addWidget(self.answer_browser)
 
@@ -81,10 +85,13 @@ class TurnCardWidget(QFrame):
         self.metadata_label.setObjectName("turnMetadata")
         layout.addWidget(self.metadata_label)
 
-        self.citations_label = QLabel(self)
-        self.citations_label.setObjectName("turnCitations")
-        self.citations_label.setWordWrap(True)
-        layout.addWidget(self.citations_label)
+        self.citations_browser = QTextBrowser(self)
+        self.citations_browser.setObjectName("turnCitations")
+        self.citations_browser.setReadOnly(True)
+        self.citations_browser.setOpenExternalLinks(False)
+        self.citations_browser.setOpenLinks(False)
+        self.citations_browser.anchorClicked.connect(self._on_anchor_clicked)
+        layout.addWidget(self.citations_browser)
 
         self.reasoning_section = self._create_section("Reasoning summary", [])
         layout.addWidget(self.reasoning_section)
@@ -108,6 +115,7 @@ class TurnCardWidget(QFrame):
         actions_row.addWidget(self.copy_citations_button)
         layout.addLayout(actions_row)
 
+        self._selected_citation: int | None = None
         self._apply_turn_data()
         self.apply_settings(settings)
 
@@ -121,14 +129,8 @@ class TurnCardWidget(QFrame):
         metadata_text = f"Asked: {asked} | Answered: {answered} | {latency} | {tokens}"
         self.metadata_label.setText(metadata_text)
 
-        if turn.citations:
-            if all(isinstance(cite, str) for cite in turn.citations):
-                formatted = "\n".join(f"• {cite}" for cite in turn.citations)
-            else:
-                formatted = "\n".join(f"• {str(cite)}" for cite in turn.citations)
-            self.citations_label.setText(f"Citations:\n{formatted}")
-        else:
-            self.citations_label.setText("Citations: —")
+        self._render_answer()
+        self._render_citations()
 
         reasoning_bullets = list(turn.reasoning_bullets)
         self._set_section_content(self.reasoning_section, reasoning_bullets)
@@ -182,7 +184,7 @@ class TurnCardWidget(QFrame):
             self.question_label.text(),
             self.answer_browser.toPlainText(),
             self.metadata_label.text(),
-            self.citations_label.text(),
+            self.citations_browser.toPlainText(),
         ]
         for section in (
             self.reasoning_section,
@@ -202,8 +204,19 @@ class TurnCardWidget(QFrame):
         self._progress.notify("Answer copied to clipboard", level="info", duration_ms=1500)
 
     def _copy_citations(self) -> None:
-        QApplication.clipboard().setText(self.citations_label.text())
+        QApplication.clipboard().setText(self.citations_browser.toPlainText())
         self._progress.notify("Citations copied", level="info", duration_ms=1500)
+
+    def set_selected_citation(self, index: int | None) -> None:
+        if index == self._selected_citation:
+            return
+        self._selected_citation = index
+        self._render_answer()
+        self._render_citations()
+
+    @property
+    def selected_citation(self) -> int | None:
+        return self._selected_citation
 
     # ------------------------------------------------------------------
     def _create_section(self, title: str, lines: Iterable[str]) -> QFrame:
@@ -235,9 +248,74 @@ class TurnCardWidget(QFrame):
             label.clear()
             section.setVisible(False)
 
+    def _render_answer(self) -> None:
+        answer = html.escape(self.turn.answer or "")
+        answer = answer.replace("\n", "<br/>")
+        total_citations = len(self.turn.citations)
+        for index in range(1, total_citations + 1):
+            placeholder = f"[{index}]"
+            highlighted = placeholder
+            classes = []
+            if self._selected_citation == index:
+                classes.append("selected-citation")
+                highlighted = f"<span class='selected-citation'>{placeholder}</span>"
+            anchor = f"<a href='cite-{index}'>{highlighted}</a>"
+            answer = answer.replace(placeholder, anchor)
+        if self._selected_citation is not None:
+            style = "<style>.selected-citation{background-color:rgba(255,230,128,0.6);}</style>"
+        else:
+            style = ""
+        self.answer_browser.setHtml(style + answer)
+
+    def _render_citations(self) -> None:
+        if not self.turn.citations:
+            self.citations_browser.setHtml("<p>Citations: —</p>")
+            return
+        rows: list[str] = ["<p>Citations:</p><ul>"]
+        for idx, citation in enumerate(self.turn.citations, start=1):
+            if isinstance(citation, str):
+                label = citation
+            elif isinstance(citation, dict):
+                label = str(
+                    citation.get("source")
+                    or citation.get("title")
+                    or citation.get("document")
+                    or citation.get("path")
+                    or citation.get("snippet")
+                    or citation
+                )
+            else:
+                label = str(citation)
+            safe_label = html.escape(label)
+            if self._selected_citation == idx:
+                safe_label = (
+                    "<span class='selected-citation'>"
+                    + safe_label
+                    + "</span>"
+                )
+            rows.append(f"<li><a href='cite-{idx}'>[{idx}]</a> {safe_label}</li>")
+        rows.append("</ul>")
+        if self._selected_citation is not None:
+            style = "<style>.selected-citation{background-color:rgba(255,230,128,0.6);}</style>"
+        else:
+            style = ""
+        self.citations_browser.setHtml(style + "".join(rows))
+
+    def _on_anchor_clicked(self, url: QUrl) -> None:
+        target = url.toString()
+        if target.startswith("cite-"):
+            try:
+                index = int(target.split("-", 1)[1])
+            except (ValueError, IndexError):
+                return
+            self.set_selected_citation(index)
+            self.citation_activated.emit(index)
+
 
 class AnswerView(QScrollArea):
     """Scrollable list of :class:`ConversationTurn` cards."""
+
+    citation_activated = pyqtSignal(object, int)
 
     def __init__(
         self,
@@ -281,6 +359,8 @@ class AnswerView(QScrollArea):
         card = TurnCardWidget(turn, self._settings, self._progress, parent=self.widget())
         self._cards.append(card)
         self._layout.insertWidget(self._layout.count() - 1, card)
+        card.citation_activated.connect(lambda index, card=card: self._emit_citation(card, index))
+        card.set_selected_citation(None)
         self._scroll_to_bottom()
         return card
 
@@ -288,6 +368,13 @@ class AnswerView(QScrollArea):
         return "\n\n".join(card.to_plain_text() for card in self._cards)
 
     # ------------------------------------------------------------------
+    def highlight_citation(self, card: TurnCardWidget | None, index: int | None) -> None:
+        for current in self._cards:
+            if current is card:
+                current.set_selected_citation(index)
+            else:
+                current.set_selected_citation(None)
+
     def _apply_settings_to_cards(self) -> None:
         for card in self._cards:
             card.apply_settings(self._settings)
@@ -296,6 +383,9 @@ class AnswerView(QScrollArea):
         bar = self.verticalScrollBar()
         if bar is not None:
             bar.setValue(bar.maximum())
+
+    def _emit_citation(self, card: TurnCardWidget, index: int) -> None:
+        self.citation_activated.emit(card, index)
 
 
 __all__ = ["AnswerView", "TurnCardWidget"]

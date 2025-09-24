@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 import threading
 from functools import partial
 from importlib import metadata
@@ -25,7 +26,6 @@ from PyQt6.QtWidgets import (
     QShortcut,
     QSplitter,
     QStatusBar,
-    QTextBrowser,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -42,8 +42,9 @@ from ..services.conversation_manager import (
 from ..services.conversation_settings import ConversationSettings
 from ..services.lmstudio_client import LMStudioClient
 from ..services.progress_service import ProgressService, ProgressUpdate
+from .answer_view import AnswerView, TurnCardWidget
+from .evidence_panel import EvidencePanel
 from ..services.settings_service import SettingsService
-from .answer_view import AnswerView
 from .question_input_widget import QuestionInputWidget
 
 
@@ -136,6 +137,9 @@ class MainWindow(QMainWindow):
         self.settings_service.apply_theme()
         self.settings_service.apply_font_scale()
         self._update_lmstudio_status()
+        self._current_retrieval_scope: dict[str, list[str]] = {"include": [], "exclude": []}
+        self._last_question: str | None = None
+        self._active_card: TurnCardWidget | None = None
         if self.enable_health_monitor:
             self._health_timer = QTimer(self)
             self._health_timer.timeout.connect(self._update_lmstudio_status)
@@ -219,6 +223,7 @@ class MainWindow(QMainWindow):
             parent=chat_panel,
         )
         self.answer_view.setObjectName("answerView")
+        self.answer_view.citation_activated.connect(self._on_card_citation)
         chat_layout.addWidget(self.answer_view, 1)
 
         self._controls_frame = self._create_conversation_controls(chat_panel)
@@ -230,9 +235,10 @@ class MainWindow(QMainWindow):
         splitter.addWidget(chat_panel)
 
         # Right panel - evidence viewer
-        self._evidence_panel = QTextBrowser(splitter)
+        self._evidence_panel = EvidencePanel(splitter)
         self._evidence_panel.setObjectName("evidencePanel")
-        self._evidence_panel.setPlaceholderText("Evidence and citations will appear here.")
+        self._evidence_panel.scope_changed.connect(self._on_evidence_scope_changed)
+        self._evidence_panel.evidence_selected.connect(self._on_evidence_selected)
         splitter.addWidget(self._evidence_panel)
 
         splitter.setStretchFactor(0, 1)
@@ -352,32 +358,7 @@ class MainWindow(QMainWindow):
             return
 
         self.question_input.set_busy(True)
-        self.progress_service.start("chat-send", "Submitting question...")
-        asked_at = datetime.now()
-        try:
-            turn = self._conversation_manager.ask(
-                text,
-                reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
-                response_mode=self.conversation_settings.response_mode,
-            )
-        except LMStudioError as exc:
-            self.progress_service.finish("chat-send", "Send failed")
-            self.progress_service.notify(str(exc) or "Failed to contact LMStudio", level="error")
-            self.question_input.set_busy(False)
-            self._update_question_prerequisites(self._conversation_manager.connection_state)
-            return
-
-        answered_at = datetime.now()
-        turn.asked_at = asked_at
-        turn.answered_at = answered_at
-        turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
-        turn.token_usage = self._extract_token_usage(turn)
-        self._turns.append(turn)
-        self.answer_view.add_turn(turn)
-        self._update_evidence_panel(turn)
-        self.progress_service.finish("chat-send", "Answer received")
-        self.question_input.set_busy(False)
-        self._update_question_prerequisites(self._conversation_manager.connection_state)
+        self._ask_question(text, triggered_by_scope=False)
 
     def _focus_corpus(self) -> None:
         self._corpus_list.setFocus()
@@ -400,14 +381,87 @@ class MainWindow(QMainWindow):
                 continue
         return parsed or None
 
+    def _ask_question(self, question: str, *, triggered_by_scope: bool) -> None:
+        if not question.strip():
+            return
+
+        state = self._conversation_manager.connection_state
+        if not state.connected:
+            self._update_question_prerequisites(state)
+            self.progress_service.notify(
+                state.message or "LMStudio is unavailable.", level="error", duration_ms=4000
+            )
+            return
+
+        self._last_question = question
+        self.question_input.set_busy(True)
+        progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
+        self.progress_service.start("chat-send", progress_message)
+        asked_at = datetime.now()
+        extra_options = self._build_extra_request_options()
+        try:
+            turn = self._conversation_manager.ask(
+                question,
+                reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
+                response_mode=self.conversation_settings.response_mode,
+                extra_options=extra_options or None,
+            )
+        except LMStudioError as exc:
+            self.progress_service.finish("chat-send", "Send failed")
+            self.progress_service.notify(str(exc) or "Failed to contact LMStudio", level="error")
+            self.question_input.set_busy(False)
+            self._update_question_prerequisites(self._conversation_manager.connection_state)
+            return
+
+        answered_at = datetime.now()
+        turn.asked_at = asked_at
+        turn.answered_at = answered_at
+        turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
+        turn.token_usage = self._extract_token_usage(turn)
+        self._turns.append(turn)
+        card = self.answer_view.add_turn(turn)
+        self._active_card = card
+        self._update_evidence_panel(turn)
+        finish_message = "Evidence refreshed" if triggered_by_scope else "Answer received"
+        self.progress_service.finish("chat-send", finish_message)
+        self.question_input.set_busy(False)
+        self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+    def _build_extra_request_options(self) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        scope = self._current_retrieval_scope
+        include = list(scope.get("include", [])) if scope else []
+        exclude = list(scope.get("exclude", [])) if scope else []
+        if include or exclude:
+            options["retrieval"] = {"include": include, "exclude": exclude}
+        return options
+
     def _update_evidence_panel(self, turn: ConversationTurn) -> None:
         if not turn.citations:
-            self._evidence_panel.setPlainText("No citations provided.")
+            self._evidence_panel.clear()
+            self._current_retrieval_scope = {"include": [], "exclude": []}
             return
-        lines = []
-        for index, citation in enumerate(turn.citations, start=1):
-            lines.append(f"{index}. {citation}")
-        self._evidence_panel.setPlainText("\n".join(lines))
+        self._evidence_panel.set_evidence(turn.citations)
+        self._current_retrieval_scope = self._evidence_panel.current_scope
+        self.answer_view.highlight_citation(self._active_card, None)
+
+    def _on_card_citation(self, card: TurnCardWidget, index: int) -> None:
+        if card is not self._active_card:
+            self._active_card = card
+            self._evidence_panel.set_evidence(card.turn.citations)
+            self._current_retrieval_scope = self._evidence_panel.current_scope
+        self.answer_view.highlight_citation(card, index)
+        self._evidence_panel.select_index(index - 1)
+
+    def _on_evidence_selected(self, index: int, _identifier: str) -> None:
+        if self._active_card is None:
+            return
+        self.answer_view.highlight_citation(self._active_card, index + 1)
+
+    def _on_evidence_scope_changed(self, include: list[str], exclude: list[str]) -> None:
+        self._current_retrieval_scope = {"include": list(include), "exclude": list(exclude)}
+        if self._last_question:
+            self._ask_question(self._last_question, triggered_by_scope=True)
 
     def _update_question_prerequisites(self, state: ConnectionState) -> None:
         message = state.message if not state.connected else None

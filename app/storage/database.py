@@ -5,12 +5,16 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import json
+import re
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
-SCHEMA_VERSION = 1
+if TYPE_CHECKING:
+    from app.ingest.parsers import ParsedDocument
+
+SCHEMA_VERSION = 2
 SCHEMA_FILENAME = "schema.sql"
 
 
@@ -317,6 +321,162 @@ class DocumentRepository(BaseRepository):
         ).fetchall()
         return [self._row_to_dict(row) for row in rows if row is not None]  # type: ignore[list-item]
 
+
+class IngestDocumentRepository(BaseRepository):
+    """Manage parsed document text, previews, and search indexes."""
+
+    def store_version(
+        self,
+        *,
+        path: str,
+        checksum: str | None,
+        size: int | None,
+        mtime: float | None,
+        ctime: float | None,
+        parsed: "ParsedDocument",
+        base_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        normalized_path = str(Path(path).resolve())
+        metadata = dict(base_metadata or {})
+        metadata.update(parsed.metadata)
+        metadata_json = json.dumps(metadata, ensure_ascii=False)
+        sections_json = json.dumps(
+            [section.to_dict() for section in parsed.sections], ensure_ascii=False
+        )
+        pages_json = json.dumps([page.to_dict() for page in parsed.pages], ensure_ascii=False)
+        normalized_text = self._normalize_text(parsed.text)
+        preview = self._build_preview(normalized_text)
+        ocr_message = parsed.ocr_hint if parsed.needs_ocr else None
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT version
+                FROM ingest_documents
+                WHERE path = ?
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (normalized_path,),
+            ).fetchone()
+            version = int(row["version"]) + 1 if row else 1
+            cursor = connection.execute(
+                """
+                INSERT INTO ingest_documents (
+                    path, version, checksum, size, mtime, ctime, metadata, text,
+                    normalized_text, preview, sections, pages, needs_ocr, ocr_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_path,
+                    version,
+                    checksum,
+                    size,
+                    mtime,
+                    ctime,
+                    metadata_json,
+                    parsed.text,
+                    normalized_text,
+                    preview,
+                    sections_json,
+                    pages_json,
+                    int(parsed.needs_ocr),
+                    ocr_message,
+                ),
+            )
+            document_id = cursor.lastrowid
+            connection.execute(
+                """
+                INSERT INTO ingest_document_index (rowid, content, document_id)
+                VALUES (?, ?, ?)
+                """,
+                (document_id, normalized_text, document_id),
+            )
+        return self.get(document_id)  # type: ignore[return-value]
+
+    def get(self, document_id: int) -> dict[str, Any] | None:
+        row = self.db.connect().execute(
+            "SELECT * FROM ingest_documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+        return self._decode_document_row(row)
+
+    def get_latest_by_path(self, path: str | Path) -> dict[str, Any] | None:
+        normalized_path = str(Path(path).resolve())
+        row = self.db.connect().execute(
+            """
+            SELECT * FROM ingest_documents
+            WHERE path = ?
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (normalized_path,),
+        ).fetchone()
+        return self._decode_document_row(row)
+
+    def list_versions(self, path: str | Path) -> list[dict[str, Any]]:
+        normalized_path = str(Path(path).resolve())
+        rows = self.db.connect().execute(
+            """
+            SELECT * FROM ingest_documents
+            WHERE path = ?
+            ORDER BY version DESC
+            """,
+            (normalized_path,),
+        ).fetchall()
+        return [record for record in (self._decode_document_row(row) for row in rows) if record]
+
+    def list_all(self) -> list[dict[str, Any]]:
+        rows = self.db.connect().execute(
+            "SELECT * FROM ingest_documents ORDER BY created_at ASC",
+        ).fetchall()
+        return [record for record in (self._decode_document_row(row) for row in rows) if record]
+
+    def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self.db.connect().execute(
+            """
+            SELECT ingest_documents.*, highlight(ingest_document_index, 0, '<mark>', '</mark>') AS snippet
+            FROM ingest_document_index
+            INNER JOIN ingest_documents ON ingest_documents.id = ingest_document_index.rowid
+            WHERE ingest_document_index MATCH ?
+            ORDER BY bm25(ingest_document_index)
+            LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._decode_document_row(row)
+            if record is not None:
+                record["highlight"] = row["snippet"]
+                results.append(record)
+        return results
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        collapsed = re.sub(r"\s+", " ", text.strip())
+        return collapsed
+
+    @staticmethod
+    def _build_preview(text: str, *, limit: int = 320) -> str:
+        if len(text) <= limit:
+            return text
+        cutoff = text.rfind(" ", 0, limit)
+        if cutoff == -1:
+            cutoff = limit
+        return text[:cutoff].rstrip() + "…"
+
+    @staticmethod
+    def _decode_document_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        record = {key: row[key] for key in row.keys()}
+        for key in ("metadata", "sections", "pages"):
+            if record.get(key):
+                record[key] = json.loads(record[key])
+        record["needs_ocr"] = bool(record.get("needs_ocr"))
+        return record
 
 class ChatRepository(BaseRepository):
     """Manage chat sessions, citations, and reasoning summaries."""

@@ -537,9 +537,18 @@ class IngestService:
         include_patterns = list(include)
         exclude_patterns = list(exclude)
 
-        if include_patterns and not any(fnmatch(relative, pattern) for pattern in include_patterns):
+        def _matches(pattern: str) -> bool:
+            if fnmatch(relative, pattern):
+                return True
+            normalized_relative = relative.replace("\\", "/")
+            normalized_pattern = pattern.replace("\\", "/")
+            if fnmatch(normalized_relative, normalized_pattern):
+                return True
+            return fnmatch(path.name, pattern)
+
+        if include_patterns and not any(_matches(pattern) for pattern in include_patterns):
             return False
-        if exclude_patterns and any(fnmatch(relative, pattern) for pattern in exclude_patterns):
+        if exclude_patterns and any(_matches(pattern) for pattern in exclude_patterns):
             return False
         return True
 

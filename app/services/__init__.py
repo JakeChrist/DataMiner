@@ -14,6 +14,7 @@ from .conversation_manager import (
 )
 from .conversation_settings import ConversationSettings
 from .document_hierarchy import DocumentHierarchyService
+from .export_service import ExportService
 from .lmstudio_client import (
     ChatMessage,
     LMStudioClient,
@@ -30,6 +31,7 @@ __all__ = [
     "ConversationManager",
     "ConversationSettings",
     "ConversationTurn",
+    "ExportService",
     "PlanItem",
     "ReasoningArtifacts",
     "ReasoningVerbosity",
@@ -57,3 +59,11 @@ except ImportError:  # pragma: no cover
     SettingsService = None  # type: ignore[assignment]
 else:  # pragma: no cover - executed when Qt is available
     __all__.append("SettingsService")
+
+try:  # pragma: no cover - optional dependency guard
+    from .project_service import ProjectRecord, ProjectService
+    from .backup_service import BackupService
+except ImportError:  # pragma: no cover
+    ProjectRecord = ProjectService = BackupService = None  # type: ignore[assignment]
+else:  # pragma: no cover - executed when Qt is available
+    __all__.extend(["ProjectRecord", "ProjectService", "BackupService"])

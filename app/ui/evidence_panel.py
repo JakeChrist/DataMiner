@@ -183,6 +183,15 @@ class EvidencePanel(QWidget):
         row = self._list.currentRow()
         return row if row >= 0 else None
 
+    def selected_record(self) -> EvidenceRecord | None:
+        index = self.selected_index
+        if index is None:
+            return None
+        try:
+            return self._records[index]
+        except IndexError:  # pragma: no cover - defensive guard
+            return None
+
     @property
     def current_scope(self) -> dict[str, list[str]]:
         include = [record.identifier for record in self._records if record.state == "include"]

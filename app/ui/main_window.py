@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
-import threading
 from functools import partial
 from importlib import metadata
+from pathlib import Path
+import threading
+from typing import Any
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
-from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
+from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
+    QLineEdit,
     QLabel,
     QListWidget,
     QMainWindow,
@@ -42,9 +46,12 @@ from ..services.conversation_manager import (
 from ..services.conversation_settings import ConversationSettings
 from ..services.lmstudio_client import LMStudioClient
 from ..services.progress_service import ProgressService, ProgressUpdate
+from ..services.project_service import ProjectRecord, ProjectService
+from ..services.backup_service import BackupService
+from ..services.export_service import ExportService
+from ..services.settings_service import SettingsService
 from .answer_view import AnswerView, TurnCardWidget
 from .evidence_panel import EvidencePanel
-from ..services.settings_service import SettingsService
 from .question_input_widget import QuestionInputWidget
 
 
@@ -114,12 +121,18 @@ class MainWindow(QMainWindow):
         settings_service: SettingsService,
         progress_service: ProgressService,
         lmstudio_client: LMStudioClient,
+        project_service: ProjectService,
+        export_service: ExportService,
+        backup_service: BackupService,
         enable_health_monitor: bool = True,
     ) -> None:
         super().__init__()
         self.settings_service = settings_service
         self.progress_service = progress_service
         self.lmstudio_client = lmstudio_client
+        self.project_service = project_service
+        self.export_service = export_service
+        self.backup_service = backup_service
         self.enable_health_monitor = enable_health_monitor
         self._setup_window()
         self._create_actions()
@@ -128,6 +141,7 @@ class MainWindow(QMainWindow):
         self.conversation_settings = ConversationSettings()
         self._conversation_manager = ConversationManager(self.lmstudio_client)
         self._turns: list[ConversationTurn] = []
+        self._project_sessions: dict[int, dict[str, Any]] = {}
         self._connection_unsubscribe = self._conversation_manager.add_connection_listener(
             self._on_connection_state_changed
         )
@@ -140,6 +154,9 @@ class MainWindow(QMainWindow):
         self._current_retrieval_scope: dict[str, list[str]] = {"include": [], "exclude": []}
         self._last_question: str | None = None
         self._active_card: TurnCardWidget | None = None
+        self.project_service.projects_changed.connect(self._on_projects_changed)
+        self.project_service.active_project_changed.connect(self._on_active_project_changed)
+        self._initialise_project_state()
         if self.enable_health_monitor:
             self._health_timer = QTimer(self)
             self._health_timer.timeout.connect(self._update_lmstudio_status)
@@ -160,12 +177,61 @@ class MainWindow(QMainWindow):
         self.toggle_theme_action = QAction("Toggle Theme", self)
         self.toggle_theme_action.triggered.connect(self.settings_service.toggle_theme)
 
+        self.new_project_action = QAction("New Project…", self)
+        self.new_project_action.triggered.connect(self._prompt_new_project)
+
+        self.rename_project_action = QAction("Rename Project…", self)
+        self.rename_project_action.triggered.connect(self._prompt_rename_project)
+
+        self.delete_project_action = QAction("Delete Project", self)
+        self.delete_project_action.triggered.connect(self._delete_current_project)
+
+        self.reveal_storage_action = QAction("Reveal Project Storage", self)
+        self.reveal_storage_action.triggered.connect(self._reveal_project_storage)
+
+        self.remove_project_data_action = QAction("Remove Project Data", self)
+        self.remove_project_data_action.triggered.connect(self._purge_project_data)
+
+        self.backup_action = QAction("Create Backup…", self)
+        self.backup_action.triggered.connect(self._create_backup)
+
+        self.restore_action = QAction("Restore from Backup…", self)
+        self.restore_action.triggered.connect(self._restore_backup)
+
+        self.export_markdown_action = QAction("Export Conversation to Markdown…", self)
+        self.export_markdown_action.triggered.connect(self._export_conversation_markdown)
+
+        self.export_html_action = QAction("Export Conversation to HTML…", self)
+        self.export_html_action.triggered.connect(self._export_conversation_html)
+
+        self.export_snippet_action = QAction("Export Selected Snippet…", self)
+        self.export_snippet_action.triggered.connect(self._export_selected_snippet)
+
+        self.export_markdown_action.setEnabled(False)
+        self.export_html_action.setEnabled(False)
+        self.export_snippet_action.setEnabled(False)
+
     def _create_menus_and_toolbar(self) -> None:
         menubar = QMenuBar(self)
         self.setMenuBar(menubar)
 
         file_menu = QMenu("File", self)
         file_menu.addAction(self.settings_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.new_project_action)
+        file_menu.addAction(self.rename_project_action)
+        file_menu.addAction(self.delete_project_action)
+        file_menu.addAction(self.remove_project_data_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.reveal_storage_action)
+        file_menu.addSeparator()
+        export_menu = file_menu.addMenu("Export")
+        export_menu.addAction(self.export_markdown_action)
+        export_menu.addAction(self.export_html_action)
+        export_menu.addAction(self.export_snippet_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.backup_action)
+        file_menu.addAction(self.restore_action)
         menubar.addMenu(file_menu)
 
         help_menu = QMenu("Help", self)
@@ -180,6 +246,14 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.settings_action)
         toolbar.addAction(self.help_action)
         toolbar.addAction(self.toggle_theme_action)
+        toolbar.addSeparator()
+        self._project_combo = QComboBox(toolbar)
+        self._project_combo.setToolTip("Switch active project")
+        self._project_combo.currentIndexChanged.connect(self._on_project_combo_changed)
+        toolbar.addWidget(self._project_combo)
+        toolbar.addSeparator()
+        toolbar.addAction(self.new_project_action)
+        toolbar.addAction(self.backup_action)
         self.addToolBar(toolbar)
 
     def _create_status_bar(self) -> None:
@@ -253,6 +327,335 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self._copy_chat_text)
         self._update_question_prerequisites(self._conversation_manager.connection_state)
 
+    # ------------------------------------------------------------------
+    # Project coordination
+    def _initialise_project_state(self) -> None:
+        self._refresh_project_selector()
+        active = self.project_service.active_project()
+        self._load_project_session(active.id)
+
+    def _refresh_project_selector(self) -> None:
+        projects = self.project_service.list_projects()
+        current_id = self.project_service.active_project_id
+        self._project_combo.blockSignals(True)
+        self._project_combo.clear()
+        current_index = -1
+        for record in projects:
+            self._project_combo.addItem(record.name, record.id)
+            if record.id == current_id:
+                current_index = self._project_combo.count() - 1
+        if current_index >= 0:
+            self._project_combo.setCurrentIndex(current_index)
+        self._project_combo.blockSignals(False)
+        self.delete_project_action.setEnabled(len(projects) > 1)
+
+    def _on_projects_changed(self, _projects: list[ProjectRecord]) -> None:
+        self._refresh_project_selector()
+
+    def _on_active_project_changed(self, project: ProjectRecord) -> None:
+        self._refresh_project_selector()
+        self._load_project_session(project.id)
+
+    def _on_project_combo_changed(self, index: int) -> None:
+        project_id = self._project_combo.itemData(index)
+        if not isinstance(project_id, int):
+            return
+        if project_id == self.project_service.active_project_id:
+            return
+        self._store_active_project_session()
+        self.project_service.set_active_project(project_id)
+
+    def _load_project_session(self, project_id: int) -> None:
+        session = self._project_sessions.get(project_id)
+        if session is None:
+            snapshot = self.project_service.load_conversation_settings(project_id)
+            session = {"settings": snapshot}
+            self._project_sessions[project_id] = session
+        self._turns = list(session.get("turns", []))
+        self._conversation_manager.turns = list(self._turns)
+        self.answer_view.render_turns(self._turns)
+        self._active_card = self.answer_view.cards[-1] if self.answer_view.cards else None
+        scope = session.get("scope")
+        if isinstance(scope, dict):
+            include = list(scope.get("include", []))
+            exclude = list(scope.get("exclude", []))
+            self._current_retrieval_scope = {"include": include, "exclude": exclude}
+        else:
+            self._current_retrieval_scope = {"include": [], "exclude": []}
+        self._last_question = session.get("last_question")
+        self._apply_conversation_settings_snapshot(session.get("settings"))
+        if self._turns and self._turns[-1].citations:
+            self._evidence_panel.set_evidence(self._turns[-1].citations)
+        else:
+            self._evidence_panel.clear()
+        self._update_export_actions()
+        self.export_snippet_action.setEnabled(self._evidence_panel.selected_index is not None)
+
+    def _snapshot_conversation_settings(self) -> dict[str, Any]:
+        return {
+            "reasoning_verbosity": self.conversation_settings.reasoning_verbosity.value,
+            "show_plan": self.conversation_settings.show_plan,
+            "show_assumptions": self.conversation_settings.show_assumptions,
+            "sources_only": self.conversation_settings.sources_only_mode,
+        }
+
+    def _apply_conversation_settings_snapshot(self, snapshot: Any) -> None:
+        data = snapshot if isinstance(snapshot, dict) else {}
+        verbosity = data.get("reasoning_verbosity")
+        resolved: ReasoningVerbosity | None = None
+        if isinstance(verbosity, str):
+            try:
+                resolved = ReasoningVerbosity[verbosity.upper()]
+            except KeyError:
+                try:
+                    resolved = ReasoningVerbosity(verbosity)
+                except ValueError:
+                    resolved = None
+        if isinstance(verbosity, ReasoningVerbosity):
+            resolved = verbosity
+        if resolved and resolved is not self.conversation_settings.reasoning_verbosity:
+            self.conversation_settings.set_reasoning_verbosity(resolved)
+        plan = data.get("show_plan")
+        if isinstance(plan, bool):
+            self.conversation_settings.set_show_plan(plan)
+        assumptions = data.get("show_assumptions")
+        if isinstance(assumptions, bool):
+            self.conversation_settings.set_show_assumptions(assumptions)
+        sources_only = data.get("sources_only")
+        if isinstance(sources_only, bool):
+            self.conversation_settings.set_sources_only_mode(sources_only)
+
+    def _update_session(self, project_id: int | None = None, **fields: Any) -> None:
+        if project_id is None:
+            project_id = self.project_service.active_project_id
+        session = self._project_sessions.setdefault(project_id, {})
+        session.update(fields)
+
+    def _store_active_project_session(self) -> None:
+        project_id = self.project_service.active_project_id
+        snapshot = self._snapshot_conversation_settings()
+        self._update_session(
+            project_id,
+            turns=list(self._turns),
+            scope=dict(self._current_retrieval_scope),
+            last_question=self._last_question,
+            settings=snapshot,
+        )
+        self.project_service.save_conversation_settings(project_id, snapshot)
+
+    def _build_default_export_path(self, suffix: str) -> str:
+        project = self.project_service.active_project()
+        safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in project.name)
+        slug = "-".join(filter(None, safe.split("-"))) or "project"
+        base = Path(self.project_service.storage_root)
+        return str(base / f"{slug}{suffix}")
+
+    def _prompt_new_project(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "New Project",
+            "Project name:",
+            QLineEdit.EchoMode.Normal,
+        )
+        if not ok:
+            return
+        cleaned = name.strip()
+        if not cleaned:
+            return
+        project = self.project_service.create_project(cleaned)
+        self._show_toast(f"Project '{project.name}' created.", level="info", duration_ms=2500)
+
+    def _prompt_rename_project(self) -> None:
+        project = self.project_service.active_project()
+        name, ok = QInputDialog.getText(
+            self,
+            "Rename Project",
+            "Project name:",
+            QLineEdit.EchoMode.Normal,
+            project.name,
+        )
+        if not ok:
+            return
+        cleaned = name.strip()
+        if not cleaned or cleaned == project.name:
+            return
+        updated = self.project_service.rename_project(project.id, name=cleaned)
+        self._show_toast(f"Project renamed to {updated.name}.", level="info", duration_ms=2000)
+
+    def _delete_current_project(self) -> None:
+        project = self.project_service.active_project()
+        alternatives = [p for p in self.project_service.list_projects() if p.id != project.id]
+        if not alternatives:
+            QMessageBox.information(
+                self,
+                "Delete Project",
+                "Create another project before deleting this one.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete Project",
+            f"Delete project '{project.name}'? This action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._store_active_project_session()
+        replacement = alternatives[0]
+        self.project_service.set_active_project(replacement.id)
+        self.project_service.delete_project(project.id)
+        self._project_sessions.pop(project.id, None)
+        self._show_toast("Project deleted.", level="warning", duration_ms=2500)
+
+    def _reveal_project_storage(self) -> None:
+        project = self.project_service.active_project()
+        path = self.project_service.get_project_storage(project.id)
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _purge_project_data(self) -> None:
+        project = self.project_service.active_project()
+        reply = QMessageBox.question(
+            self,
+            "Remove Project Data",
+            "Remove indexed data, chats, and cached assets for this project?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.project_service.purge_project_data(project.id)
+        self._turns.clear()
+        self._conversation_manager.turns.clear()
+        self.answer_view.clear()
+        self._current_retrieval_scope = {"include": [], "exclude": []}
+        self._evidence_panel.clear()
+        self._last_question = None
+        self._active_card = None
+        self.export_snippet_action.setEnabled(False)
+        self._update_export_actions()
+        self._update_session(turns=[], scope=self._current_retrieval_scope, last_question=None)
+        self._show_toast("Project data removed.", level="info", duration_ms=3000)
+
+    def _create_backup(self) -> None:
+        default_path = self._build_default_export_path("-backup.zip")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Create Backup",
+            default_path,
+            "Zip Archives (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            saved = self.backup_service.create_backup(path)
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(self, "Backup Failed", str(exc) or "Unable to create backup.")
+            return
+        self._show_toast(f"Backup saved to {saved}", level="info", duration_ms=3000)
+
+    def _restore_backup(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Restore Backup",
+            "",
+            "Zip Archives (*.zip)",
+        )
+        if not path:
+            return
+        try:
+            self._project_sessions.clear()
+            self.backup_service.restore_backup(path)
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(self, "Restore Failed", str(exc) or "Unable to restore backup.")
+            return
+        self._show_toast("Backup restored.", level="info", duration_ms=3000)
+
+    def _export_conversation_markdown(self) -> None:
+        if not self._turns:
+            QMessageBox.information(
+                self, "Export Conversation", "No conversation available to export."
+            )
+            return
+        project = self.project_service.active_project()
+        default_path = self._build_default_export_path("-conversation.md")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Conversation to Markdown",
+            default_path,
+            "Markdown Files (*.md)",
+        )
+        if not path:
+            return
+        try:
+            self.export_service.export_conversation_markdown(
+                path,
+                self._turns,
+                title=f"{project.name} Conversation",
+                metadata={"Project": project.name},
+            )
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(self, "Export Failed", str(exc) or "Unable to export conversation.")
+            return
+        self._show_toast("Conversation exported.", level="info", duration_ms=2500)
+
+    def _export_conversation_html(self) -> None:
+        if not self._turns:
+            QMessageBox.information(
+                self, "Export Conversation", "No conversation available to export."
+            )
+            return
+        project = self.project_service.active_project()
+        default_path = self._build_default_export_path("-conversation.html")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Conversation to HTML",
+            default_path,
+            "HTML Files (*.html)",
+        )
+        if not path:
+            return
+        try:
+            self.export_service.export_conversation_html(
+                path,
+                self._turns,
+                title=f"{project.name} Conversation",
+                metadata={"Project": project.name},
+            )
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(self, "Export Failed", str(exc) or "Unable to export conversation.")
+            return
+        self._show_toast("Conversation exported.", level="info", duration_ms=2500)
+
+    def _export_selected_snippet(self) -> None:
+        record = self._evidence_panel.selected_record()
+        if record is None:
+            QMessageBox.information(
+                self, "Export Snippet", "Select an evidence snippet to export first."
+            )
+            return
+        default_path = self._build_default_export_path("-snippet.txt")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Selected Snippet",
+            default_path,
+            "Text Files (*.txt)",
+        )
+        if not path:
+            return
+        payload = {
+            "label": record.label,
+            "snippet_html": record.snippet_html,
+            "metadata_text": record.metadata_text,
+        }
+        try:
+            self.export_service.export_snippets_text(path, [payload])
+        except Exception as exc:  # pragma: no cover - user feedback path
+            QMessageBox.critical(self, "Export Failed", str(exc) or "Unable to export snippet.")
+            return
+        self._show_toast("Snippet exported.", level="info", duration_ms=2000)
+
     def _create_conversation_controls(self, parent: QWidget) -> QFrame:
         frame = QFrame(parent)
         layout = QHBoxLayout(frame)
@@ -310,6 +713,16 @@ class MainWindow(QMainWindow):
         self.progress_service.progress_updated.connect(self._on_progress_updated)
         self.progress_service.progress_finished.connect(self._on_progress_finished)
         self.progress_service.toast_requested.connect(self._show_toast)
+        self.conversation_settings.reasoning_verbosity_changed.connect(
+            self._persist_conversation_settings
+        )
+        self.conversation_settings.show_plan_changed.connect(self._persist_conversation_settings)
+        self.conversation_settings.show_assumptions_changed.connect(
+            self._persist_conversation_settings
+        )
+        self.conversation_settings.sources_only_mode_changed.connect(
+            self._persist_conversation_settings
+        )
 
     def _on_reasoning_verbosity_changed(self, index: int) -> None:
         data = self._verbosity_combo.itemData(index)
@@ -343,6 +756,17 @@ class MainWindow(QMainWindow):
             self._sources_only_checkbox.blockSignals(True)
             self._sources_only_checkbox.setChecked(enabled)
             self._sources_only_checkbox.blockSignals(False)
+
+    def _persist_conversation_settings(self, *_args: object) -> None:
+        snapshot = self._snapshot_conversation_settings()
+        project_id = self.project_service.active_project_id
+        self._update_session(project_id, settings=snapshot)
+        self.project_service.save_conversation_settings(project_id, snapshot)
+
+    def _update_export_actions(self) -> None:
+        has_turns = bool(self._turns)
+        self.export_markdown_action.setEnabled(has_turns)
+        self.export_html_action.setEnabled(has_turns)
 
     # ------------------------------------------------------------------
     def _handle_ask(self, text: str) -> None:
@@ -394,6 +818,7 @@ class MainWindow(QMainWindow):
             return
 
         self._last_question = question
+        self._update_session(last_question=question)
         self.question_input.set_busy(True)
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
@@ -419,9 +844,11 @@ class MainWindow(QMainWindow):
         turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
         turn.token_usage = self._extract_token_usage(turn)
         self._turns.append(turn)
+        self._update_session(turns=list(self._turns))
         card = self.answer_view.add_turn(turn)
         self._active_card = card
         self._update_evidence_panel(turn)
+        self._update_export_actions()
         finish_message = "Evidence refreshed" if triggered_by_scope else "Answer received"
         self.progress_service.finish("chat-send", finish_message)
         self.question_input.set_busy(False)
@@ -440,9 +867,13 @@ class MainWindow(QMainWindow):
         if not turn.citations:
             self._evidence_panel.clear()
             self._current_retrieval_scope = {"include": [], "exclude": []}
+            self._update_session(scope=self._current_retrieval_scope)
+            self.export_snippet_action.setEnabled(False)
             return
         self._evidence_panel.set_evidence(turn.citations)
         self._current_retrieval_scope = self._evidence_panel.current_scope
+        self._update_session(scope=self._current_retrieval_scope)
+        self.export_snippet_action.setEnabled(self._evidence_panel.evidence_count > 0)
         self.answer_view.highlight_citation(self._active_card, None)
 
     def _on_card_citation(self, card: TurnCardWidget, index: int) -> None:
@@ -457,9 +888,11 @@ class MainWindow(QMainWindow):
         if self._active_card is None:
             return
         self.answer_view.highlight_citation(self._active_card, index + 1)
+        self.export_snippet_action.setEnabled(index >= 0)
 
     def _on_evidence_scope_changed(self, include: list[str], exclude: list[str]) -> None:
         self._current_retrieval_scope = {"include": list(include), "exclude": list(exclude)}
+        self._update_session(scope=self._current_retrieval_scope)
         if self._last_question:
             self._ask_question(self._last_question, triggered_by_scope=True)
 
@@ -546,6 +979,10 @@ class MainWindow(QMainWindow):
                 unsubscribe()
             except Exception:
                 pass
+        try:
+            self._store_active_project_session()
+        except Exception:
+            pass
         return super().closeEvent(event)
 
 

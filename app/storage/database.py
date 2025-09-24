@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 if TYPE_CHECKING:
     from app.ingest.parsers import ParsedDocument
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA_FILENAME = "schema.sql"
 
 
@@ -197,20 +197,22 @@ class DocumentRepository(BaseRepository):
         source_type: str | None = None,
         source_path: str | Path | None = None,
         metadata: dict[str, Any] | None = None,
+        folder_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        metadata_json = None
-        if metadata is not None:
-            import json
-
-            metadata_json = json.dumps(metadata)
-        stored_path = str(source_path) if source_path is not None else None
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+        stored_path = self._normalize_path(source_path)
+        folder = self._normalize_folder(folder_path)
+        if folder is None and stored_path is not None:
+            folder = self._normalize_folder(Path(stored_path).parent)
         with self.transaction() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO documents (project_id, title, source_type, source_path, metadata)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO documents (
+                    project_id, title, source_type, source_path, folder_path, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, title, source_type, stored_path, metadata_json),
+                (project_id, title, source_type, stored_path, folder, metadata_json),
             )
             document_id = cursor.lastrowid
         return self.get(document_id)  # type: ignore[return-value]
@@ -219,32 +221,133 @@ class DocumentRepository(BaseRepository):
         row = self.db.connect().execute(
             "SELECT * FROM documents WHERE id = ?", (document_id,)
         ).fetchone()
-        data = self._row_to_dict(row)
-        if data and data.get("metadata"):
-            import json
-
-            data["metadata"] = json.loads(data["metadata"])
-        return data
+        return self._decode_document_row(row)
 
     def list_for_project(self, project_id: int) -> list[dict[str, Any]]:
         rows = self.db.connect().execute(
             "SELECT * FROM documents WHERE project_id = ? ORDER BY created_at ASC",
             (project_id,),
         ).fetchall()
-        documents: list[dict[str, Any]] = []
-        for row in rows:
-            document = self._row_to_dict(row)
-            if document and document.get("metadata"):
-                import json
+        return [record for record in (self._decode_document_row(row) for row in rows) if record]
 
-                document["metadata"] = json.loads(document["metadata"])
-            if document:
-                documents.append(document)
-        return documents
+    def list_for_folder(
+        self,
+        project_id: int,
+        folder_path: str | Path,
+        *,
+        recursive: bool = True,
+    ) -> list[dict[str, Any]]:
+        return self.list_for_scope(project_id, folder=folder_path, recursive=recursive)
+
+    def list_for_tag(self, project_id: int, tag_id: int) -> list[dict[str, Any]]:
+        return self.list_for_scope(project_id, tags=[tag_id])
+
+    def list_for_scope(
+        self,
+        project_id: int,
+        *,
+        tags: Iterable[int] | None = None,
+        folder: str | Path | None = None,
+        recursive: bool = True,
+    ) -> list[dict[str, Any]]:
+        tag_ids = list(dict.fromkeys(tags or []))
+        connection = self.db.connect()
+        params: list[Any] = [project_id]
+        where_clauses = ["documents.project_id = ?"]
+        joins: list[str] = []
+        group_by = ""
+        having = ""
+
+        if tag_ids:
+            joins.append("INNER JOIN tag_links ON tag_links.document_id = documents.id")
+            placeholders = ",".join("?" for _ in tag_ids)
+            where_clauses.append(f"tag_links.tag_id IN ({placeholders})")
+            params.extend(tag_ids)
+            group_by = " GROUP BY documents.id"
+            having = " HAVING COUNT(DISTINCT tag_links.tag_id) = ?"
+
+        normalized_folder = self._normalize_folder(folder) if folder is not None else None
+        if normalized_folder is not None:
+            if recursive:
+                where_clauses.append(
+                    "(documents.folder_path = ? OR documents.folder_path LIKE ? ESCAPE '\\')"
+                )
+                params.extend(
+                    [
+                        normalized_folder,
+                        self._build_folder_like_pattern(normalized_folder),
+                    ]
+                )
+            else:
+                where_clauses.append("documents.folder_path = ?")
+                params.append(normalized_folder)
+
+        if tag_ids:
+            params.append(len(tag_ids))
+
+        query = "SELECT documents.* FROM documents"
+        if joins:
+            query = " ".join([query] + joins)
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        query += group_by + having + " ORDER BY documents.created_at ASC"
+
+        rows = connection.execute(query, params).fetchall()
+        return [record for record in (self._decode_document_row(row) for row in rows) if record]
+
+    def update(self, document_id: int, **fields: Any) -> dict[str, Any] | None:
+        if not fields:
+            return self.get(document_id)
+
+        updates: list[str] = []
+        values: list[Any] = []
+
+        if "metadata" in fields:
+            metadata_value = fields["metadata"]
+            fields["metadata"] = json.dumps(metadata_value) if metadata_value is not None else None
+
+        if "source_path" in fields:
+            normalized = self._normalize_path(fields["source_path"])
+            fields["source_path"] = normalized
+            if "folder_path" not in fields:
+                folder_value: str | Path | None
+                if normalized is not None:
+                    folder_value = Path(normalized).parent
+                else:
+                    folder_value = None
+                fields["folder_path"] = self._normalize_folder(folder_value)
+
+        if "folder_path" in fields:
+            fields["folder_path"] = self._normalize_folder(fields["folder_path"])
+
+        for key, value in fields.items():
+            updates.append(f"{key} = ?")
+            values.append(value)
+        values.append(document_id)
+
+        with self.transaction() as connection:
+            connection.execute(
+                f"UPDATE documents SET {', '.join(updates)} WHERE id = ?",
+                values,
+            )
+        return self.get(document_id)
 
     def delete(self, document_id: int) -> None:
+        tag_ids = [tag["id"] for tag in self.list_tags_for_document(document_id)]
         with self.transaction() as connection:
             connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+            if tag_ids:
+                connection.executemany(
+                    """
+                    UPDATE tags
+                    SET document_count = CASE
+                        WHEN document_count > 0 THEN document_count - 1
+                        ELSE 0
+                    END
+                    WHERE id = ?
+                    """,
+                    [(tag_id,) for tag_id in set(tag_ids)],
+                )
 
     def add_file_version(
         self,
@@ -266,7 +369,13 @@ class DocumentRepository(BaseRepository):
                 INSERT INTO file_versions (document_id, version, file_path, checksum, file_size)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (document_id, version, str(file_path), checksum, file_size),
+                (
+                    document_id,
+                    version,
+                    str(Path(file_path).resolve()),
+                    checksum,
+                    file_size,
+                ),
             )
             version_id = cursor.lastrowid
         return self.get_file_version(version_id)  # type: ignore[return-value]
@@ -303,10 +412,34 @@ class DocumentRepository(BaseRepository):
 
     def tag_document(self, document_id: int, tag_id: int) -> None:
         with self.transaction() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "INSERT OR IGNORE INTO tag_links (tag_id, document_id) VALUES (?, ?)",
                 (tag_id, document_id),
             )
+            if cursor.rowcount:
+                connection.execute(
+                    "UPDATE tags SET document_count = document_count + 1 WHERE id = ?",
+                    (tag_id,),
+                )
+
+    def untag_document(self, document_id: int, tag_id: int) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "DELETE FROM tag_links WHERE tag_id = ? AND document_id = ?",
+                (tag_id, document_id),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    """
+                    UPDATE tags
+                    SET document_count = CASE
+                        WHEN document_count > 0 THEN document_count - 1
+                        ELSE 0
+                    END
+                    WHERE id = ?
+                    """,
+                    (tag_id,),
+                )
 
     def list_tags_for_document(self, document_id: int) -> list[dict[str, Any]]:
         rows = self.db.connect().execute(
@@ -320,6 +453,72 @@ class DocumentRepository(BaseRepository):
             (document_id,),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows if row is not None]  # type: ignore[list-item]
+
+    def list_tags_for_project(self, project_id: int) -> list[dict[str, Any]]:
+        rows = self.db.connect().execute(
+            "SELECT * FROM tags WHERE project_id = ? ORDER BY name ASC",
+            (project_id,),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows if row is not None]  # type: ignore[list-item]
+
+    def delete_tag(self, tag_id: int) -> None:
+        with self.transaction() as connection:
+            connection.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+
+    def refresh_tag_counts(self, project_id: int | None = None) -> None:
+        connection = self.db.connect()
+        if project_id is None:
+            connection.execute(
+                """
+                UPDATE tags
+                SET document_count = (
+                    SELECT COUNT(*) FROM tag_links WHERE tag_links.tag_id = tags.id
+                )
+                """
+            )
+            return
+        connection.execute(
+            """
+            UPDATE tags
+            SET document_count = (
+                SELECT COUNT(*)
+                FROM tag_links
+                INNER JOIN documents ON documents.id = tag_links.document_id
+                WHERE tag_links.tag_id = tags.id AND documents.project_id = ?
+            )
+            WHERE project_id = ?
+            """,
+            (project_id, project_id),
+        )
+
+    @staticmethod
+    def _normalize_path(path: str | Path | None) -> str | None:
+        if path is None:
+            return None
+        return str(Path(path).resolve())
+
+    @staticmethod
+    def _normalize_folder(path: str | Path | None) -> str | None:
+        if path in (None, ""):
+            return None
+        return str(Path(path).resolve())
+
+    @staticmethod
+    def _build_folder_like_pattern(folder: str) -> str:
+        sanitized = folder.replace("%", "\\%").replace("_", "\\_")
+        if sanitized.endswith(("/", "\\")):
+            return f"{sanitized}%"
+        separator = "\\" if "\\" in folder and "/" not in folder else "/"
+        return f"{sanitized}{separator}%"
+
+    @staticmethod
+    def _decode_document_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        record = {key: row[key] for key in row.keys()}
+        if record.get("metadata"):
+            record["metadata"] = json.loads(record["metadata"])
+        return record
 
 
 class IngestDocumentRepository(BaseRepository):
@@ -481,11 +680,18 @@ class IngestDocumentRepository(BaseRepository):
 class ChatRepository(BaseRepository):
     """Manage chat sessions, citations, and reasoning summaries."""
 
-    def create(self, project_id: int, title: str | None = None) -> dict[str, Any]:
+    def create(
+        self,
+        project_id: int,
+        title: str | None = None,
+        *,
+        query_scope: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = json.dumps(query_scope) if query_scope is not None else None
         with self.transaction() as connection:
             cursor = connection.execute(
-                "INSERT INTO chats (project_id, title) VALUES (?, ?)",
-                (project_id, title),
+                "INSERT INTO chats (project_id, title, query_scope) VALUES (?, ?, ?)",
+                (project_id, title, payload),
             )
             chat_id = cursor.lastrowid
         return self.get(chat_id)  # type: ignore[return-value]
@@ -494,14 +700,32 @@ class ChatRepository(BaseRepository):
         row = self.db.connect().execute(
             "SELECT * FROM chats WHERE id = ?", (chat_id,)
         ).fetchone()
-        return self._row_to_dict(row)
+        return self._decode_chat_row(row)
 
     def list_for_project(self, project_id: int) -> list[dict[str, Any]]:
         rows = self.db.connect().execute(
             "SELECT * FROM chats WHERE project_id = ? ORDER BY created_at ASC",
             (project_id,),
         ).fetchall()
-        return [self._row_to_dict(row) for row in rows if row is not None]  # type: ignore[list-item]
+        return [record for record in (self._decode_chat_row(row) for row in rows) if record]
+
+    def get_query_scope(self, chat_id: int) -> dict[str, Any] | None:
+        chat = self.get(chat_id)
+        if not chat:
+            return None
+        scope = chat.get("query_scope")
+        return scope if isinstance(scope, dict) else None
+
+    def set_query_scope(
+        self, chat_id: int, scope: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        payload = json.dumps(scope) if scope is not None else None
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE chats SET query_scope = ? WHERE id = ?",
+                (payload, chat_id),
+            )
+        return self.get(chat_id)
 
     def delete(self, chat_id: int) -> None:
         with self.transaction() as connection:
@@ -562,6 +786,15 @@ class ChatRepository(BaseRepository):
             (chat_id,),
         ).fetchall()
         return [self._row_to_dict(row) for row in rows if row is not None]  # type: ignore[list-item]
+
+    @staticmethod
+    def _decode_chat_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        record = {key: row[key] for key in row.keys()}
+        if record.get("query_scope"):
+            record["query_scope"] = json.loads(record["query_scope"])
+        return record
 
 
 class BackgroundTaskLogRepository(BaseRepository):

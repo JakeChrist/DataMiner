@@ -118,3 +118,49 @@ def test_project_isolation(
     # deleting one project should not remove the other project's data
     project_repo.delete(project_a["id"])
     assert document_repo.get(doc_b["id"]) is not None
+
+
+def test_tag_counts_and_scope_queries(
+    tmp_path: Path, project_repo: ProjectRepository, document_repo: DocumentRepository
+) -> None:
+    project = project_repo.create("Project Tags")
+    doc_path = tmp_path / "corpus" / "alpha" / "plan.txt"
+    doc_path.parent.mkdir(parents=True)
+    doc_path.write_text("content")
+
+    document = document_repo.create(
+        project["id"],
+        "Launch Plan",
+        source_path=doc_path,
+        metadata={"pages": 3},
+    )
+    tag_focus = document_repo.create_tag(project["id"], "focus")
+    tag_aux = document_repo.create_tag(project["id"], "aux")
+
+    assert tag_focus["document_count"] == 0
+
+    document_repo.tag_document(document["id"], tag_focus["id"])
+    document_repo.tag_document(document["id"], tag_aux["id"])
+
+    refreshed = document_repo.get_tag(tag_focus["id"])
+    assert refreshed["document_count"] == 1
+
+    tags_for_project = document_repo.list_tags_for_project(project["id"])
+    assert {tag["name"] for tag in tags_for_project} == {"focus", "aux"}
+
+    document_repo.untag_document(document["id"], tag_focus["id"])
+    assert document_repo.get_tag(tag_focus["id"])["document_count"] == 0
+
+    folder_docs = document_repo.list_for_folder(project["id"], document["folder_path"])
+    assert [doc["id"] for doc in folder_docs] == [document["id"]]
+
+    tag_docs = document_repo.list_for_tag(project["id"], tag_aux["id"])
+    assert [doc["id"] for doc in tag_docs] == [document["id"]]
+
+    scoped_docs = document_repo.list_for_scope(
+        project["id"], tags=[tag_aux["id"]], folder=document["folder_path"]
+    )
+    assert [doc["id"] for doc in scoped_docs] == [document["id"]]
+
+    document_repo.delete(document["id"])
+    assert document_repo.get_tag(tag_aux["id"])["document_count"] == 0

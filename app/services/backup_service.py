@@ -30,10 +30,18 @@ class BackupService:
         if not destination_path.parent.exists():
             destination_path.parent.mkdir(parents=True, exist_ok=True)
 
+        storage_locations: dict[str, str] = {}
+        for record in self._projects.list_projects():
+            location = self._projects.get_project_storage_location(record.id)
+            if location is None:
+                continue
+            storage_locations[str(record.id)] = str(location)
+
         manifest = {
             "created": _dt.datetime.now(_dt.UTC).isoformat().replace("+00:00", "Z"),
             "schema_version": SCHEMA_VERSION,
             "active_project": self._projects.active_project_id,
+            "storage_locations": storage_locations,
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -42,14 +50,16 @@ class BackupService:
             self._projects.database_manager.export_database(db_export)
             manifest_path = tmp_path / MANIFEST_NAME
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-            derived_root = self._projects.storage_root / "projects"
 
             with zipfile.ZipFile(destination_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.write(db_export, "database/dataminer.db")
-                if derived_root.exists():
-                    for path in derived_root.rglob("*"):
+                for project_id, path_str in storage_locations.items():
+                    project_path = Path(path_str)
+                    if not project_path.exists():
+                        continue
+                    for path in project_path.rglob("*"):
                         if path.is_file():
-                            arcname = Path("derived") / path.relative_to(self._projects.storage_root)
+                            arcname = Path("derived") / project_id / path.relative_to(project_path)
                             archive.write(path, arcname)
                 archive.write(manifest_path, MANIFEST_NAME)
         return destination_path
@@ -76,14 +86,32 @@ class BackupService:
                 raise ValueError("Backup archive missing database snapshot")
             self._projects.database_manager.import_database(database_source)
 
-            derived_source = tmp_path / "derived" / "projects"
-            target_root = self._projects.storage_root / "projects"
-            if target_root.exists():
-                shutil.rmtree(target_root)
-            if derived_source.exists():
-                shutil.copytree(derived_source, target_root)
+            storage_locations = manifest.get("storage_locations")
+            derived_root = tmp_path / "derived"
+            if isinstance(storage_locations, dict) and storage_locations:
+                for project_id, path_str in storage_locations.items():
+                    target = Path(path_str)
+                    source = derived_root / str(project_id)
+                    if target.exists():
+                        shutil.rmtree(target, ignore_errors=True)
+                    if source.exists():
+                        shutil.copytree(source, target)
+                    else:
+                        target.mkdir(parents=True, exist_ok=True)
+                    try:
+                        numeric_id = int(project_id)
+                    except (TypeError, ValueError):
+                        continue
+                    self._projects.set_project_storage_location(numeric_id, target)
             else:
-                target_root.mkdir(parents=True, exist_ok=True)
+                derived_source = derived_root / "projects"
+                target_root = self._projects.storage_root / "projects"
+                if target_root.exists():
+                    shutil.rmtree(target_root)
+                if derived_source.exists():
+                    shutil.copytree(derived_source, target_root)
+                else:
+                    target_root.mkdir(parents=True, exist_ok=True)
 
         self._projects.reload()
 

@@ -171,7 +171,7 @@ class ProjectService(QObject):
                 raise RuntimeError("Cannot delete the active project")
             self.projects.delete(project_id)
             storage = self._project_storage_dir(project_id)
-            if storage.exists():
+            if storage and storage.exists():
                 shutil.rmtree(storage, ignore_errors=True)
             self._remove_project_settings(project_id)
             self._emit_projects_changed()
@@ -206,7 +206,36 @@ class ProjectService(QObject):
     # ------------------------------------------------------------------
     # Storage helpers
     def get_project_storage(self, project_id: int) -> Path:
+        storage = self._project_storage_dir(project_id)
+        if storage is None:
+            raise RuntimeError(
+                "Project has no configured corpus root to determine storage location"
+            )
+        storage.mkdir(parents=True, exist_ok=True)
+        return storage
+
+    def get_project_storage_location(self, project_id: int) -> Path | None:
+        """Return the configured storage path for ``project_id`` without creating it."""
+
         return self._project_storage_dir(project_id)
+
+    def set_project_storage_location(self, project_id: int, path: str | Path) -> None:
+        """Persist ``path`` as the storage location for ``project_id``."""
+
+        resolved = Path(path).resolve()
+        with self._lock:
+            self._store_project_storage_path(project_id, resolved)
+
+    def project_storage_directories(self) -> dict[int, Path]:
+        """Return a mapping of project IDs to existing storage directories."""
+
+        directories: dict[int, Path] = {}
+        for record in self.list_projects():
+            storage = self._project_storage_dir(record.id)
+            if storage is None or not storage.exists():
+                continue
+            directories[record.id] = storage
+        return directories
 
     def purge_project_data(self, project_id: int) -> None:
         """Remove derived data for ``project_id`` without deleting source files."""
@@ -217,7 +246,7 @@ class ProjectService(QObject):
                 connection.execute("DELETE FROM chats WHERE project_id = ?", (project_id,))
                 connection.execute("DELETE FROM tags WHERE project_id = ?", (project_id,))
             storage = self._project_storage_dir(project_id)
-            if storage.exists():
+            if storage and storage.exists():
                 shutil.rmtree(storage, ignore_errors=True)
             self._ensure_project_storage(project_id)
 
@@ -296,6 +325,7 @@ class ProjectService(QObject):
             if normalized not in roots:
                 roots.append(normalized)
             self._config.save(data)
+            self._ensure_project_storage(project_id)
 
     def remove_corpus_root(self, project_id: int, path: str | Path) -> None:
         """Remove ``path`` from the stored corpus roots for ``project_id``."""
@@ -314,12 +344,24 @@ class ProjectService(QObject):
             roots = corpus.get(str(project_id))
             if not isinstance(roots, list):
                 return
-            filtered = [root for root in roots if isinstance(root, str) and str(Path(root).resolve()) != normalized]
+            filtered = [root for root in roots if isinstance(root, str) and root != normalized]
             if filtered:
                 corpus[str(project_id)] = filtered
             else:
                 corpus.pop(str(project_id), None)
             self._config.save(data)
+            stored_path = self._load_project_storage_path(project_id)
+            removed_root = Path(normalized)
+            if not filtered:
+                if stored_path is not None and stored_path.exists():
+                    shutil.rmtree(stored_path, ignore_errors=True)
+                self._clear_project_storage_path(project_id)
+                return
+            if stored_path is not None and self._path_within(stored_path, removed_root):
+                if stored_path.exists():
+                    shutil.rmtree(stored_path, ignore_errors=True)
+                self._clear_project_storage_path(project_id)
+            self._ensure_project_storage(project_id)
 
     def clear_corpus_roots(self, project_id: int) -> None:
         """Remove all stored corpus roots for ``project_id``."""
@@ -337,6 +379,10 @@ class ProjectService(QObject):
             if str(project_id) in corpus:
                 corpus.pop(str(project_id), None)
                 self._config.save(data)
+                stored_path = self._load_project_storage_path(project_id)
+                if stored_path is not None and stored_path.exists():
+                    shutil.rmtree(stored_path, ignore_errors=True)
+                self._clear_project_storage_path(project_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -398,15 +444,110 @@ class ProjectService(QObject):
         if isinstance(corpus, dict) and str(project_id) in corpus:
             corpus.pop(str(project_id), None)
             modified = True
+        storage_locations = projects.get("storage_locations")
+        if isinstance(storage_locations, dict) and str(project_id) in storage_locations:
+            storage_locations.pop(str(project_id), None)
+            modified = True
         if modified:
             self._config.save(data)
 
-    def _project_storage_dir(self, project_id: int) -> Path:
-        return self._storage_root / "projects" / str(project_id)
+    def _load_project_storage_path(self, project_id: int) -> Path | None:
+        data = self._config.load()
+        if not isinstance(data, dict):
+            return None
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            return None
+        storage_locations = projects.get("storage_locations")
+        if not isinstance(storage_locations, dict):
+            return None
+        stored = storage_locations.get(str(project_id))
+        if isinstance(stored, str) and stored:
+            return Path(stored)
+        return None
 
-    def _ensure_project_storage(self, project_id: int) -> None:
+    def _store_project_storage_path(self, project_id: int, path: Path) -> None:
+        data = self._config.load()
+        if not isinstance(data, dict):
+            data = {}
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            projects = {}
+            data["projects"] = projects
+        storage_locations = projects.setdefault("storage_locations", {})
+        if not isinstance(storage_locations, dict):
+            storage_locations = {}
+            projects["storage_locations"] = storage_locations
+        serialized = str(path)
+        if storage_locations.get(str(project_id)) == serialized:
+            return
+        storage_locations[str(project_id)] = serialized
+        self._config.save(data)
+
+    def _clear_project_storage_path(self, project_id: int) -> None:
+        data = self._config.load()
+        if not isinstance(data, dict):
+            return
+        projects = data.get("projects")
+        if not isinstance(projects, dict):
+            return
+        storage_locations = projects.get("storage_locations")
+        if not isinstance(storage_locations, dict):
+            return
+        if storage_locations.pop(str(project_id), None) is not None:
+            if not storage_locations:
+                projects.pop("storage_locations", None)
+            self._config.save(data)
+
+    def _primary_corpus_root(self, project_id: int) -> Path | None:
+        roots = self.list_corpus_roots(project_id)
+        if not roots:
+            return None
+        return Path(roots[0])
+
+    def _project_storage_dir(self, project_id: int) -> Path | None:
+        stored = self._load_project_storage_path(project_id)
+        if stored is not None:
+            return stored
+        primary_root = self._primary_corpus_root(project_id)
+        if primary_root is None:
+            return None
+        storage = primary_root / ".dataminer" / "projects" / str(project_id)
+        legacy = self._storage_root / "projects" / str(project_id)
+        if legacy.exists() and not storage.exists():
+            storage.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(storage))
+        self._store_project_storage_path(project_id, storage)
+        return storage
+
+    def _ensure_project_storage(self, project_id: int) -> Path | None:
         storage = self._project_storage_dir(project_id)
+        if storage is None:
+            return None
         storage.mkdir(parents=True, exist_ok=True)
+        return storage
+
+    @staticmethod
+    def _path_within(path: Path, parent: Path) -> bool:
+        try:
+            return path.resolve().is_relative_to(parent.resolve())
+        except AttributeError:  # pragma: no cover - Python < 3.9 fallback
+            try:
+                path.resolve().relative_to(parent.resolve())
+                return True
+            except ValueError:
+                return False
+        except FileNotFoundError:
+            base = parent.resolve(strict=False)
+            candidate = path.resolve(strict=False)
+            try:
+                return candidate.is_relative_to(base)
+            except AttributeError:  # pragma: no cover - fallback for older Python
+                try:
+                    candidate.relative_to(base)
+                    return True
+                except ValueError:
+                    return False
 
     def _emit_projects_changed(self) -> None:
         self.projects_changed.emit(self.list_projects())

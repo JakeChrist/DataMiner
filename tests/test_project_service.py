@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from app.services.project_service import ProjectService
 
 
@@ -27,10 +29,19 @@ def test_corpus_root_management(tmp_path: Path) -> None:
         project = service.active_project()
         assert service.list_corpus_roots(project.id) == []
 
+        with pytest.raises(RuntimeError):
+            service.get_project_storage(project.id)
+
         first = tmp_path / "docs"
         first.mkdir()
         service.add_corpus_root(project.id, first)
         assert service.list_corpus_roots(project.id) == [str(first.resolve())]
+
+        storage_path = service.get_project_storage(project.id)
+        assert storage_path.exists()
+        assert storage_path.parent.name == "projects"
+        assert storage_path.parent.parent.name == ".dataminer"
+        assert storage_path.parent.parent.parent == first.resolve()
 
         # Adding the same folder again should not create duplicates.
         service.add_corpus_root(project.id, first)

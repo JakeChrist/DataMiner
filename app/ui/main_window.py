@@ -482,7 +482,8 @@ class MainWindow(QMainWindow):
         project = self.project_service.active_project()
         safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in project.name)
         slug = "-".join(filter(None, safe.split("-"))) or "project"
-        base = Path(self.project_service.storage_root)
+        location = self.project_service.get_project_storage_location(project.id)
+        base = Path(location) if location is not None else Path(self.project_service.storage_root)
         return str(base / f"{slug}{suffix}")
 
     # ------------------------------------------------------------------

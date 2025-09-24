@@ -142,3 +142,32 @@ CREATE TABLE IF NOT EXISTS background_task_logs (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS ingest_documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    checksum TEXT,
+    size INTEGER,
+    mtime REAL,
+    ctime REAL,
+    metadata TEXT,
+    text TEXT,
+    normalized_text TEXT,
+    preview TEXT,
+    sections TEXT,
+    pages TEXT,
+    needs_ocr INTEGER NOT NULL DEFAULT 0,
+    ocr_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(path, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_documents_path ON ingest_documents(path);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS ingest_document_index
+USING fts5(
+    content,
+    document_id UNINDEXED,
+    tokenize='porter'
+);

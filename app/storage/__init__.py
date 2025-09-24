@@ -7,6 +7,7 @@ from .database import (
     DatabaseError,
     DatabaseManager,
     DocumentRepository,
+    IngestDocumentRepository,
     ProjectRepository,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "DatabaseError",
     "DatabaseManager",
     "DocumentRepository",
+    "IngestDocumentRepository",
     "ProjectRepository",
 ]

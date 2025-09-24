@@ -10,7 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from app.storage import BackgroundTaskLogRepository, DatabaseManager
+from app.ingest.parsers import ParserError, parse_file
+from app.storage import (
+    BackgroundTaskLogRepository,
+    DatabaseManager,
+    IngestDocumentRepository,
+)
 
 
 TaskCallback = Callable[[int, dict[str, Any]], None]
@@ -81,6 +86,7 @@ class IngestService:
     def __init__(self, db: DatabaseManager, *, worker_idle_sleep: float = 0.1) -> None:
         self.db = db
         self.repo = BackgroundTaskLogRepository(db)
+        self.documents = IngestDocumentRepository(db)
         self._queue: "queue.Queue[Optional[int]]" = queue.Queue()
         self._jobs: dict[int, IngestJob] = {}
         self._jobs_lock = threading.RLock()
@@ -376,6 +382,13 @@ class IngestService:
                     "mtime": metadata["mtime"],
                     "size": metadata["size"],
                 }
+                if metadata.get("needs_ocr"):
+                    job.summary.setdefault("needs_ocr", []).append(
+                        {
+                            "path": metadata["path"],
+                            "message": metadata.get("ocr_message"),
+                        }
+                    )
             elif result["status"] == "skipped":
                 job.progress["skipped"] += 1
             elif result["status"] == "removed":
@@ -424,6 +437,48 @@ class IngestService:
             previous = job.state.get("known_files_snapshot", {}).get(metadata["path"])
             if previous and previous.get("mtime") == metadata["mtime"] and previous.get("checksum") == metadata["checksum"]:
                 return {"status": "skipped", "metadata": metadata}
+
+        try:
+            parsed = parse_file(path)
+        except ParserError as exc:
+            metadata["parser_error"] = str(exc)
+            return {
+                "status": "failed",
+                "metadata": metadata,
+                "error": str(exc),
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            metadata["parser_error"] = str(exc)
+            return {
+                "status": "failed",
+                "metadata": metadata,
+                "error": str(exc),
+            }
+
+        base_metadata = {
+            "file": {
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+                "ctime": stat.st_ctime,
+                "checksum": metadata["checksum"],
+            }
+        }
+        record = self.documents.store_version(
+            path=metadata["path"],
+            checksum=metadata["checksum"],
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+            ctime=stat.st_ctime,
+            parsed=parsed,
+            base_metadata=base_metadata,
+        )
+        metadata["document_id"] = record.get("id")
+        metadata["version"] = record.get("version")
+        metadata["preview"] = record.get("preview")
+        metadata["needs_ocr"] = record.get("needs_ocr", False)
+        if record.get("ocr_message"):
+            metadata["ocr_message"] = record["ocr_message"]
+        metadata["parser_metadata"] = parsed.metadata
 
         return {"status": "success", "metadata": metadata}
 

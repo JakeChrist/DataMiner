@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 import pytest
 
 from app.ingest.service import IngestService, TaskStatus
-from app.storage import DatabaseManager
+from app.storage import DatabaseManager, IngestDocumentRepository
 
 
 @pytest.fixture()
@@ -71,6 +71,11 @@ def test_folder_crawl_tracks_progress_and_summary(tmp_path: Path, db_manager: Da
     assert extra["summary"]["success_count"] == 1
     known_files = extra["summary"]["known_files"]
     assert list(known_files.keys()) == [str((docs / "keep.txt").resolve())]
+    doc_repo = IngestDocumentRepository(db_manager)
+    stored = doc_repo.get_latest_by_path(docs / "keep.txt")
+    assert stored is not None
+    assert stored["preview"].startswith("alpha")
+    assert stored["needs_ocr"] is False
     assert any(status == TaskStatus.COMPLETED for _, status in updates)
 
     service.shutdown()
@@ -174,6 +179,33 @@ def test_cancel_rolls_back_partial_progress(tmp_path: Path, db_manager: Database
     assert summary["rolled_back"] >= 1
     assert summary["known_files"] == {}
 
+    service.shutdown()
+
+
+def test_pdf_without_text_flags_ocr(tmp_path: Path, db_manager: DatabaseManager) -> None:
+    pdf_path = tmp_path / "blank.pdf"
+    fitz = pytest.importorskip("fitz")
+
+    document = fitz.open()
+    document.new_page()
+    document.save(pdf_path)
+    document.close()
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    job_id = service.queue_file_add(None, [pdf_path], include=["*.pdf"])
+    assert service.wait_for_completion(job_id, timeout=5.0)
+    record = service.repo.get(job_id)
+    assert record is not None
+    assert record["status"] == TaskStatus.COMPLETED
+    summary = record["extra_data"]["summary"]
+    assert summary.get("needs_ocr")
+    needs_ocr_entry = summary["needs_ocr"][0]
+    assert "OCR" in needs_ocr_entry["message"]
+    repo = IngestDocumentRepository(db_manager)
+    stored = repo.get_latest_by_path(pdf_path)
+    assert stored is not None
+    assert stored["needs_ocr"] is True
+    assert stored["ocr_message"]
     service.shutdown()
 
 

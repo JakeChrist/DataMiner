@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS documents (
     title TEXT NOT NULL,
     source_type TEXT,
     source_path TEXT,
+    folder_path TEXT,
     metadata TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS tags (
     name TEXT NOT NULL,
     description TEXT,
     color TEXT,
+    document_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(project_id, name),
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -88,6 +90,7 @@ CREATE TABLE IF NOT EXISTS chats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL,
     title TEXT,
+    query_scope TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -164,6 +167,9 @@ CREATE TABLE IF NOT EXISTS ingest_documents (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ingest_documents_path ON ingest_documents(path);
+
+CREATE INDEX IF NOT EXISTS idx_documents_project_folder
+ON documents(project_id, folder_path);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS ingest_document_index
 USING fts5(

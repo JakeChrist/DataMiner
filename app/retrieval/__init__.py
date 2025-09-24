@@ -1,3 +1,5 @@
 """Information retrieval components for the DataMiner application."""
 
-__all__: list[str] = []
+from .search import SearchService
+
+__all__ = ["SearchService"]

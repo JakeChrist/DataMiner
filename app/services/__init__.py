@@ -1,3 +1,5 @@
 """Background services for the DataMiner application."""
 
-__all__: list[str] = []
+from .document_hierarchy import DocumentHierarchyService
+
+__all__ = ["DocumentHierarchyService"]

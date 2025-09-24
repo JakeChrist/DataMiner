@@ -1,0 +1,8 @@
+PyQt6
+PyMuPDF
+python-docx
+markdown
+chardet
+numpy
+scikit-learn
+rank-bm25

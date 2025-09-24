@@ -1,6 +1,7 @@
 """Storage interfaces for the DataMiner application."""
 
 from .database import (
+    BackgroundTaskLogRepository,
     BaseRepository,
     ChatRepository,
     DatabaseError,
@@ -10,6 +11,7 @@ from .database import (
 )
 
 __all__ = [
+    "BackgroundTaskLogRepository",
     "BaseRepository",
     "ChatRepository",
     "DatabaseError",

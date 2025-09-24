@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -29,7 +30,7 @@ class DatabaseManager:
     def connect(self) -> sqlite3.Connection:
         """Return a singleton SQLite connection with sensible defaults."""
         if self._connection is None:
-            connection = sqlite3.connect(self.path)
+            connection = sqlite3.connect(self.path, check_same_thread=False)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             self._connection = connection
@@ -403,6 +404,126 @@ class ChatRepository(BaseRepository):
         return [self._row_to_dict(row) for row in rows if row is not None]  # type: ignore[list-item]
 
 
+class BackgroundTaskLogRepository(BaseRepository):
+    """Persist and query background task execution metadata."""
+
+    TABLE = "background_task_logs"
+
+    def create(
+        self,
+        task_name: str,
+        *,
+        status: str,
+        message: str | None = None,
+        extra_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = json.dumps(extra_data) if extra_data is not None else None
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO background_task_logs (task_name, status, message, extra_data)
+                VALUES (?, ?, ?, ?)
+                """,
+                (task_name, status, message, payload),
+            )
+            task_id = cursor.lastrowid
+        return self.get(task_id)  # type: ignore[return-value]
+
+    def get(self, task_id: int) -> dict[str, Any] | None:
+        row = self.db.connect().execute(
+            f"SELECT * FROM {self.TABLE} WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        record = self._row_to_dict(row)
+        if record and record.get("extra_data"):
+            record["extra_data"] = json.loads(record["extra_data"])
+        return record
+
+    def update(
+        self,
+        task_id: int,
+        *,
+        status: str | None = None,
+        message: str | None = None,
+        extra_data: dict[str, Any] | None = None,
+        completed_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        updates: list[str] = []
+        values: list[Any] = []
+        if status is not None:
+            updates.append("status = ?")
+            values.append(status)
+        if message is not None:
+            updates.append("message = ?")
+            values.append(message)
+        if extra_data is not None:
+            updates.append("extra_data = ?")
+            values.append(json.dumps(extra_data))
+        if completed_at is not None:
+            updates.append("completed_at = ?")
+            values.append(completed_at)
+        if not updates:
+            return self.get(task_id)
+        values.append(task_id)
+        with self.transaction() as connection:
+            connection.execute(
+                f"UPDATE {self.TABLE} SET {', '.join(updates)} WHERE id = ?",
+                values,
+            )
+        return self.get(task_id)
+
+    def list_incomplete(self) -> list[dict[str, Any]]:
+        rows = self.db.connect().execute(
+            f"""
+            SELECT * FROM {self.TABLE}
+            WHERE status IN ('queued', 'running', 'paused')
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._row_to_dict(row)
+            if record is None:
+                continue
+            if record.get("extra_data"):
+                record["extra_data"] = json.loads(record["extra_data"])
+            records.append(record)
+        return records
+
+    def find_latest_completed(self, task_name: str) -> dict[str, Any] | None:
+        row = self.db.connect().execute(
+            f"""
+            SELECT * FROM {self.TABLE}
+            WHERE task_name = ? AND status = 'completed'
+            ORDER BY completed_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """,
+            (task_name,),
+        ).fetchone()
+        record = self._row_to_dict(row)
+        if record and record.get("extra_data"):
+            record["extra_data"] = json.loads(record["extra_data"])
+        return record
+
+    def list_completed(self, task_name: str) -> list[dict[str, Any]]:
+        rows = self.db.connect().execute(
+            f"""
+            SELECT * FROM {self.TABLE}
+            WHERE task_name = ? AND status = 'completed'
+            ORDER BY completed_at DESC NULLS LAST, created_at DESC
+            """,
+            (task_name,),
+        ).fetchall()
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            record = self._row_to_dict(row)
+            if record and record.get("extra_data"):
+                record["extra_data"] = json.loads(record["extra_data"])
+            if record:
+                records.append(record)
+        return records
+
+
 __all__ = [
     "DatabaseError",
     "DatabaseManager",
@@ -410,4 +531,5 @@ __all__ = [
     "ProjectRepository",
     "DocumentRepository",
     "ChatRepository",
+    "BackgroundTaskLogRepository",
 ]

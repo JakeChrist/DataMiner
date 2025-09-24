@@ -12,6 +12,7 @@ from .conversation_manager import (
     ResponseMode,
     SelfCheckResult,
 )
+from .conversation_settings import ConversationSettings
 from .document_hierarchy import DocumentHierarchyService
 from .lmstudio_client import (
     ChatMessage,
@@ -27,6 +28,7 @@ __all__ = [
     "ChatMessage",
     "ConnectionState",
     "ConversationManager",
+    "ConversationSettings",
     "ConversationTurn",
     "PlanItem",
     "ReasoningArtifacts",

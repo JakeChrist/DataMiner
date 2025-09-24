@@ -84,6 +84,14 @@ _PARSERS: dict[str, Parser] = {
 }
 
 
+SUPPORTED_SUFFIXES: tuple[str, ...] = tuple(_PARSERS.keys())
+"""Ordered collection of supported file suffixes."""
+
+
+SUPPORTED_PATTERNS: tuple[str, ...] = tuple(f"*{suffix}" for suffix in SUPPORTED_SUFFIXES)
+"""Glob patterns corresponding to :data:`SUPPORTED_SUFFIXES`."""
+
+
 def register_parser(suffixes: Iterable[str], parser: Parser) -> None:
     """Register ``parser`` for the provided ``suffixes``."""
 
@@ -109,6 +117,8 @@ __all__ = [
     "PageContent",
     "ParsedDocument",
     "ParserError",
+    "SUPPORTED_PATTERNS",
+    "SUPPORTED_SUFFIXES",
     "parse_file",
     "register_parser",
 ]

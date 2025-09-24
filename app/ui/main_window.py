@@ -342,18 +342,24 @@ class MainWindow(QMainWindow):
 
         add_folder_button = QPushButton("Index Folder…", controls_frame)
         add_folder_button.setObjectName("indexFolderButton")
-        add_folder_button.clicked.connect(lambda: self.add_folder_action.trigger())
+        add_folder_button.clicked.connect(
+            lambda _checked=False: self.add_folder_action.trigger()
+        )
         controls_layout.addWidget(add_folder_button)
 
         add_files_button = QPushButton("Index Files…", controls_frame)
         add_files_button.setObjectName("indexFilesButton")
-        add_files_button.clicked.connect(lambda: self.add_files_action.trigger())
+        add_files_button.clicked.connect(
+            lambda _checked=False: self.add_files_action.trigger()
+        )
         controls_layout.addWidget(add_files_button)
 
         self._rescan_button = QPushButton("Rescan Indexed Folders", controls_frame)
         self._rescan_button.setObjectName("rescanCorpusButton")
         self._rescan_button.setEnabled(False)
-        self._rescan_button.clicked.connect(lambda: self.rescan_corpus_action.trigger())
+        self._rescan_button.clicked.connect(
+            lambda _checked=False: self.rescan_corpus_action.trigger()
+        )
         controls_layout.addWidget(self._rescan_button)
 
         controls_layout.addStretch(1)
@@ -544,7 +550,7 @@ class MainWindow(QMainWindow):
     def _ingest_include_patterns(self) -> list[str]:
         return ["*.pdf", "*.docx", "*.txt", "*.text", "*.md", "*.markdown", "*.mkd"]
 
-    def _add_folder_to_corpus(self) -> None:
+    def _add_folder_to_corpus(self, _checked: bool = False) -> None:
         project = self.project_service.active_project()
         roots = self.project_service.list_corpus_roots(project.id)
         initial = roots[-1] if roots else ""
@@ -581,7 +587,7 @@ class MainWindow(QMainWindow):
         self._update_corpus_actions()
         self._show_toast("Folder queued for indexing.", level="info", duration_ms=2500)
 
-    def _add_files_to_corpus(self) -> None:
+    def _add_files_to_corpus(self, _checked: bool = False) -> None:
         project = self.project_service.active_project()
         filter_spec = (
             "Documents (*.pdf *.docx *.txt *.text *.md *.markdown *.mkd);;All Files (*)"
@@ -618,7 +624,7 @@ class MainWindow(QMainWindow):
         )
         self._show_toast("Files queued for indexing.", level="info", duration_ms=2500)
 
-    def _rescan_corpus(self) -> None:
+    def _rescan_corpus(self, _checked: bool = False) -> None:
         project = self.project_service.active_project()
         roots = self.project_service.list_corpus_roots(project.id)
         if not roots:

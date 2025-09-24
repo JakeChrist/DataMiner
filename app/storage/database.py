@@ -8,6 +8,7 @@ import json
 import re
 import shutil
 import sqlite3
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -29,22 +30,28 @@ class DatabaseManager:
         self.path = Path(path)
         if not self.path.parent.exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection: sqlite3.Connection | None = None
+        self._connection_lock = threading.RLock()
+        self._connections: dict[int, sqlite3.Connection] = {}
 
     def connect(self) -> sqlite3.Connection:
         """Return a singleton SQLite connection with sensible defaults."""
-        if self._connection is None:
-            connection = sqlite3.connect(self.path, check_same_thread=False)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            self._connection = connection
-        return self._connection
+        thread_id = threading.get_ident()
+        with self._connection_lock:
+            connection = self._connections.get(thread_id)
+            if connection is None:
+                connection = sqlite3.connect(self.path, check_same_thread=False)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+                self._connections[thread_id] = connection
+            return connection
 
     def close(self) -> None:
         """Close the underlying database connection if it exists."""
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        with self._connection_lock:
+            connections = list(self._connections.values())
+            self._connections.clear()
+        for connection in connections:
+            connection.close()
 
     def initialize(self) -> None:
         """Bootstrap the database schema, applying migrations if required."""

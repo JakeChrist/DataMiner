@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..ingest.service import IngestService, TaskStatus
+from ..retrieval import SearchService
 from ..services.conversation_manager import (
     ConnectionState,
     ConversationManager,
@@ -153,6 +154,11 @@ class MainWindow(QMainWindow):
         self._create_status_bar()
         self.conversation_settings = ConversationSettings()
         self._conversation_manager = ConversationManager(self.lmstudio_client)
+        self.search_service = SearchService(
+            project_service.ingest,
+            project_service.documents,
+            project_service.chats,
+        )
         self._turns: list[ConversationTurn] = []
         self._project_sessions: dict[int, dict[str, Any]] = {}
         self._ingest_jobs: dict[int, dict[str, Any]] = {}
@@ -429,6 +435,11 @@ class MainWindow(QMainWindow):
 
     def _on_active_project_changed(self, project: ProjectRecord) -> None:
         self._refresh_project_selector()
+        self.search_service = SearchService(
+            self.project_service.ingest,
+            self.project_service.documents,
+            self.project_service.chats,
+        )
         self._load_project_session(project.id)
 
     def _on_project_combo_changed(self, index: int) -> None:
@@ -1245,6 +1256,7 @@ class MainWindow(QMainWindow):
         try:
             turn = self._conversation_manager.ask(
                 question,
+                context_snippets=self._build_context_snippets(question),
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 extra_options=extra_options or None,
@@ -1280,6 +1292,24 @@ class MainWindow(QMainWindow):
         if include or exclude:
             options["retrieval"] = {"include": include, "exclude": exclude}
         return options
+
+    def _build_context_snippets(self, question: str) -> list[str]:
+        if not question.strip():
+            return []
+        try:
+            project_id = self.project_service.active_project_id
+        except RuntimeError:
+            return []
+        scope = self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = scope.get("include") or []
+        exclude = scope.get("exclude") or []
+        snippets = self.search_service.retrieve_context_snippets(
+            question,
+            project_id=project_id,
+            include_identifiers=include,
+            exclude_identifiers=exclude,
+        )
+        return snippets
 
     def _update_evidence_panel(self, turn: ConversationTurn) -> None:
         if not turn.citations:

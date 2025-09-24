@@ -168,12 +168,32 @@ CREATE TABLE IF NOT EXISTS ingest_documents (
 
 CREATE INDEX IF NOT EXISTS idx_ingest_documents_path ON ingest_documents(path);
 
+CREATE TABLE IF NOT EXISTS ingest_document_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id INTEGER NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    token_count INTEGER NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(document_id, chunk_index),
+    FOREIGN KEY (document_id) REFERENCES ingest_documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_chunks_document_id
+ON ingest_document_chunks(document_id);
+
 CREATE INDEX IF NOT EXISTS idx_documents_project_folder
 ON documents(project_id, folder_path);
 
-CREATE VIRTUAL TABLE IF NOT EXISTS ingest_document_index
+DROP TABLE IF EXISTS ingest_document_index;
+CREATE VIRTUAL TABLE ingest_document_index
 USING fts5(
     content,
+    path UNINDEXED,
     document_id UNINDEXED,
+    chunk_id UNINDEXED,
+    chunk_index UNINDEXED,
     tokenize='porter'
 );

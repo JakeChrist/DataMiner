@@ -7,7 +7,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.storage import ChatRepository, DatabaseManager, DocumentRepository, ProjectRepository
+from app.ingest.parsers import ParsedDocument
+from app.storage import (
+    ChatRepository,
+    DatabaseManager,
+    DocumentRepository,
+    IngestDocumentRepository,
+    ProjectRepository,
+)
 
 
 @pytest.fixture()
@@ -32,6 +39,11 @@ def document_repo(database: DatabaseManager) -> DocumentRepository:
 @pytest.fixture()
 def chat_repo(database: DatabaseManager) -> ChatRepository:
     return ChatRepository(database)
+
+
+@pytest.fixture()
+def ingest_repo(database: DatabaseManager) -> IngestDocumentRepository:
+    return IngestDocumentRepository(database)
 
 
 def test_project_crud(project_repo: ProjectRepository) -> None:
@@ -164,3 +176,31 @@ def test_tag_counts_and_scope_queries(
 
     document_repo.delete(document["id"])
     assert document_repo.get_tag(tag_aux["id"])["document_count"] == 0
+
+
+def test_ingest_chunk_storage(
+    tmp_path: Path, ingest_repo: IngestDocumentRepository
+) -> None:
+    path = tmp_path / "evidence.txt"
+    path.write_text(
+        "Alpha beta gamma delta epsilon zeta eta theta iota.",
+        encoding="utf-8",
+    )
+    parsed = ParsedDocument(text=path.read_text(encoding="utf-8"), metadata={})
+    record = ingest_repo.store_version(
+        path=str(path),
+        checksum=None,
+        size=None,
+        mtime=None,
+        ctime=None,
+        parsed=parsed,
+    )
+    assert record is not None
+    chunk_results = ingest_repo.search_chunks("gamma", limit=5)
+    assert chunk_results
+    texts = [entry["chunk"]["text"] for entry in chunk_results if entry.get("chunk")]
+    assert any("gamma" in text for text in texts)
+    count = ingest_repo.db.connect().execute(
+        "SELECT COUNT(*) FROM ingest_document_chunks"
+    ).fetchone()[0]
+    assert count >= 1

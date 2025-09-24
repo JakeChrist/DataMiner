@@ -103,6 +103,7 @@ def test_search_service_scope_and_highlight(
     )
     assert [item["document"]["id"] for item in first_results] == [doc_alpha["id"]]
     assert "<mark>starlight</mark>" in first_results[0]["highlight"]
+    assert "starlight" in first_results[0]["context"]
 
     follow_up = service.search_documents(
         "starlight",
@@ -121,6 +122,13 @@ def test_search_service_scope_and_highlight(
         save_scope=True,
     )
     assert [item["document"]["id"] for item in updated_results] == [doc_beta["id"]]
+
+    contexts = service.retrieve_context_snippets(
+        "starlight",
+        project_id=project["id"],
+        include_identifiers=[str(doc_alpha["id"])],
+    )
+    assert any("starlight" in snippet for snippet in contexts)
 
 
 def test_document_hierarchy_service(

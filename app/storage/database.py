@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 if TYPE_CHECKING:
     from app.ingest.parsers import ParsedDocument
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA_FILENAME = "schema.sql"
 
 
@@ -555,6 +555,11 @@ class IngestDocumentRepository(BaseRepository):
         ocr_message = parsed.ocr_hint if parsed.needs_ocr else None
 
         with self.transaction() as connection:
+            existing_rows = connection.execute(
+                "SELECT id FROM ingest_documents WHERE path = ?",
+                (normalized_path,),
+            ).fetchall()
+            previous_ids = [int(row["id"]) for row in existing_rows]
             row = connection.execute(
                 """
                 SELECT version
@@ -592,12 +597,14 @@ class IngestDocumentRepository(BaseRepository):
                 ),
             )
             document_id = cursor.lastrowid
-            connection.execute(
-                """
-                INSERT INTO ingest_document_index (rowid, content, document_id)
-                VALUES (?, ?, ?)
-                """,
-                (document_id, normalized_text, document_id),
+            if previous_ids:
+                self._delete_chunks_for_documents(connection, previous_ids)
+            self._replace_chunks(
+                connection,
+                document_id,
+                normalized_path,
+                parsed.text,
+                normalized_text,
             )
         return self.get(document_id)  # type: ignore[return-value]
 
@@ -662,11 +669,8 @@ class IngestDocumentRepository(BaseRepository):
                 document_ids = [int(row["id"]) for row in rows]
                 if not document_ids:
                     continue
+                self._delete_chunks_for_documents(connection, document_ids)
                 placeholders = ",".join("?" for _ in document_ids)
-                connection.execute(
-                    f"DELETE FROM ingest_document_index WHERE rowid IN ({placeholders})",
-                    document_ids,
-                )
                 connection.execute(
                     f"DELETE FROM ingest_documents WHERE id IN ({placeholders})",
                     document_ids,
@@ -675,29 +679,213 @@ class IngestDocumentRepository(BaseRepository):
         return removed
 
     def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+        return self.search_chunks(query, limit=limit)
+
+    def search_chunks(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         rows = self.db.connect().execute(
             """
-            SELECT ingest_documents.*, highlight(ingest_document_index, 0, '<mark>', '</mark>') AS snippet
+            SELECT
+                ingest_document_index.rowid AS chunk_id,
+                ingest_document_index.document_id AS document_id,
+                ingest_document_index.chunk_index AS chunk_index,
+                ingest_document_index.path AS path,
+                highlight(ingest_document_index, 0, '<mark>', '</mark>') AS snippet,
+                bm25(ingest_document_index) AS score,
+                chunks.text AS chunk_text,
+                chunks.token_count AS token_count,
+                chunks.start_offset AS start_offset,
+                chunks.end_offset AS end_offset
             FROM ingest_document_index
-            INNER JOIN ingest_documents ON ingest_documents.id = ingest_document_index.rowid
+            INNER JOIN ingest_document_chunks AS chunks ON chunks.id = ingest_document_index.rowid
             WHERE ingest_document_index MATCH ?
-            ORDER BY bm25(ingest_document_index)
+            ORDER BY score ASC, chunk_index ASC
             LIMIT ?
             """,
             (query, limit),
         ).fetchall()
+
+        if not rows:
+            return []
+
+        document_ids = {int(row["document_id"]) for row in rows}
+        documents: dict[int, dict[str, Any]] = {}
+        for doc_id in document_ids:
+            document = self.get(doc_id)
+            if document is not None:
+                documents[doc_id] = document
+
         results: list[dict[str, Any]] = []
         for row in rows:
-            record = self._decode_document_row(row)
-            if record is not None:
-                record["highlight"] = row["snippet"]
-                results.append(record)
+            doc_id = int(row["document_id"])
+            document = documents.get(doc_id)
+            if document is None:
+                continue
+            chunk = {
+                "id": int(row["chunk_id"]),
+                "document_id": doc_id,
+                "index": int(row["chunk_index"]),
+                "text": row["chunk_text"],
+                "token_count": int(row["token_count"]),
+                "start_offset": int(row["start_offset"]),
+                "end_offset": int(row["end_offset"]),
+            }
+            results.append(
+                {
+                    "chunk": chunk,
+                    "document": document,
+                    "highlight": row["snippet"],
+                    "score": float(row["score"]),
+                    "path": document.get("path"),
+                }
+            )
         return results
 
     @staticmethod
     def _normalize_text(text: str) -> str:
         collapsed = re.sub(r"\s+", " ", text.strip())
         return collapsed
+
+    def _delete_chunks_for_documents(
+        self, connection: sqlite3.Connection, document_ids: Iterable[int]
+    ) -> None:
+        doc_ids = [int(doc_id) for doc_id in document_ids]
+        if not doc_ids:
+            return
+        placeholders = ",".join("?" for _ in doc_ids)
+        rows = connection.execute(
+            f"SELECT id FROM ingest_document_chunks WHERE document_id IN ({placeholders})",
+            doc_ids,
+        ).fetchall()
+        chunk_ids = [int(row["id"]) for row in rows]
+        if not chunk_ids:
+            return
+        chunk_placeholders = ",".join("?" for _ in chunk_ids)
+        connection.execute(
+            f"DELETE FROM ingest_document_index WHERE rowid IN ({chunk_placeholders})",
+            chunk_ids,
+        )
+        connection.execute(
+            f"DELETE FROM ingest_document_chunks WHERE id IN ({chunk_placeholders})",
+            chunk_ids,
+        )
+
+    def _replace_chunks(
+        self,
+        connection: sqlite3.Connection,
+        document_id: int,
+        path: str,
+        text: str,
+        normalized_text: str,
+    ) -> None:
+        chunks = self._chunk_document(text, normalized_text=normalized_text)
+        connection.execute(
+            "DELETE FROM ingest_document_chunks WHERE document_id = ?",
+            (document_id,),
+        )
+        for chunk in chunks:
+            cursor = connection.execute(
+                """
+                INSERT INTO ingest_document_chunks (
+                    document_id, chunk_index, text, token_count, start_offset, end_offset
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    chunk["index"],
+                    chunk["text"],
+                    chunk["token_count"],
+                    chunk["start_offset"],
+                    chunk["end_offset"],
+                ),
+            )
+            chunk_id = cursor.lastrowid
+            connection.execute(
+                """
+                INSERT INTO ingest_document_index (
+                    rowid, content, path, document_id, chunk_id, chunk_index
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk_id,
+                    chunk["search_text"],
+                    path,
+                    document_id,
+                    chunk_id,
+                    chunk["index"],
+                ),
+            )
+
+    def _chunk_document(
+        self, text: str, *, normalized_text: str, max_tokens: int = 200, overlap: int = 40
+    ) -> list[dict[str, Any]]:
+        max_tokens = max(1, int(max_tokens))
+        overlap = max(0, min(int(overlap), max_tokens - 1))
+        matches = list(re.finditer(r"\S+", text))
+        chunks: list[dict[str, Any]] = []
+        if not matches:
+            trimmed = text.strip()
+            chunk_text = trimmed if trimmed else normalized_text
+            chunks.append(
+                {
+                    "index": 0,
+                    "text": chunk_text,
+                    "token_count": 0,
+                    "start_offset": 0,
+                    "end_offset": len(chunk_text),
+                    "search_text": self._normalize_text(chunk_text),
+                }
+            )
+            return chunks
+
+        step = max_tokens - overlap if max_tokens > overlap else max_tokens
+        start_token = 0
+        chunk_index = 0
+        text_length = len(text)
+
+        while start_token < len(matches):
+            end_token = min(start_token + max_tokens, len(matches))
+            start_offset = matches[start_token].start()
+            end_offset = matches[end_token - 1].end() if end_token > start_token else start_offset
+            if end_token >= len(matches):
+                end_offset = text_length
+            chunk_text = text[start_offset:end_offset].strip()
+            if not chunk_text:
+                if chunks:
+                    start_token += step
+                    chunk_index += 1
+                    continue
+                chunk_text = normalized_text
+            search_text = self._normalize_text(chunk_text)
+            chunks.append(
+                {
+                    "index": chunk_index,
+                    "text": chunk_text,
+                    "token_count": end_token - start_token,
+                    "start_offset": start_offset,
+                    "end_offset": end_offset,
+                    "search_text": search_text,
+                }
+            )
+            if end_token >= len(matches):
+                break
+            start_token += step
+            chunk_index += 1
+
+        if not chunks:
+            chunk_text = normalized_text
+            chunks.append(
+                {
+                    "index": 0,
+                    "text": chunk_text,
+                    "token_count": len(matches),
+                    "start_offset": 0,
+                    "end_offset": len(chunk_text),
+                    "search_text": self._normalize_text(chunk_text),
+                }
+            )
+        return chunks
 
     @staticmethod
     def _build_preview(text: str, *, limit: int = 320) -> str:

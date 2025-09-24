@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import threading
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from ..config import ConfigManager, get_user_config_dir
 from ..storage import (
     BackgroundTaskLogRepository,
     ChatRepository,
+    DatabaseError,
     DatabaseManager,
     DocumentRepository,
     IngestDocumentRepository,
@@ -22,6 +24,9 @@ from ..storage import (
 
 
 DEFAULT_PROJECT_NAME = "Default Project"
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -326,6 +331,12 @@ class ProjectService(QObject):
                 roots.append(normalized)
             self._config.save(data)
             self._ensure_project_storage(project_id)
+            try:
+                self.export_project_database_snapshot(project_id)
+            except DatabaseError:
+                logger.exception(
+                    "Failed to refresh database snapshot for project %s", project_id
+                )
 
     def remove_corpus_root(self, project_id: int, path: str | Path) -> None:
         """Remove ``path`` from the stored corpus roots for ``project_id``."""
@@ -450,6 +461,18 @@ class ProjectService(QObject):
             modified = True
         if modified:
             self._config.save(data)
+
+    def export_project_database_snapshot(
+        self, project_id: int, *, filename: str = "dataminer.db"
+    ) -> Path | None:
+        """Write a SQLite snapshot for ``project_id`` into its storage directory."""
+
+        with self._lock:
+            storage = self._ensure_project_storage(project_id)
+            if storage is None:
+                return None
+            destination = storage / filename
+            return self._db.export_database(destination)
 
     def _load_project_storage_path(self, project_id: int) -> Path | None:
         data = self._config.load()

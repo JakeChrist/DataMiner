@@ -75,6 +75,12 @@ _PARSERS: dict[str, Parser] = {
     ".md": parse_markdown,
     ".markdown": parse_markdown,
     ".mkd": parse_markdown,
+    ".html": parse_text,
+    ".htm": parse_text,
+    ".py": parse_text,
+    ".pyw": parse_text,
+    ".m": parse_text,
+    ".cpp": parse_text,
 }
 
 

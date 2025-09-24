@@ -86,6 +86,28 @@ def test_folder_crawl_tracks_progress_and_summary(tmp_path: Path, db_manager: Da
     service.shutdown()
 
 
+def test_folder_crawl_recurses_into_subdirectories(
+    tmp_path: Path, db_manager: DatabaseManager
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    nested = root / "nested"
+    nested.mkdir()
+    nested_file = nested / "note.txt"
+    nested_file.write_text("payload", encoding="utf-8")
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    job_id = service.queue_folder_crawl(None, root, include=["*.txt"])
+    assert service.wait_for_completion(job_id, timeout=5.0)
+
+    record = service.repo.get(job_id)
+    assert record is not None
+    known_files = record["extra_data"]["summary"]["known_files"]
+    assert str(nested_file.resolve()) in known_files
+
+    service.shutdown()
+
+
 def test_completed_job_populates_document_repository(
     tmp_path: Path, db_manager: DatabaseManager
 ) -> None:

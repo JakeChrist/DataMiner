@@ -118,6 +118,7 @@ class LMStudioClient:
             "messages": list(messages),
         }
         payload.update(preset.to_request_params())
+        payload.setdefault("stream", False)
         if extra_options:
             payload.update(extra_options)
         data = self._request_json("POST", CHAT_COMPLETIONS_PATH, payload)

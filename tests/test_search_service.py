@@ -131,6 +131,34 @@ def test_search_service_scope_and_highlight(
     assert any("starlight" in snippet for snippet in contexts)
 
 
+def test_context_snippets_relax_query_terms(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    corpus_dir = tmp_path / "docs"
+    doc_path = corpus_dir / "design.md"
+    doc_path.parent.mkdir(parents=True, exist_ok=True)
+    content = """
+    # DataMiner Architecture
+
+    The DataMiner system includes a retrieval pipeline with ranking heuristics.
+    """
+    doc_path.write_text(content)
+
+    project = project_repo.create("Relaxed Query")
+    document_repo.create(project["id"], "Design", source_path=doc_path)
+    _store_ingest_document(ingest_repo, doc_path, content)
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    question = "What does the DataMiner system include for its architecture?"
+    snippets = service.retrieve_context_snippets(question, project_id=project["id"])
+
+    assert any("DataMiner" in snippet for snippet in snippets)
+
 def test_document_hierarchy_service(
     tmp_path: Path,
     project_repo: ProjectRepository,

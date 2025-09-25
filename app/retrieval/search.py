@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
+import sqlite3
 from typing import Any, Iterable
 
 from app.storage import ChatRepository, DocumentRepository, IngestDocumentRepository
@@ -50,7 +52,7 @@ class SearchService:
         documents_by_path = self._build_path_index(candidate_documents)
         seen_documents: set[int] = set()
         results: list[dict[str, Any]] = []
-        for record in self.ingest.search(query, limit=limit * 6):
+        for record in self._search_with_fallback(query, limit=limit * 6):
             doc_payload = record.get("document") or {}
             path = record.get("path") or doc_payload.get("path")
             if not path:
@@ -104,7 +106,7 @@ class SearchService:
         exclude_set = {str(item) for item in (exclude_identifiers or []) if str(item)}
         snippets: list[str] = []
         seen_chunks: set[int] = set()
-        for record in self.ingest.search(query, limit=limit * 6):
+        for record in self._search_with_fallback(query, limit=limit * 6):
             doc_payload = record.get("document") or {}
             path = record.get("path") or doc_payload.get("path")
             if not path:
@@ -192,3 +194,92 @@ class SearchService:
         if folder in (None, ""):
             return None
         return str(Path(folder))
+
+    # ------------------------------------------------------------------
+    _TOKEN_PATTERN = re.compile(r"[\w-]+", re.UNICODE)
+    _STOPWORDS = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "for",
+        "from",
+        "how",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "their",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "to",
+        "was",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "will",
+        "with",
+    }
+
+    def _search_with_fallback(self, query: str, *, limit: int) -> list[dict[str, Any]]:
+        """Query the ingest index while relaxing overly strict MATCH syntax."""
+
+        normalized = (query or "").strip()
+        if not normalized:
+            return []
+
+        attempts: list[str] = [normalized]
+        tokens = self._tokenize_query(normalized)
+        if tokens:
+            wildcard_tokens = [f"{token}*" for token in tokens]
+            attempts.append(" OR ".join(wildcard_tokens))
+            if len(tokens) > 1:
+                attempts.append(" ".join(wildcard_tokens))
+
+        seen: set[str] = set()
+        for candidate in attempts:
+            candidate = candidate.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                results = self.ingest.search(candidate, limit=limit)
+            except sqlite3.OperationalError:
+                continue
+            if results:
+                return results
+        return []
+
+    def _tokenize_query(self, query: str) -> list[str]:
+        """Extract significant terms for relaxed fallback queries."""
+
+        tokens = [match.group(0).lower() for match in self._TOKEN_PATTERN.finditer(query)]
+        filtered = [
+            token
+            for token in tokens
+            if len(token) >= 3 and token not in self._STOPWORDS
+        ]
+        seen: set[str] = set()
+        unique: list[str] = []
+        for token in filtered:
+            if token not in seen:
+                seen.add(token)
+                unique.append(token)
+        return unique

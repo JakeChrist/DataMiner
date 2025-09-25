@@ -91,6 +91,30 @@ class SearchService:
         include_identifiers: Iterable[str] | None = None,
         exclude_identifiers: Iterable[str] | None = None,
     ) -> list[str]:
+        entries = self.retrieve_context_entries(
+            query,
+            project_id=project_id,
+            limit=limit,
+            tags=tags,
+            folder=folder,
+            recursive=recursive,
+            include_identifiers=include_identifiers,
+            exclude_identifiers=exclude_identifiers,
+        )
+        return [entry["snippet"] for entry in entries]
+
+    def retrieve_context_entries(
+        self,
+        query: str,
+        *,
+        project_id: int,
+        limit: int = 5,
+        tags: Iterable[int] | None = None,
+        folder: str | Path | None = None,
+        recursive: bool = True,
+        include_identifiers: Iterable[str] | None = None,
+        exclude_identifiers: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
         scope_tags = list(tags) if tags is not None else None
         scope_folder = self._normalize_folder(folder) if folder is not None else None
         candidate_documents = self.documents.list_for_scope(
@@ -102,7 +126,7 @@ class SearchService:
         documents_by_path = self._build_path_index(candidate_documents)
         include_set = {str(item) for item in (include_identifiers or []) if str(item)}
         exclude_set = {str(item) for item in (exclude_identifiers or []) if str(item)}
-        snippets: list[str] = []
+        entries: list[dict[str, Any]] = []
         seen_chunks: set[int] = set()
         for record in self.ingest.search(query, limit=limit * 6):
             doc_payload = record.get("document") or {}
@@ -124,12 +148,25 @@ class SearchService:
             text = chunk.get("text") if isinstance(chunk, dict) else None
             if not text:
                 continue
+            cleaned_text = text.strip()
+            if not cleaned_text:
+                continue
             title = document.get("title") or Path(path).stem or Path(path).name
-            snippets.append(f"{title}: {text.strip()}")
+            snippet_text = f"{title}: {cleaned_text}"
+            entry = {
+                "snippet": snippet_text,
+                "text": cleaned_text,
+                "document": document,
+                "chunk": chunk,
+                "score": record.get("score"),
+                "path": path,
+                "title": title,
+            }
+            entries.append(entry)
             seen_chunks.add(chunk_id)
-            if len(snippets) >= limit:
+            if len(entries) >= limit:
                 break
-        return snippets
+        return entries
 
     def _resolve_scope(
         self,

@@ -1261,11 +1261,15 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        extra_options = self._build_extra_request_options()
+        context_entries = self._gather_context_entries(question)
+        context_snippets = [entry["snippet"] for entry in context_entries]
+        extra_options = self._build_extra_request_options(
+            question, context_entries=context_entries
+        )
         try:
             turn = self._conversation_manager.ask(
                 question,
-                context_snippets=self._build_context_snippets(question),
+                context_snippets=context_snippets,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 extra_options=extra_options or None,
@@ -1293,16 +1297,30 @@ class MainWindow(QMainWindow):
         self.question_input.set_busy(False)
         self._update_question_prerequisites(self._conversation_manager.connection_state)
 
-    def _build_extra_request_options(self) -> dict[str, Any]:
+    def _build_extra_request_options(
+        self,
+        question: str | None = None,
+        *,
+        context_entries: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         options: dict[str, Any] = {}
         scope = self._current_retrieval_scope
         include = list(scope.get("include", [])) if scope else []
         exclude = list(scope.get("exclude", [])) if scope else []
-        if include or exclude:
-            options["retrieval"] = {"include": include, "exclude": exclude}
+        retrieval: dict[str, Any] = {}
+        if question and question.strip():
+            retrieval["query"] = question.strip()
+        if include:
+            retrieval["include"] = include
+        if exclude:
+            retrieval["exclude"] = exclude
+        if context_entries:
+            retrieval["documents"] = self._format_retrieval_documents(context_entries)
+        if retrieval:
+            options["retrieval"] = retrieval
         return options
 
-    def _build_context_snippets(self, question: str) -> list[str]:
+    def _gather_context_entries(self, question: str) -> list[dict[str, Any]]:
         if not question.strip():
             return []
         try:
@@ -1312,13 +1330,58 @@ class MainWindow(QMainWindow):
         scope = self._current_retrieval_scope or {"include": [], "exclude": []}
         include = scope.get("include") or []
         exclude = scope.get("exclude") or []
-        snippets = self.search_service.retrieve_context_snippets(
+        entries = self.search_service.retrieve_context_entries(
             question,
             project_id=project_id,
             include_identifiers=include,
             exclude_identifiers=exclude,
         )
-        return snippets
+        return entries
+
+    @staticmethod
+    def _format_retrieval_documents(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        documents: list[dict[str, Any]] = []
+        for index, entry in enumerate(entries):
+            text = entry.get("text") or entry.get("snippet")
+            if not text:
+                continue
+            document = entry.get("document") or {}
+            chunk = entry.get("chunk") or {}
+            doc_id = document.get("id")
+            chunk_id = chunk.get("id")
+            identifier_parts: list[str] = []
+            if doc_id is not None:
+                identifier_parts.append(str(doc_id))
+            if chunk_id is not None:
+                identifier_parts.append(str(chunk_id))
+            if not identifier_parts:
+                identifier_parts.append(f"context-{index}")
+            metadata: dict[str, Any] = {}
+            title = entry.get("title") or document.get("title")
+            if title:
+                metadata["title"] = title
+            source_path = document.get("source_path")
+            if source_path:
+                metadata["source_path"] = source_path
+            if doc_id is not None:
+                metadata["document_id"] = doc_id
+            if chunk_id is not None:
+                metadata["chunk_id"] = chunk_id
+            chunk_index = chunk.get("index")
+            if chunk_index is not None:
+                metadata["chunk_index"] = chunk_index
+            score = entry.get("score")
+            if isinstance(score, (int, float)):
+                metadata["score"] = float(score)
+            metadata["position"] = index
+            documents.append(
+                {
+                    "id": ":".join(identifier_parts),
+                    "content": text,
+                    "metadata": metadata,
+                }
+            )
+        return documents
 
     def _update_evidence_panel(self, turn: ConversationTurn) -> None:
         if not turn.citations:

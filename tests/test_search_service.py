@@ -130,6 +130,16 @@ def test_search_service_scope_and_highlight(
     )
     assert any("starlight" in snippet for snippet in contexts)
 
+    entries = service.retrieve_context_entries(
+        "starlight",
+        project_id=project["id"],
+        include_identifiers=[str(doc_alpha["id"])],
+    )
+    assert entries
+    first_entry = entries[0]
+    assert first_entry["document"]["id"] == doc_alpha["id"]
+    assert "starlight" in first_entry["text"].lower()
+
 
 def test_document_hierarchy_service(
     tmp_path: Path,

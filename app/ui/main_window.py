@@ -1261,11 +1261,14 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        extra_options = self._build_extra_request_options(question)
+        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
+        extra_options = self._build_extra_request_options(
+            question, retrieval_documents=retrieval_documents
+        )
         try:
             turn = self._conversation_manager.ask(
                 question,
-                context_snippets=self._build_context_snippets(question),
+                context_snippets=context_snippets,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 extra_options=extra_options or None,
@@ -1293,7 +1296,12 @@ class MainWindow(QMainWindow):
         self.question_input.set_busy(False)
         self._update_question_prerequisites(self._conversation_manager.connection_state)
 
-    def _build_extra_request_options(self, question: str | None = None) -> dict[str, Any]:
+    def _build_extra_request_options(
+        self,
+        question: str | None = None,
+        *,
+        retrieval_documents: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         options: dict[str, Any] = {}
         scope = self._current_retrieval_scope
         include = list(scope.get("include", [])) if scope else []
@@ -1305,27 +1313,97 @@ class MainWindow(QMainWindow):
             retrieval["include"] = include
         if exclude:
             retrieval["exclude"] = exclude
+        if retrieval_documents:
+            retrieval["documents"] = retrieval_documents
         if retrieval:
             options["retrieval"] = retrieval
         return options
 
-    def _build_context_snippets(self, question: str) -> list[str]:
+    def _prepare_retrieval_context(
+        self, question: str
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         if not question.strip():
-            return []
+            return [], []
         try:
             project_id = self.project_service.active_project_id
         except RuntimeError:
-            return []
+            return [], []
         scope = self._current_retrieval_scope or {"include": [], "exclude": []}
         include = scope.get("include") or []
         exclude = scope.get("exclude") or []
-        snippets = self.search_service.retrieve_context_snippets(
+        records = self.search_service.collect_context_records(
             question,
             project_id=project_id,
             include_identifiers=include,
             exclude_identifiers=exclude,
         )
-        return snippets
+
+        snippets: list[str] = []
+        retrieval_documents: list[dict[str, Any]] = []
+        for record in records:
+            document = record.get("document") or {}
+            chunk = record.get("chunk") or {}
+            context_text = str(record.get("context") or chunk.get("text") or "").strip()
+            if not context_text:
+                continue
+            source_path = document.get("source_path") or record.get("path")
+            title = document.get("title")
+            if not title and source_path:
+                try:
+                    path_obj = Path(source_path)
+                    title = path_obj.name or path_obj.stem
+                except Exception:
+                    title = str(source_path)
+            if not title:
+                title = "Document"
+            identifiers = sorted(SearchService._document_identifiers(document))
+            primary_identifier = identifiers[0] if identifiers else str(document.get("id") or title)
+            snippet_header = f"[{primary_identifier}] {title}" if primary_identifier else title
+            snippets.append(f"{snippet_header}\n{context_text}")
+
+            payload: dict[str, Any] = {
+                "id": primary_identifier,
+                "source": title,
+                "identifiers": identifiers,
+                "text": context_text,
+            }
+            score = record.get("score")
+            if score is not None:
+                try:
+                    payload["score"] = float(score)
+                except (TypeError, ValueError):
+                    pass
+            if source_path:
+                payload["path"] = str(source_path)
+            document_id = document.get("id")
+            if document_id is not None:
+                payload["document_id"] = int(document_id)
+            chunk_id = chunk.get("id") if isinstance(chunk, dict) else None
+            if chunk_id is not None:
+                payload["chunk_id"] = int(chunk_id)
+            chunk_index = chunk.get("index") if isinstance(chunk, dict) else None
+            if chunk_index is not None:
+                payload["chunk_index"] = int(chunk_index)
+            start_offset = chunk.get("start_offset") if isinstance(chunk, dict) else None
+            if start_offset is not None:
+                payload["start_offset"] = int(start_offset)
+            end_offset = chunk.get("end_offset") if isinstance(chunk, dict) else None
+            if end_offset is not None:
+                payload["end_offset"] = int(end_offset)
+            highlight = record.get("highlight")
+            if highlight:
+                payload["snippet"] = str(highlight)
+            ingest_doc = record.get("ingest_document") or {}
+            ingest_id = ingest_doc.get("id")
+            if ingest_id is not None:
+                payload["ingest_document_id"] = int(ingest_id)
+            ingest_version = ingest_doc.get("version")
+            if ingest_version is not None:
+                payload["ingest_version"] = int(ingest_version)
+            payload["project_id"] = project_id
+            retrieval_documents.append(payload)
+
+        return snippets, retrieval_documents
 
     def _update_evidence_panel(self, turn: ConversationTurn) -> None:
         if not turn.citations:

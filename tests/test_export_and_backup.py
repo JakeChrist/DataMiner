@@ -68,10 +68,21 @@ def test_project_service_lifecycle_and_settings(tmp_path: Path, monkeypatch: pyt
     service = build_project_service(tmp_path)
     try:
         default_project = service.active_project()
-        service.save_conversation_settings(default_project.id, {"show_plan": False})
+        service.save_conversation_settings(
+            default_project.id,
+            {"show_plan": False, "answer_length": "brief", "model": "test-small"},
+        )
 
         created = service.create_project("Analysis", activate=True)
-        service.save_conversation_settings(created.id, {"show_plan": True, "sources_only": True})
+        service.save_conversation_settings(
+            created.id,
+            {
+                "show_plan": True,
+                "sources_only": True,
+                "answer_length": "detailed",
+                "model": "analysis-large",
+            },
+        )
 
         analysis_root = tmp_path / "analysis_corpus"
         analysis_root.mkdir()
@@ -80,11 +91,15 @@ def test_project_service_lifecycle_and_settings(tmp_path: Path, monkeypatch: pyt
         service.set_active_project(default_project.id)
         original_settings = service.load_conversation_settings(default_project.id)
         assert original_settings.get("show_plan") is False
+        assert original_settings.get("answer_length") == "brief"
+        assert original_settings.get("model") == "test-small"
 
         service.set_active_project(created.id)
         created_settings = service.load_conversation_settings(created.id)
         assert created_settings.get("show_plan") is True
         assert created_settings.get("sources_only") is True
+        assert created_settings.get("answer_length") == "detailed"
+        assert created_settings.get("model") == "analysis-large"
 
         storage_path = service.get_project_storage(created.id)
         assert storage_path.exists()

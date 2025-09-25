@@ -99,6 +99,9 @@ class TurnCardWidget(QFrame):
         self.plan_section = self._create_section("Plan", [])
         layout.addWidget(self.plan_section)
 
+        self.step_results_section = self._create_section("Step results", [])
+        layout.addWidget(self.step_results_section)
+
         self.assumptions_section = self._create_section("Assumptions", [])
         layout.addWidget(self.assumptions_section)
 
@@ -141,6 +144,19 @@ class TurnCardWidget(QFrame):
             plan_rows.append(f"{index}. {item.description} [{status}]")
         self._set_section_content(self.plan_section, plan_rows)
 
+        step_lines: list[str] = []
+        for result in turn.step_results:
+            description = result.description.strip() or f"Step {result.index}"
+            step_lines.append(f"{result.index}. {description}")
+            answer_text = result.answer.strip()
+            markers = "".join(f"[{idx}]" for idx in result.citation_indexes)
+            if answer_text or markers:
+                summary = answer_text or "No evidence recorded"
+                if markers:
+                    summary = f"{summary} {markers}".strip()
+                step_lines.append(f"    {summary}")
+        self._set_section_content(self.step_results_section, step_lines)
+
         self._set_section_content(self.assumptions_section, list(turn.assumptions))
 
         decision = turn.assumption_decision
@@ -174,6 +190,7 @@ class TurnCardWidget(QFrame):
     def apply_settings(self, settings: ConversationSettings) -> None:
         self._settings = settings
         self.plan_section.setVisible(settings.show_plan and bool(self.turn.plan))
+        self.step_results_section.setVisible(bool(self.turn.step_results))
         assumptions_visible = settings.show_assumptions and (
             bool(self.turn.assumptions) or self.turn.assumption_decision is not None
         )
@@ -189,6 +206,7 @@ class TurnCardWidget(QFrame):
         for section in (
             self.reasoning_section,
             self.plan_section,
+            self.step_results_section,
             self.assumptions_section,
             self.self_check_section,
         ):
@@ -276,7 +294,7 @@ class TurnCardWidget(QFrame):
             if isinstance(citation, str):
                 label = citation
             elif isinstance(citation, dict):
-                label = str(
+                base_label = str(
                     citation.get("source")
                     or citation.get("title")
                     or citation.get("document")
@@ -284,6 +302,15 @@ class TurnCardWidget(QFrame):
                     or citation.get("snippet")
                     or citation
                 )
+                steps = citation.get("steps")
+                if isinstance(steps, Iterable) and not isinstance(steps, (str, bytes, dict)):
+                    step_ids = sorted({str(step) for step in steps if str(step).strip()})
+                    if step_ids:
+                        label = f"Steps {', '.join(step_ids)} – {base_label}" if base_label else f"Steps {', '.join(step_ids)}"
+                    else:
+                        label = base_label
+                else:
+                    label = base_label
             else:
                 label = str(citation)
             safe_label = html.escape(label)

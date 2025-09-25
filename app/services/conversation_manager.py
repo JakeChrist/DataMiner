@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 import copy
+import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -119,6 +121,7 @@ class ConversationTurn:
     latency_ms: int | None = None
     token_usage: dict[str, int] | None = None
     raw_response: dict[str, Any] | None = None
+    step_results: list["StepResult"] = field(default_factory=list)
 
     @property
     def reasoning_bullets(self) -> list[str]:
@@ -157,6 +160,30 @@ class ConnectionState:
 
     connected: bool
     message: str | None = None
+
+
+@dataclass
+class StepContextBatch:
+    """Context payload for a single execution pass of a plan item."""
+
+    snippets: list[str]
+    documents: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class StepResult:
+    """Aggregate response for a single plan step."""
+
+    index: int
+    description: str
+    answer: str
+    citations: list[Any] = field(default_factory=list)
+    contexts: list[StepContextBatch] = field(default_factory=list)
+    citation_indexes: list[int] = field(default_factory=list)
+
+
+class DynamicPlanningError(RuntimeError):
+    """Raised when dynamic planning cannot be completed."""
 
 
 class ConversationManager:
@@ -218,6 +245,7 @@ class ConversationManager:
         reasoning_verbosity: ReasoningVerbosity | None = ReasoningVerbosity.BRIEF,
         response_mode: ResponseMode = ResponseMode.GENERATIVE,
         extra_options: dict[str, Any] | None = None,
+        context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]] | None = None,
     ) -> ConversationTurn:
         """Send ``question`` to LMStudio and append the resulting turn."""
 
@@ -225,6 +253,47 @@ class ConversationManager:
             message = self._connection_error or "LMStudio is disconnected."
             raise LMStudioConnectionError(message)
 
+        if context_provider is not None:
+            try:
+                turn = self._ask_with_plan(
+                    question,
+                    context_snippets=context_snippets,
+                    preset=preset,
+                    reasoning_verbosity=reasoning_verbosity,
+                    response_mode=response_mode,
+                    extra_options=extra_options,
+                    context_provider=context_provider,
+                )
+            except DynamicPlanningError:
+                turn = self._ask_single_shot(
+                    question,
+                    context_snippets=context_snippets,
+                    preset=preset,
+                    reasoning_verbosity=reasoning_verbosity,
+                    response_mode=response_mode,
+                    extra_options=extra_options,
+                )
+        else:
+            turn = self._ask_single_shot(
+                question,
+                context_snippets=context_snippets,
+                preset=preset,
+                reasoning_verbosity=reasoning_verbosity,
+                response_mode=response_mode,
+                extra_options=extra_options,
+            )
+        return turn
+
+    def _ask_single_shot(
+        self,
+        question: str,
+        *,
+        context_snippets: Sequence[str] | None,
+        preset: AnswerLength,
+        reasoning_verbosity: ReasoningVerbosity | None,
+        response_mode: ResponseMode,
+        extra_options: dict[str, Any] | None,
+    ) -> ConversationTurn:
         messages = self._build_messages(question, context_snippets)
         request_options = self._build_request_options(
             question,
@@ -245,6 +314,167 @@ class ConversationManager:
         self._update_connection(True, None)
         turn = self._register_turn(question, response, response_mode)
         return turn
+
+    def _ask_with_plan(
+        self,
+        question: str,
+        *,
+        context_snippets: Sequence[str] | None,
+        preset: AnswerLength,
+        reasoning_verbosity: ReasoningVerbosity | None,
+        response_mode: ResponseMode,
+        extra_options: dict[str, Any] | None,
+        context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]],
+    ) -> ConversationTurn:
+        plan_items = self._generate_plan(question)
+        if not plan_items:
+            raise DynamicPlanningError("No plan items generated")
+
+        total_steps = len(plan_items)
+        shared_context = "\n\n".join(context_snippets or [])
+        base_options = copy.deepcopy(extra_options) if extra_options else {}
+        executed_plan: list[PlanItem] = [
+            PlanItem(description=item.description, status="not_started")
+            for item in plan_items
+        ]
+        step_results: list[StepResult] = []
+        assumptions: list[str] = []
+
+        for index, plan_item in enumerate(executed_plan, start=1):
+            plan_item.status = "running"
+            try:
+                batches = list(context_provider(plan_item, index, total_steps))
+            except Exception as exc:  # pragma: no cover - fallback to single shot
+                raise DynamicPlanningError("Context provider failed") from exc
+            if not batches:
+                batches = [StepContextBatch(snippets=[], documents=[])]
+
+            answer_parts: list[str] = []
+            citations: list[Any] = []
+            used_contexts: list[StepContextBatch] = []
+
+            for pass_index, batch in enumerate(batches, start=1):
+                used_contexts.append(batch)
+                combined_snippets: list[str] = []
+                if shared_context:
+                    combined_snippets.append(shared_context)
+                combined_snippets.extend(batch.snippets)
+                prompt = self._build_step_prompt(
+                    question,
+                    plan_item.description,
+                    index,
+                    total_steps,
+                    pass_index,
+                )
+                messages = self._build_messages(
+                    prompt,
+                    combined_snippets if combined_snippets else None,
+                )
+                merged_options = self._merge_step_options(
+                    base_options,
+                    batch.documents,
+                    plan_item.description,
+                    reasoning_verbosity,
+                    response_mode,
+                )
+                try:
+                    response = self.client.chat(
+                        messages,
+                        preset=preset,
+                        extra_options=merged_options or None,
+                    )
+                except LMStudioError as exc:
+                    self._update_connection(False, str(exc) or "Unable to reach LMStudio.")
+                    raise
+
+                self._update_connection(True, None)
+                text = response.content.strip()
+                if text:
+                    answer_parts.append(text)
+                if response.citations:
+                    citations.extend(copy.deepcopy(response.citations))
+
+            if not answer_parts:
+                message = (
+                    f"No direct evidence located for step {index}: {plan_item.description}"
+                )
+                answer_parts.append(message)
+                assumptions.append(message)
+            plan_item.status = "done"
+            result = StepResult(
+                index=index,
+                description=plan_item.description,
+                answer="\n\n".join(answer_parts).strip(),
+                citations=self._deduplicate_citations(citations),
+                contexts=used_contexts,
+            )
+            if not result.citations:
+                assumptions.append(
+                    f"No citations available for step {index}: {plan_item.description}"
+                )
+            step_results.append(result)
+
+        aggregated, citation_index_map = self._aggregate_citations(step_results)
+        for result in step_results:
+            indexes = self._collect_citation_indexes(result.citations, citation_index_map)
+            result.citation_indexes = indexes
+
+        answer = self._compose_final_answer(step_results)
+        summary = f"Executed {total_steps} dynamic step{'s' if total_steps != 1 else ''}."
+        artifacts = ReasoningArtifacts(
+            summary_bullets=[summary],
+            plan_items=executed_plan,
+            assumptions=assumptions,
+        )
+        reasoning_payload = {
+            "plan": [
+                {"description": item.description, "status": item.status}
+                for item in executed_plan
+            ],
+            "assumptions": assumptions,
+            "steps": [
+                {
+                    "index": result.index,
+                    "description": result.description,
+                    "answer": result.answer,
+                    "citations": result.citation_indexes,
+                }
+                for result in step_results
+            ],
+        }
+        raw_response = {
+            "dynamic_plan": {
+                "steps": reasoning_payload["steps"],
+                "citations": aggregated,
+            }
+        }
+        turn = ConversationTurn(
+            question=question,
+            answer=answer,
+            citations=aggregated,
+            reasoning=reasoning_payload,
+            reasoning_artifacts=artifacts,
+            response_mode=response_mode,
+            raw_response=raw_response,
+            step_results=step_results,
+        )
+        self.turns.append(turn)
+        return turn
+
+    def _generate_plan(self, question: str) -> list[PlanItem]:
+        normalized = question.strip()
+        if not normalized:
+            return []
+        segments = re.split(r"[\n\.!?]+", normalized)
+        plan: list[PlanItem] = []
+        for segment in segments:
+            text = segment.strip()
+            if len(text) < 4:
+                continue
+            plan.append(PlanItem(description=text, status="not_started"))
+        if not plan:
+            plan = [PlanItem(description=normalized, status="not_started")]
+        return plan[:6]
 
     def _register_turn(
         self, question: str, response: ChatMessage, response_mode: ResponseMode
@@ -291,6 +521,110 @@ class ConversationManager:
             if normalized_question and (query is None or not str(query).strip()):
                 retrieval["query"] = normalized_question
         return options
+
+    def _merge_step_options(
+        self,
+        base_options: dict[str, Any],
+        documents: Sequence[dict[str, Any]],
+        question: str,
+        reasoning_verbosity: ReasoningVerbosity | None,
+        response_mode: ResponseMode,
+    ) -> dict[str, Any]:
+        extra: dict[str, Any] = copy.deepcopy(base_options) if base_options else {}
+        if documents:
+            retrieval = extra.setdefault("retrieval", {})
+            payload_docs = retrieval.setdefault("documents", [])
+            payload_docs.extend(copy.deepcopy(list(documents)))
+        merged = self._build_request_options(
+            question,
+            reasoning_verbosity,
+            response_mode,
+            extra,
+        )
+        return merged
+
+    def _build_step_prompt(
+        self,
+        question: str,
+        step_description: str,
+        index: int,
+        total_steps: int,
+        pass_index: int,
+    ) -> str:
+        prefix = (
+            f"Step {index} of {total_steps} (pass {pass_index}): {step_description}."
+        )
+        instructions = (
+            "Respond with a concise factual finding for this step. "
+            "Do not include bracketed citation markers; they will be added later."
+        )
+        return f"{prefix}\nOriginal question: {question}\n{instructions}"
+
+    @staticmethod
+    def _deduplicate_citations(citations: Sequence[Any]) -> list[Any]:
+        unique: list[Any] = []
+        seen: set[str] = set()
+        for citation in citations:
+            key = ConversationManager._citation_key(citation)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(copy.deepcopy(citation))
+        return unique
+
+    @staticmethod
+    def _citation_key(citation: Any) -> str:
+        try:
+            return json.dumps(citation, sort_keys=True, default=str)
+        except TypeError:
+            return str(citation)
+
+    def _aggregate_citations(
+        self, step_results: Sequence[StepResult]
+    ) -> tuple[list[Any], dict[str, int]]:
+        aggregated: list[Any] = []
+        index_map: dict[str, int] = {}
+        for result in step_results:
+            for citation in result.citations:
+                key = self._citation_key(citation)
+                if key not in index_map:
+                    entry = copy.deepcopy(citation)
+                    aggregated.append(entry)
+                    index_map[key] = len(aggregated)
+        for citation in aggregated:
+            key = self._citation_key(citation)
+            steps = []
+            for result in step_results:
+                if any(self._citation_key(item) == key for item in result.citations):
+                    steps.append(result.index)
+            if steps:
+                try:
+                    citation["steps"] = sorted(set(steps))  # type: ignore[index]
+                except TypeError:
+                    pass
+        return aggregated, index_map
+
+    @staticmethod
+    def _collect_citation_indexes(
+        citations: Sequence[Any], index_map: dict[str, int]
+    ) -> list[int]:
+        indexes = {
+            index_map[key]
+            for key in (ConversationManager._citation_key(citation) for citation in citations)
+            if key in index_map
+        }
+        return sorted(indexes)
+
+    @staticmethod
+    def _compose_final_answer(step_results: Sequence[StepResult]) -> str:
+        lines: list[str] = []
+        for result in step_results:
+            text = result.answer.strip() or result.description
+            markers = "".join(f"[{index}]" for index in result.citation_indexes)
+            if markers:
+                text = f"{text} {markers}".strip()
+            lines.append(text)
+        return "\n\n".join(lines)
 
     @staticmethod
     def _parse_reasoning_artifacts(
@@ -468,10 +802,13 @@ __all__ = [
     "ConnectionState",
     "ConversationManager",
     "ConversationTurn",
+    "DynamicPlanningError",
     "PlanItem",
     "ReasoningArtifacts",
     "ReasoningVerbosity",
     "ResponseMode",
     "SelfCheckResult",
+    "StepContextBatch",
+    "StepResult",
 ]
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -226,7 +227,10 @@ class ConversationManager:
 
         messages = self._build_messages(question, context_snippets)
         request_options = self._build_request_options(
-            reasoning_verbosity, response_mode, extra_options
+            question,
+            reasoning_verbosity,
+            response_mode,
+            extra_options,
         )
         try:
             response = self.client.chat(
@@ -260,6 +264,7 @@ class ConversationManager:
 
     @staticmethod
     def _build_request_options(
+        question: str,
         reasoning_verbosity: ReasoningVerbosity | None,
         response_mode: ResponseMode,
         extra_options: dict[str, Any] | None,
@@ -278,7 +283,13 @@ class ConversationManager:
                 ):
                     options["reasoning"].update(value)
                 else:
-                    options[key] = value
+                    options[key] = copy.deepcopy(value)
+        retrieval = options.get("retrieval")
+        if isinstance(retrieval, dict):
+            normalized_question = question.strip()
+            query = retrieval.get("query")
+            if normalized_question and (query is None or not str(query).strip()):
+                retrieval["query"] = normalized_question
         return options
 
     @staticmethod

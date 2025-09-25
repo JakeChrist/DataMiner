@@ -1261,7 +1261,7 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        extra_options = self._build_extra_request_options()
+        extra_options = self._build_extra_request_options(question)
         try:
             turn = self._conversation_manager.ask(
                 question,
@@ -1293,13 +1293,20 @@ class MainWindow(QMainWindow):
         self.question_input.set_busy(False)
         self._update_question_prerequisites(self._conversation_manager.connection_state)
 
-    def _build_extra_request_options(self) -> dict[str, Any]:
+    def _build_extra_request_options(self, question: str | None = None) -> dict[str, Any]:
         options: dict[str, Any] = {}
         scope = self._current_retrieval_scope
         include = list(scope.get("include", [])) if scope else []
         exclude = list(scope.get("exclude", [])) if scope else []
-        if include or exclude:
-            options["retrieval"] = {"include": include, "exclude": exclude}
+        retrieval: dict[str, Any] = {}
+        if question and question.strip():
+            retrieval["query"] = question.strip()
+        if include:
+            retrieval["include"] = include
+        if exclude:
+            retrieval["exclude"] = exclude
+        if retrieval:
+            options["retrieval"] = retrieval
         return options
 
     def _build_context_snippets(self, question: str) -> list[str]:

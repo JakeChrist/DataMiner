@@ -241,6 +241,23 @@ def test_lmstudio_client_and_conversation_manager_success(lmstudio_server: tuple
     assert "Context:" in messages[-1]["content"]
 
 
+def test_conversation_manager_populates_retrieval_query(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    client = LMStudioClient(base_url=base_url, retry_backoff=0.01)
+    manager = ConversationManager(client, context_window=0)
+
+    extra = {"retrieval": {"include": ["doc-1"]}}
+    manager.ask("Gather context please", extra_options=extra)
+
+    assert state["requests"] and isinstance(state["requests"], list)
+    payload = state["requests"][-1]
+    assert payload.get("retrieval", {}).get("query") == "Gather context please"
+    assert payload.get("retrieval", {}).get("include") == ["doc-1"]
+    assert "query" not in extra["retrieval"]
+
+
 def test_lmstudio_client_disables_streaming_by_default(
     lmstudio_server: tuple[dict[str, object], str]
 ) -> None:

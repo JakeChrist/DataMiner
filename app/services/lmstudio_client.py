@@ -156,6 +156,10 @@ class LMStudioClient:
                     break
             except error.URLError as exc:
                 last_error = LMStudioConnectionError(str(exc.reason))
+            except TimeoutError:
+                last_error = LMStudioConnectionError(
+                    f"LMStudio request timed out after {self.timeout:.1f}s"
+                )
             if attempt < self.max_retries:
                 time.sleep(self.retry_backoff * (2**attempt))
         if isinstance(last_error, LMStudioError):

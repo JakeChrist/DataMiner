@@ -260,6 +260,15 @@ class EvidencePanel(QWidget):
             section = citation.get("section") or citation.get("heading")
             if section:
                 location_parts.append(str(section))
+            steps = citation.get("steps")
+            steps_label = ""
+            if isinstance(steps, Iterable) and not isinstance(steps, (str, bytes, dict)):
+                step_ids = sorted({str(step) for step in steps if str(step).strip()})
+                if step_ids:
+                    steps_label = ", ".join(step_ids)
+                    label_prefix = f"Steps {steps_label} – "
+                    label = f"[{index}] {label_prefix}{source}" if source else f"[{index}] Steps {steps_label}"
+                    location_parts.insert(0, f"Steps {steps_label}")
             metadata = " | ".join(location_parts)
             path = citation.get("path") or citation.get("file_path")
             if isinstance(path, str) and not path.strip():

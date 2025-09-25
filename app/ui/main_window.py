@@ -9,7 +9,7 @@ from functools import partial
 from importlib import metadata
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence, QShortcut
@@ -46,8 +46,10 @@ from ..services.conversation_manager import (
     ConversationManager,
     ConversationTurn,
     LMStudioError,
+    PlanItem,
     ReasoningVerbosity,
     ResponseMode,
+    StepContextBatch,
 )
 from ..services.conversation_settings import ConversationSettings
 from ..services.document_hierarchy import DocumentHierarchyService
@@ -1261,17 +1263,15 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
-        extra_options = self._build_extra_request_options(
-            question, retrieval_documents=retrieval_documents
-        )
+        step_context_provider = self._build_step_context_provider(question)
+        extra_options = self._build_extra_request_options(question)
         try:
             turn = self._conversation_manager.ask(
                 question,
-                context_snippets=context_snippets,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 extra_options=extra_options or None,
+                context_provider=step_context_provider,
             )
         except LMStudioError as exc:
             self.progress_service.finish("chat-send", "Send failed")
@@ -1319,6 +1319,46 @@ class MainWindow(QMainWindow):
             options["retrieval"] = retrieval
         return options
 
+    def _build_step_context_provider(
+        self, question: str
+    ) -> Callable[[PlanItem, int, int], Iterable[StepContextBatch]]:
+        normalized = question.strip()
+        try:
+            project_id = self.project_service.active_project_id
+        except RuntimeError:
+            return lambda *_args, **_kwargs: []
+
+        scope = self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope.get("include") or [])
+        exclude = list(scope.get("exclude") or [])
+        chunk_size = 3
+        limit = 9
+
+        def provider(plan_item: PlanItem, step_index: int, total_steps: int) -> list[StepContextBatch]:
+            step_prompt = plan_item.description.strip()
+            combined_query = "\n\n".join(
+                part for part in [normalized, step_prompt] if part
+            )
+            records = self.search_service.collect_context_records(
+                combined_query,
+                project_id=project_id,
+                include_identifiers=include,
+                exclude_identifiers=exclude,
+                limit=limit,
+            )
+            batches: list[StepContextBatch] = []
+            for chunk in self._chunk_records(records, chunk_size):
+                snippets, documents = self._context_payload_from_records(
+                    chunk,
+                    project_id,
+                    step_index=step_index,
+                )
+                if snippets or documents:
+                    batches.append(StepContextBatch(snippets=snippets, documents=documents))
+            return batches
+
+        return provider
+
     def _prepare_retrieval_context(
         self, question: str
     ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -1337,9 +1377,18 @@ class MainWindow(QMainWindow):
             include_identifiers=include,
             exclude_identifiers=exclude,
         )
+        return self._context_payload_from_records(records, project_id)
 
+    def _context_payload_from_records(
+        self,
+        records: Iterable[dict[str, Any]],
+        project_id: int,
+        *,
+        step_index: int | None = None,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         snippets: list[str] = []
         retrieval_documents: list[dict[str, Any]] = []
+        prefix = f"Step {step_index}: " if step_index is not None else ""
         for record in records:
             document = record.get("document") or {}
             chunk = record.get("chunk") or {}
@@ -1358,7 +1407,14 @@ class MainWindow(QMainWindow):
                 title = "Document"
             identifiers = sorted(SearchService._document_identifiers(document))
             primary_identifier = identifiers[0] if identifiers else str(document.get("id") or title)
-            snippet_header = f"[{primary_identifier}] {title}" if primary_identifier else title
+            header_parts = []
+            if prefix:
+                header_parts.append(prefix.strip())
+            if primary_identifier:
+                header_parts.append(f"[{primary_identifier}] {title}")
+            else:
+                header_parts.append(title)
+            snippet_header = " ".join(header_parts)
             snippets.append(f"{snippet_header}\n{context_text}")
 
             payload: dict[str, Any] = {
@@ -1366,6 +1422,7 @@ class MainWindow(QMainWindow):
                 "source": title,
                 "identifiers": identifiers,
                 "text": context_text,
+                "project_id": project_id,
             }
             score = record.get("score")
             if score is not None:
@@ -1400,10 +1457,22 @@ class MainWindow(QMainWindow):
             ingest_version = ingest_doc.get("version")
             if ingest_version is not None:
                 payload["ingest_version"] = int(ingest_version)
-            payload["project_id"] = project_id
             retrieval_documents.append(payload)
 
         return snippets, retrieval_documents
+
+    @staticmethod
+    def _chunk_records(
+        records: Iterable[dict[str, Any]], chunk_size: int
+    ) -> Iterable[list[dict[str, Any]]]:
+        chunk: list[dict[str, Any]] = []
+        for record in records:
+            chunk.append(record)
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
 
     def _update_evidence_panel(self, turn: ConversationTurn) -> None:
         if not turn.citations:

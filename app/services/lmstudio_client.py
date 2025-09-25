@@ -118,6 +118,7 @@ class LMStudioClient:
             "messages": list(messages),
         }
         payload.update(preset.to_request_params())
+        payload.setdefault("stream", False)
         if extra_options:
             payload.update(extra_options)
         data = self._request_json("POST", CHAT_COMPLETIONS_PATH, payload)
@@ -156,6 +157,10 @@ class LMStudioClient:
                     break
             except error.URLError as exc:
                 last_error = LMStudioConnectionError(str(exc.reason))
+            except TimeoutError:
+                last_error = LMStudioConnectionError(
+                    f"LMStudio request timed out after {self.timeout:.1f}s"
+                )
             if attempt < self.max_retries:
                 time.sleep(self.retry_backoff * (2**attempt))
         if isinstance(last_error, LMStudioError):

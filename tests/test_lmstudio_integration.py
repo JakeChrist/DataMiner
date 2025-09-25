@@ -239,6 +239,35 @@ def test_lmstudio_client_and_conversation_manager_success(lmstudio_server: tuple
     assert "Context:" in messages[-1]["content"]
 
 
+def test_lmstudio_client_disables_streaming_by_default(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    client = LMStudioClient(base_url=base_url)
+
+    client.chat([{"role": "user", "content": "Hello"}])
+
+    first_request = state["requests"][0]
+    assert isinstance(first_request, dict)
+    assert first_request.get("stream") is False
+
+
+def test_lmstudio_client_allows_stream_override(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    client = LMStudioClient(base_url=base_url)
+
+    client.chat(
+        [{"role": "user", "content": "Hello"}],
+        extra_options={"stream": True},
+    )
+
+    first_request = state["requests"][0]
+    assert isinstance(first_request, dict)
+    assert first_request.get("stream") is True
+
+
 def test_conversation_manager_handles_failures_and_recovers(
     lmstudio_server: tuple[dict[str, object], str]
 ) -> None:

@@ -326,6 +326,10 @@ def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch, proje
     retrieval = client.last_options.get("retrieval", {})
     assert retrieval.get("exclude") == ["doc-a"]
     assert "doc-b" in retrieval.get("include", [])
+    documents = retrieval.get("documents")
+    assert isinstance(documents, list) and documents
+    assert documents[0]["text"]
+    assert documents[0]["id"]
 
     window.close()
 

@@ -81,7 +81,7 @@ class SearchService:
                 break
         return results
 
-    def retrieve_context_snippets(
+    def collect_context_records(
         self,
         query: str,
         *,
@@ -92,7 +92,9 @@ class SearchService:
         recursive: bool = True,
         include_identifiers: Iterable[str] | None = None,
         exclude_identifiers: Iterable[str] | None = None,
-    ) -> list[str]:
+    ) -> list[dict[str, Any]]:
+        """Return structured retrieval records for ``query`` within scope."""
+
         scope_tags = list(tags) if tags is not None else None
         scope_folder = self._normalize_folder(folder) if folder is not None else None
         candidate_documents = self.documents.list_for_scope(
@@ -104,7 +106,7 @@ class SearchService:
         documents_by_path = self._build_path_index(candidate_documents)
         include_set = {str(item) for item in (include_identifiers or []) if str(item)}
         exclude_set = {str(item) for item in (exclude_identifiers or []) if str(item)}
-        snippets: list[str] = []
+        records: list[dict[str, Any]] = []
         seen_chunks: set[int] = set()
         for record in self._search_with_fallback(query, limit=limit * 6):
             doc_payload = record.get("document") or {}
@@ -126,11 +128,59 @@ class SearchService:
             text = chunk.get("text") if isinstance(chunk, dict) else None
             if not text:
                 continue
-            title = document.get("title") or Path(path).stem or Path(path).name
-            snippets.append(f"{title}: {text.strip()}")
+            highlight = (
+                record.get("highlight")
+                or chunk.get("highlight")
+                or doc_payload.get("preview")
+                or text
+            )
+            context_record = {
+                "document": document,
+                "chunk": chunk,
+                "context": text,
+                "highlight": highlight,
+                "ingest_document": doc_payload,
+                "score": record.get("score"),
+            }
+            records.append(context_record)
             seen_chunks.add(chunk_id)
-            if len(snippets) >= limit:
+            if len(records) >= limit:
                 break
+        return records
+
+    def retrieve_context_snippets(
+        self,
+        query: str,
+        *,
+        project_id: int,
+        limit: int = 5,
+        tags: Iterable[int] | None = None,
+        folder: str | Path | None = None,
+        recursive: bool = True,
+        include_identifiers: Iterable[str] | None = None,
+        exclude_identifiers: Iterable[str] | None = None,
+    ) -> list[str]:
+        records = self.collect_context_records(
+            query,
+            project_id=project_id,
+            limit=limit,
+            tags=tags,
+            folder=folder,
+            recursive=recursive,
+            include_identifiers=include_identifiers,
+            exclude_identifiers=exclude_identifiers,
+        )
+        snippets: list[str] = []
+        for entry in records:
+            document = entry.get("document") or {}
+            chunk = entry.get("chunk") or {}
+            context = entry.get("context") or chunk.get("text") or ""
+            path = document.get("source_path") or entry.get("path")
+            title = document.get("title") or (Path(path).stem if path else None)
+            if not title and path:
+                title = Path(path).name
+            label = title or "Document"
+            snippets.append(f"{label}: {context.strip()}")
         return snippets
 
     def _resolve_scope(

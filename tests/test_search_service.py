@@ -159,6 +159,33 @@ def test_context_snippets_relax_query_terms(
 
     assert any("DataMiner" in snippet for snippet in snippets)
 
+
+def test_collect_context_records_includes_metadata(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    base = tmp_path / "corpus"
+    doc_path = base / "report.txt"
+    doc_path.parent.mkdir(parents=True, exist_ok=True)
+    doc_path.write_text("The quarterly report covers revenue and expenses in detail.")
+
+    project = project_repo.create("Metadata Project")
+    document = document_repo.create(project["id"], "Report", source_path=doc_path)
+    _store_ingest_document(ingest_repo, doc_path, doc_path.read_text())
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    records = service.collect_context_records("revenue", project_id=project["id"])
+
+    assert records
+    first = records[0]
+    assert first["document"]["id"] == document["id"]
+    assert "context" in first and "revenue" in first["context"].lower()
+    assert first["chunk"]["id"]
+
 def test_document_hierarchy_service(
     tmp_path: Path,
     project_repo: ProjectRepository,

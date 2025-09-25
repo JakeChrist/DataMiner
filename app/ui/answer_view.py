@@ -61,11 +61,13 @@ class TurnCardWidget(QFrame):
         self.turn = turn
         self._settings = settings
         self._progress = progress_service
+        self._density = ""
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setObjectName("turnCard")
 
         layout = QVBoxLayout(self)
         layout.setSpacing(6)
+        self._layout = layout
 
         self.question_label = QLabel(f"Q: {turn.question}", self)
         self.question_label.setWordWrap(True)
@@ -117,10 +119,12 @@ class TurnCardWidget(QFrame):
         self.copy_citations_button.clicked.connect(self._copy_citations)
         actions_row.addWidget(self.copy_citations_button)
         layout.addLayout(actions_row)
+        self._actions_row = actions_row
 
         self._selected_citation: int | None = None
         self._apply_turn_data()
         self.apply_settings(settings)
+        self.set_density("comfortable")
 
     # ------------------------------------------------------------------
     def _apply_turn_data(self) -> None:
@@ -235,6 +239,29 @@ class TurnCardWidget(QFrame):
     @property
     def selected_citation(self) -> int | None:
         return self._selected_citation
+
+    def set_density(self, density: str) -> None:
+        normalized = "compact" if str(density).lower() == "compact" else "comfortable"
+        if normalized == self._density:
+            return
+        self._density = normalized
+        margin = 12 if normalized == "compact" else 16
+        spacing = 4 if normalized == "compact" else 8
+        if isinstance(self._layout, QVBoxLayout):
+            self._layout.setContentsMargins(margin, margin, margin, margin)
+            self._layout.setSpacing(spacing)
+        if isinstance(self._actions_row, QHBoxLayout):
+            self._actions_row.setSpacing(spacing)
+        for section in (
+            self.reasoning_section,
+            self.plan_section,
+            self.step_results_section,
+            self.assumptions_section,
+            self.self_check_section,
+        ):
+            layout = section.layout()
+            if isinstance(layout, QVBoxLayout):
+                layout.setSpacing(1 if normalized == "compact" else 2)
 
     # ------------------------------------------------------------------
     def _create_section(self, title: str, lines: Iterable[str]) -> QFrame:
@@ -354,6 +381,7 @@ class AnswerView(QScrollArea):
         self._settings = settings
         self._progress = progress_service
         self._cards: list[TurnCardWidget] = []
+        self._density = ""
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -363,6 +391,7 @@ class AnswerView(QScrollArea):
         self._layout.setSpacing(8)
         self._layout.addStretch(1)
         self.setWidget(container)
+        self.set_density("comfortable")
 
         settings.show_plan_changed.connect(self._apply_settings_to_cards)
         settings.show_assumptions_changed.connect(self._apply_settings_to_cards)
@@ -388,6 +417,7 @@ class AnswerView(QScrollArea):
         self._layout.insertWidget(self._layout.count() - 1, card)
         card.citation_activated.connect(lambda index, card=card: self._emit_citation(card, index))
         card.set_selected_citation(None)
+        card.set_density(self._density or "comfortable")
         self._scroll_to_bottom()
         return card
 
@@ -413,6 +443,17 @@ class AnswerView(QScrollArea):
 
     def _emit_citation(self, card: TurnCardWidget, index: int) -> None:
         self.citation_activated.emit(card, index)
+
+    def set_density(self, density: str) -> None:
+        normalized = "compact" if str(density).lower() == "compact" else "comfortable"
+        if normalized == self._density:
+            return
+        self._density = normalized
+        spacing = 8 if normalized == "compact" else 12
+        if isinstance(self._layout, QVBoxLayout):
+            self._layout.setSpacing(spacing)
+        for card in self._cards:
+            card.set_density(normalized)
 
 
 __all__ = ["AnswerView", "TurnCardWidget"]

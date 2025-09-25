@@ -364,7 +364,9 @@ def test_evidence_open_in_system_app(qt_app, tmp_path, monkeypatch, project_serv
 
     window._evidence_panel.select_index(0)
     qt_app.processEvents()
-    window._evidence_panel._open_button.click()
+    row = window._evidence_panel._list.itemWidget(window._evidence_panel._list.item(0))
+    assert row is not None
+    row.open_button.click()
     qt_app.processEvents()
 
     assert "url" in called

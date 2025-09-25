@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
+    QActionGroup,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -53,7 +54,7 @@ from ..services.conversation_manager import (
 )
 from ..services.conversation_settings import ConversationSettings
 from ..services.document_hierarchy import DocumentHierarchyService
-from ..services.lmstudio_client import LMStudioClient
+from ..services.lmstudio_client import AnswerLength, LMStudioClient
 from ..services.progress_service import ProgressService, ProgressUpdate
 from ..services.project_service import ProjectRecord, ProjectService
 from ..services.backup_service import BackupService
@@ -151,6 +152,7 @@ class MainWindow(QMainWindow):
         self.export_service = export_service
         self.backup_service = backup_service
         self.enable_health_monitor = enable_health_monitor
+        self._last_splitter_sizes = list(self.settings_service.splitter_sizes)
         self._setup_window()
         self._create_actions()
         self._create_menus_and_toolbar()
@@ -176,6 +178,10 @@ class MainWindow(QMainWindow):
         self._toast = ToastWidget(self)
         self._rescan_button: QPushButton | None = None
         self._create_layout()
+        self._apply_density(self.settings_service.density)
+        self.question_input.set_model_name(self.conversation_settings.model_name)
+        self.question_input.set_answer_length(self.conversation_settings.answer_length)
+        self._configure_question_settings_menu()
         self._connect_services()
         self.settings_service.apply_theme()
         self.settings_service.apply_font_scale()
@@ -287,6 +293,33 @@ class MainWindow(QMainWindow):
 
         view_menu = QMenu("View", self)
         view_menu.addAction(self.toggle_theme_action)
+        view_menu.addSeparator()
+
+        self.toggle_corpus_panel_action = QAction("Show corpus pane", self, checkable=True)
+        self.toggle_corpus_panel_action.setChecked(self.settings_service.show_corpus_panel)
+        self.toggle_corpus_panel_action.toggled.connect(self._toggle_corpus_panel)
+        view_menu.addAction(self.toggle_corpus_panel_action)
+
+        self.toggle_evidence_panel_action = QAction(
+            "Show evidence pane", self, checkable=True
+        )
+        self.toggle_evidence_panel_action.setChecked(
+            self.settings_service.show_evidence_panel
+        )
+        self.toggle_evidence_panel_action.toggled.connect(self._toggle_evidence_panel)
+        view_menu.addAction(self.toggle_evidence_panel_action)
+
+        view_menu.addSeparator()
+        density_menu = view_menu.addMenu("Density")
+        self._density_group = QActionGroup(self)
+        for label, value in [("Comfortable", "comfortable"), ("Compact", "compact")]:
+            action = QAction(label, self, checkable=True)
+            action.setData(value)
+            if self.settings_service.density == value:
+                action.setChecked(True)
+            self._density_group.addAction(action)
+            density_menu.addAction(action)
+        self._density_group.triggered.connect(self._on_density_action_triggered)
         menubar.addMenu(view_menu)
 
         toolbar = QToolBar("Main Toolbar", self)
@@ -311,9 +344,6 @@ class MainWindow(QMainWindow):
         project_label = QLabel(self._project_label_text())
         status.addWidget(project_label)
 
-        self._lmstudio_indicator = QLabel("LMStudio: Checking...")
-        status.addPermanentWidget(self._lmstudio_indicator)
-
         self._progress_bar = QProgressBar(self)
         self._progress_bar.setVisible(False)
         self._progress_bar.setMaximumWidth(200)
@@ -323,25 +353,39 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         root_layout = QHBoxLayout(central)
         root_layout.setContentsMargins(0, 0, 0, 0)
-        splitter = QSplitter(Qt.Orientation.Horizontal, central)
-        splitter.setChildrenCollapsible(False)
-        root_layout.addWidget(splitter)
+
+        self._splitter = QSplitter(Qt.Orientation.Horizontal, central)
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.splitterMoved.connect(lambda *_args: self._store_splitter_sizes())
+        root_layout.addWidget(self._splitter)
 
         # Left panel - corpus selector and ingest controls
-        corpus_panel = QWidget(splitter)
-        corpus_layout = QVBoxLayout(corpus_panel)
-        corpus_layout.setContentsMargins(8, 8, 8, 8)
-        corpus_layout.setSpacing(8)
+        self._corpus_panel = QWidget(self._splitter)
+        self._corpus_panel.setObjectName("corpusPane")
+        corpus_layout = QVBoxLayout(self._corpus_panel)
+        corpus_layout.setContentsMargins(12, 12, 12, 12)
+        corpus_layout.setSpacing(12)
 
-        controls_frame = QFrame(corpus_panel)
+        controls_frame = QFrame(self._corpus_panel)
         controls_frame.setObjectName("corpusControls")
         controls_layout = QVBoxLayout(controls_frame)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(6)
+        controls_layout.setContentsMargins(8, 8, 8, 8)
+        controls_layout.setSpacing(8)
 
-        controls_label = QLabel("Document corpus", controls_frame)
+        controls_header = QHBoxLayout()
+        controls_header.setContentsMargins(0, 0, 0, 0)
+        controls_header.setSpacing(6)
+        controls_label = QLabel("Corpus", controls_frame)
         controls_label.setObjectName("corpusLabel")
-        controls_layout.addWidget(controls_label)
+        controls_header.addWidget(controls_label)
+        controls_header.addStretch(1)
+        collapse_left = QPushButton("Collapse", controls_frame)
+        collapse_left.setObjectName("collapseCorpus")
+        collapse_left.clicked.connect(
+            lambda: self.toggle_corpus_panel_action.setChecked(False)
+        )
+        controls_header.addWidget(collapse_left)
+        controls_layout.addLayout(controls_header)
 
         add_folder_button = QPushButton("Index Folder…", controls_frame)
         add_folder_button.setObjectName("indexFolderButton")
@@ -368,18 +412,19 @@ class MainWindow(QMainWindow):
         controls_layout.addStretch(1)
         corpus_layout.addWidget(controls_frame)
 
-        self._corpus_tree = QTreeWidget(corpus_panel)
+        self._corpus_tree = QTreeWidget(self._corpus_panel)
         self._corpus_tree.setObjectName("corpusSelector")
         self._corpus_tree.setHeaderHidden(True)
         self._corpus_tree.setIndentation(16)
         corpus_layout.addWidget(self._corpus_tree, 1)
-        splitter.addWidget(corpus_panel)
+        self._splitter.addWidget(self._corpus_panel)
 
         # Center panel - conversation and controls
-        chat_panel = QWidget(splitter)
+        chat_panel = QWidget(self._splitter)
+        chat_panel.setObjectName("chatPane")
         chat_layout = QVBoxLayout(chat_panel)
-        chat_layout.setContentsMargins(8, 8, 8, 8)
-        chat_layout.setSpacing(8)
+        chat_layout.setContentsMargins(12, 12, 12, 12)
+        chat_layout.setSpacing(12)
 
         self.answer_view = AnswerView(
             settings=self.conversation_settings,
@@ -395,22 +440,26 @@ class MainWindow(QMainWindow):
 
         self.question_input = QuestionInputWidget(chat_panel)
         self.question_input.ask_requested.connect(self._handle_ask)
+        self.question_input.scope_cleared.connect(self._on_scope_chip_cleared)
         chat_layout.addWidget(self.question_input)
-        splitter.addWidget(chat_panel)
+        self._splitter.addWidget(chat_panel)
 
         # Right panel - evidence viewer
-        self._evidence_panel = EvidencePanel(splitter)
+        self._evidence_panel = EvidencePanel(self._splitter)
         self._evidence_panel.setObjectName("evidencePanel")
         self._evidence_panel.scope_changed.connect(self._on_evidence_scope_changed)
         self._evidence_panel.evidence_selected.connect(self._on_evidence_selected)
-        splitter.addWidget(self._evidence_panel)
+        self._evidence_panel.locate_requested.connect(self._on_evidence_locate_requested)
+        self._evidence_panel.copy_requested.connect(self._on_copy_evidence_snippet)
+        self._splitter.addWidget(self._evidence_panel)
 
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 1)
-        splitter.setSizes([240, 640, 320])
+        self._splitter.setStretchFactor(0, 1)
+        self._splitter.setStretchFactor(1, 3)
+        self._splitter.setStretchFactor(2, 2)
 
         self.setCentralWidget(central)
+
+        self._apply_splitter_preferences()
 
         # Keyboard shortcuts
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_corpus)
@@ -418,6 +467,191 @@ class MainWindow(QMainWindow):
         self._update_question_prerequisites(self._conversation_manager.connection_state)
 
     # ------------------------------------------------------------------
+    def _apply_splitter_preferences(self) -> None:
+        if not hasattr(self, "_splitter"):
+            return
+        sizes = list(self.settings_service.splitter_sizes)
+        if len(sizes) == 3 and any(size > 0 for size in sizes):
+            self._splitter.setSizes([max(80, int(size)) for size in sizes])
+        self._set_panel_visibility(0, self.settings_service.show_corpus_panel)
+        self._set_panel_visibility(2, self.settings_service.show_evidence_panel)
+        if hasattr(self, "toggle_corpus_panel_action"):
+            self.toggle_corpus_panel_action.blockSignals(True)
+            self.toggle_corpus_panel_action.setChecked(self.settings_service.show_corpus_panel)
+            self.toggle_corpus_panel_action.blockSignals(False)
+        if hasattr(self, "toggle_evidence_panel_action"):
+            self.toggle_evidence_panel_action.blockSignals(True)
+            self.toggle_evidence_panel_action.setChecked(
+                self.settings_service.show_evidence_panel
+            )
+            self.toggle_evidence_panel_action.blockSignals(False)
+
+    def _configure_question_settings_menu(self) -> None:
+        menu = QMenu("Response settings", self.question_input)
+        length_menu = menu.addMenu("Answer length")
+        self._length_action_group = QActionGroup(menu)
+        self._length_action_group.setExclusive(True)
+        for preset in AnswerLength:
+            action = QAction(preset.name.title(), menu)
+            action.setCheckable(True)
+            action.setData(preset)
+            if preset is self.conversation_settings.answer_length:
+                action.setChecked(True)
+            self._length_action_group.addAction(action)
+            length_menu.addAction(action)
+        self._length_action_group.triggered.connect(self._on_answer_length_action_triggered)
+        menu.addSeparator()
+        model_action = QAction("Set model…", menu)
+        model_action.triggered.connect(self._prompt_model_name)
+        menu.addAction(model_action)
+        self.question_input.set_settings_menu(menu)
+        self._sync_answer_length_actions(self.conversation_settings.answer_length)
+
+    def _set_panel_visibility(self, index: int, visible: bool) -> None:
+        widget = self._splitter.widget(index) if hasattr(self, "_splitter") else None
+        if widget is None:
+            return
+        widget.setVisible(bool(visible))
+        if visible:
+            widget.show()
+        else:
+            widget.hide()
+
+    def _store_splitter_sizes(self) -> None:
+        if not hasattr(self, "_splitter"):
+            return
+        sizes = self._splitter.sizes()
+        if len(sizes) != 3:
+            return
+        if any(size > 0 for size in sizes):
+            self._last_splitter_sizes = list(sizes)
+            self.settings_service.set_splitter_sizes(sizes)
+
+    def _restore_splitter_sizes(self) -> None:
+        sizes = getattr(self, "_last_splitter_sizes", None)
+        if not sizes:
+            sizes = list(self.settings_service.splitter_sizes)
+        if hasattr(self, "_splitter") and sizes and len(sizes) == 3:
+            self._splitter.setSizes([max(80, int(size)) for size in sizes])
+
+    def _toggle_corpus_panel(self, visible: bool) -> None:
+        if visible:
+            self.settings_service.set_show_corpus_panel(True)
+            self._set_panel_visibility(0, True)
+            self._restore_splitter_sizes()
+        else:
+            self._store_splitter_sizes()
+            self._set_panel_visibility(0, False)
+            self.settings_service.set_show_corpus_panel(False)
+
+    def _toggle_evidence_panel(self, visible: bool) -> None:
+        if visible:
+            self.settings_service.set_show_evidence_panel(True)
+            self._set_panel_visibility(2, True)
+            self._restore_splitter_sizes()
+        else:
+            self._store_splitter_sizes()
+            self._set_panel_visibility(2, False)
+            self.settings_service.set_show_evidence_panel(False)
+
+    def _on_density_action_triggered(self, action: QAction) -> None:
+        value = action.data()
+        if isinstance(value, str):
+            self.settings_service.set_density(value)
+            self._apply_density(value)
+
+    def _apply_density(self, density: str | None = None) -> None:
+        mode = (density or self.settings_service.density or "comfortable").lower()
+        spacing = 8 if mode == "compact" else 12
+        if hasattr(self, "_splitter"):
+            for index in range(self._splitter.count()):
+                widget = self._splitter.widget(index)
+                if widget:
+                    layout = widget.layout()
+                    if isinstance(layout, (QVBoxLayout, QHBoxLayout)):
+                        layout.setSpacing(spacing)
+        self.answer_view.set_density(mode)
+        self._evidence_panel.set_density(mode)
+        self.question_input.set_density(mode)
+
+    def _on_scope_chip_cleared(self) -> None:
+        if not any(self._current_retrieval_scope.values()):
+            return
+        self._current_retrieval_scope = {"include": [], "exclude": []}
+        self._update_session(scope=self._current_retrieval_scope)
+        self._evidence_panel.reset_scope()
+        self._update_scope_chip()
+        if self._last_question:
+            self._ask_question(self._last_question, triggered_by_scope=True)
+
+    def _update_scope_chip(self) -> None:
+        include = len(self._current_retrieval_scope.get("include", []))
+        exclude = len(self._current_retrieval_scope.get("exclude", []))
+        self.question_input.update_scope_chip(include, exclude)
+
+    def _on_evidence_locate_requested(self, payload: dict[str, Any]) -> None:
+        document_id = payload.get("document_id") if isinstance(payload, dict) else None
+        if document_id is not None and self._select_document_in_tree(int(document_id)):
+            return
+        path = payload.get("path") if isinstance(payload, dict) else None
+        if path:
+            self._focus_tree_by_path(str(path))
+
+    def _on_copy_evidence_snippet(self, snippet: str) -> None:
+        if not snippet:
+            return
+        QApplication.clipboard().setText(snippet)
+        self.progress_service.notify("Evidence snippet copied", level="info", duration_ms=1800)
+
+    def _select_document_in_tree(self, document_id: int) -> bool:
+        root = self._corpus_tree.invisibleRootItem()
+
+        def visit(item: QTreeWidgetItem) -> bool:
+            if item.data(0, Qt.ItemDataRole.UserRole) == document_id:
+                current = item
+                while current:
+                    current.setExpanded(True)
+                    current = current.parent()
+                self._corpus_tree.setCurrentItem(item)
+                self._corpus_tree.scrollToItem(item)
+                return True
+            for idx in range(item.childCount()):
+                if visit(item.child(idx)):
+                    return True
+            return False
+
+        for index in range(root.childCount()):
+            if visit(root.child(index)):
+                return True
+        return False
+
+    def _focus_tree_by_path(self, path: str) -> None:
+        target = Path(path)
+        root = self._corpus_tree.invisibleRootItem()
+
+        def visit(item: QTreeWidgetItem) -> bool:
+            tooltip = item.toolTip(0)
+            if tooltip:
+                try:
+                    current_path = Path(tooltip)
+                except Exception:
+                    current_path = None
+                if current_path and current_path == target:
+                    current = item
+                    while current:
+                        current.setExpanded(True)
+                        current = current.parent()
+                    self._corpus_tree.setCurrentItem(item)
+                    self._corpus_tree.scrollToItem(item)
+                    return True
+            for idx in range(item.childCount()):
+                if visit(item.child(idx)):
+                    return True
+            return False
+
+        for index in range(root.childCount()):
+            if visit(root.child(index)):
+                return
     # Project coordination
     def _initialise_project_state(self) -> None:
         self._refresh_project_selector()
@@ -494,6 +728,8 @@ class MainWindow(QMainWindow):
             "show_plan": self.conversation_settings.show_plan,
             "show_assumptions": self.conversation_settings.show_assumptions,
             "sources_only": self.conversation_settings.sources_only_mode,
+            "answer_length": self.conversation_settings.answer_length.value,
+            "model": self.conversation_settings.model_name,
         }
 
     def _apply_conversation_settings_snapshot(self, snapshot: Any) -> None:
@@ -521,6 +757,24 @@ class MainWindow(QMainWindow):
         sources_only = data.get("sources_only")
         if isinstance(sources_only, bool):
             self.conversation_settings.set_sources_only_mode(sources_only)
+        answer_length = data.get("answer_length")
+        resolved_length: AnswerLength | None = None
+        if isinstance(answer_length, str):
+            try:
+                resolved_length = AnswerLength[answer_length.upper()]
+            except KeyError:
+                try:
+                    resolved_length = AnswerLength(answer_length)
+                except ValueError:
+                    resolved_length = None
+        if isinstance(answer_length, AnswerLength):
+            resolved_length = answer_length
+        if resolved_length and resolved_length is not self.conversation_settings.answer_length:
+            self.conversation_settings.set_answer_length(resolved_length)
+        model = data.get("model")
+        if isinstance(model, str) and model.strip():
+            self.conversation_settings.set_model_name(model)
+            self.lmstudio_client.configure(model=model.strip())
 
     def _update_session(self, project_id: int | None = None, **fields: Any) -> None:
         if project_id is None:
@@ -873,6 +1127,9 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem([title])
             if source_path:
                 item.setToolTip(0, str(source_path))
+            doc_id = document.get("id")
+            if doc_id is not None:
+                item.setData(0, Qt.ItemDataRole.UserRole, doc_id)
             parent.addChild(item)
 
     def _update_corpus_actions(self) -> None:
@@ -1149,6 +1406,7 @@ class MainWindow(QMainWindow):
     def _connect_services(self) -> None:
         self.settings_service.theme_changed.connect(self._apply_theme)
         self.settings_service.font_scale_changed.connect(self._apply_font_scale)
+        self.settings_service.density_changed.connect(self._apply_density)
         self.progress_service.progress_started.connect(self._on_progress_started)
         self.progress_service.progress_updated.connect(self._on_progress_updated)
         self.progress_service.progress_finished.connect(self._on_progress_finished)
@@ -1163,6 +1421,10 @@ class MainWindow(QMainWindow):
         self.conversation_settings.sources_only_mode_changed.connect(
             self._persist_conversation_settings
         )
+        self.conversation_settings.answer_length_changed.connect(
+            self._on_answer_length_changed
+        )
+        self.conversation_settings.model_changed.connect(self._on_model_changed)
 
     def _on_reasoning_verbosity_changed(self, index: int) -> None:
         data = self._verbosity_combo.itemData(index)
@@ -1270,6 +1532,7 @@ class MainWindow(QMainWindow):
                 question,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
+                preset=self.conversation_settings.answer_length,
                 extra_options=extra_options or None,
                 context_provider=step_context_provider,
             )
@@ -1480,11 +1743,13 @@ class MainWindow(QMainWindow):
             self._current_retrieval_scope = {"include": [], "exclude": []}
             self._update_session(scope=self._current_retrieval_scope)
             self.export_snippet_action.setEnabled(False)
+            self._update_scope_chip()
             return
         self._evidence_panel.set_evidence(turn.citations)
         self._current_retrieval_scope = self._evidence_panel.current_scope
         self._update_session(scope=self._current_retrieval_scope)
         self.export_snippet_action.setEnabled(self._evidence_panel.evidence_count > 0)
+        self._update_scope_chip()
         self.answer_view.highlight_citation(self._active_card, None)
 
     def _on_card_citation(self, card: TurnCardWidget, index: int) -> None:
@@ -1504,22 +1769,26 @@ class MainWindow(QMainWindow):
     def _on_evidence_scope_changed(self, include: list[str], exclude: list[str]) -> None:
         self._current_retrieval_scope = {"include": list(include), "exclude": list(exclude)}
         self._update_session(scope=self._current_retrieval_scope)
+        self._update_scope_chip()
         if self._last_question:
             self._ask_question(self._last_question, triggered_by_scope=True)
 
     def _update_question_prerequisites(self, state: ConnectionState) -> None:
         ok = state.connected
-        message = state.message if not state.connected else None
+        message: str | None = None
+        if not state.connected:
+            message = state.message or "LMStudio connection unavailable."
         if ok and not self._has_documents:
             ok = False
             message = "Index at least one document to enable questions."
         self.question_input.set_prerequisites_met(ok, message)
 
     def _on_connection_state_changed(self, state: ConnectionState) -> None:
-        text = "LMStudio: Connected" if state.connected else "LMStudio: Offline"
-        self._lmstudio_indicator.setText(text)
+        self.question_input.set_connection_state(state)
         if state.message:
             self.statusBar().showMessage(state.message, 4000)
+        elif not state.connected:
+            self.statusBar().showMessage("LMStudio connection unavailable.", 4000)
         self._update_question_prerequisites(state)
 
     # ------------------------------------------------------------------
@@ -1536,6 +1805,49 @@ class MainWindow(QMainWindow):
 
     def _apply_font_scale(self, _scale: float) -> None:
         self.settings_service.apply_font_scale()
+
+    def _on_model_changed(self, name: str) -> None:
+        cleaned = str(name).strip()
+        if not cleaned:
+            return
+        self.lmstudio_client.configure(model=cleaned)
+        self.question_input.set_model_name(cleaned)
+        self._persist_conversation_settings()
+
+    def _on_answer_length_changed(self, preset: AnswerLength) -> None:
+        if isinstance(preset, AnswerLength):
+            self.question_input.set_answer_length(preset)
+            self._sync_answer_length_actions(preset)
+        self._persist_conversation_settings()
+
+    def _on_answer_length_action_triggered(self, action: QAction) -> None:
+        preset = action.data()
+        if isinstance(preset, AnswerLength):
+            self.conversation_settings.set_answer_length(preset)
+
+    def _sync_answer_length_actions(self, preset: AnswerLength) -> None:
+        group = getattr(self, "_length_action_group", None)
+        if group is None:
+            return
+        for action in group.actions():
+            data = action.data()
+            if isinstance(data, AnswerLength):
+                action.setChecked(data is preset)
+
+    def _prompt_model_name(self) -> None:
+        current = self.conversation_settings.model_name
+        name, ok = QInputDialog.getText(
+            self,
+            "Set LMStudio Model",
+            "Model identifier:",
+            QLineEdit.EchoMode.Normal,
+            current,
+        )
+        if not ok:
+            return
+        cleaned = name.strip()
+        if cleaned:
+            self.conversation_settings.set_model_name(cleaned)
 
     # ------------------------------------------------------------------
     def _on_progress_started(self, update: ProgressUpdate) -> None:
@@ -1571,7 +1883,7 @@ class MainWindow(QMainWindow):
 
     def _update_lmstudio_status(self) -> None:
         if not self.enable_health_monitor:
-            self._lmstudio_indicator.setText("LMStudio: Disabled")
+            self.question_input.set_status_message("LMStudio monitor off", "warning")
             return
 
         def worker() -> None:
@@ -1581,8 +1893,8 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _set_lmstudio_status(self, healthy: bool) -> None:
-        text = "LMStudio: Connected" if healthy else "LMStudio: Offline"
-        self._lmstudio_indicator.setText(text)
+        message = None if healthy else "LMStudio health probe failed"
+        self.question_input.set_connection_state(ConnectionState(healthy, message))
 
     # ------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
@@ -1602,6 +1914,10 @@ class MainWindow(QMainWindow):
                 ingest_unsubscribe()
             except Exception:
                 pass
+        try:
+            self._store_splitter_sizes()
+        except Exception:
+            pass
         try:
             self._store_active_project_session()
         except Exception:

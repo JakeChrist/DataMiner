@@ -5,6 +5,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .conversation_manager import ReasoningVerbosity, ResponseMode
+from .lmstudio_client import AnswerLength
 
 
 class ConversationSettings(QObject):
@@ -14,6 +15,8 @@ class ConversationSettings(QObject):
     show_plan_changed = pyqtSignal(bool)
     show_assumptions_changed = pyqtSignal(bool)
     sources_only_mode_changed = pyqtSignal(bool)
+    answer_length_changed = pyqtSignal(object)
+    model_changed = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -21,6 +24,8 @@ class ConversationSettings(QObject):
         self._show_plan = True
         self._show_assumptions = True
         self._sources_only_mode = False
+        self._answer_length = AnswerLength.NORMAL
+        self._model_name = "lmstudio"
 
     # ------------------------------------------------------------------
     @property
@@ -79,6 +84,33 @@ class ConversationSettings(QObject):
             if self._sources_only_mode
             else ResponseMode.GENERATIVE
         )
+
+    # ------------------------------------------------------------------
+    @property
+    def answer_length(self) -> AnswerLength:
+        return self._answer_length
+
+    def set_answer_length(self, preset: AnswerLength) -> None:
+        if not isinstance(preset, AnswerLength):
+            raise TypeError("preset must be an AnswerLength value")
+        if preset is self._answer_length:
+            return
+        self._answer_length = preset
+        self.answer_length_changed.emit(preset)
+
+    # ------------------------------------------------------------------
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def set_model_name(self, name: str) -> None:
+        cleaned = str(name).strip()
+        if not cleaned:
+            return
+        if cleaned == self._model_name:
+            return
+        self._model_name = cleaned
+        self.model_changed.emit(cleaned)
 
 
 __all__ = ["ConversationSettings"]

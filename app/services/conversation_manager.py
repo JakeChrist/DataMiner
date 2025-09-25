@@ -116,6 +116,8 @@ class ConversationTurn:
     reasoning: dict[str, Any] | None = None
     reasoning_artifacts: ReasoningArtifacts | None = None
     response_mode: ResponseMode = ResponseMode.GENERATIVE
+    answer_length: AnswerLength = AnswerLength.NORMAL
+    model_name: str | None = None
     asked_at: datetime | None = None
     answered_at: datetime | None = None
     latency_ms: int | None = None
@@ -312,7 +314,7 @@ class ConversationManager:
             raise
 
         self._update_connection(True, None)
-        turn = self._register_turn(question, response, response_mode)
+        turn = self._register_turn(question, response, response_mode, preset)
         return turn
 
     def _ask_with_plan(
@@ -455,6 +457,8 @@ class ConversationManager:
             reasoning=reasoning_payload,
             reasoning_artifacts=artifacts,
             response_mode=response_mode,
+            answer_length=preset,
+            model_name=getattr(self.client, "model", None),
             raw_response=raw_response,
             step_results=step_results,
         )
@@ -477,7 +481,11 @@ class ConversationManager:
         return plan[:6]
 
     def _register_turn(
-        self, question: str, response: ChatMessage, response_mode: ResponseMode
+        self,
+        question: str,
+        response: ChatMessage,
+        response_mode: ResponseMode,
+        preset: AnswerLength,
     ) -> ConversationTurn:
         artifacts = self._parse_reasoning_artifacts(response.reasoning)
         turn = ConversationTurn(
@@ -487,6 +495,8 @@ class ConversationManager:
             reasoning=response.reasoning,
             reasoning_artifacts=artifacts,
             response_mode=response_mode,
+            answer_length=preset,
+            model_name=getattr(self.client, "model", None),
             raw_response=response.raw_response,
         )
         self.turns.append(turn)

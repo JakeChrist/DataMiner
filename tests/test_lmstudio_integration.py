@@ -91,6 +91,30 @@ def _default_chat_response(payload: dict[str, object]) -> dict[str, object]:
     }
 
 
+def test_lmstudio_client_parses_structured_content() -> None:
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        "Part one. ",
+                        {"type": "text", "text": "Part two."},
+                    ],
+                    "metadata": {
+                        "citations": [{"source": "doc", "snippet": "text"}],
+                    },
+                }
+            }
+        ]
+    }
+
+    message = LMStudioClient._parse_chat_response(data)
+
+    assert message.content == "Part one. Part two."
+    assert message.citations == [{"source": "doc", "snippet": "text"}]
+
+
 def _make_handler(state: dict[str, object]) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - signature defined by BaseHTTPRequestHandler

@@ -12,7 +12,14 @@ import threading
 from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
-from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QKeySequence, QShortcut
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QDesktopServices,
+    QKeySequence,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QActionGroup,
     QApplication,

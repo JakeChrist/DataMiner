@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -66,12 +67,16 @@ class LMStudioClient:
         timeout: float = 30.0,
         max_retries: int = 2,
         retry_backoff: float = 0.5,
+        timeout_per_token: float = 0.1,
+        timeout_max: float | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/") or DEFAULT_BASE_URL
         self._model = model
-        self.timeout = timeout
+        self.timeout = max(timeout, 0.0)
         self.max_retries = max(max_retries, 0)
         self.retry_backoff = retry_backoff
+        self.timeout_per_token = max(timeout_per_token, 0.0)
+        self.timeout_max = timeout_max if (timeout_max is None or timeout_max > 0) else None
 
     @property
     def base_url(self) -> str:
@@ -139,8 +144,9 @@ class LMStudioClient:
         request_obj = request.Request(url, data=data, headers=headers, method=method)
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            timeout = self._compute_timeout(payload)
             try:
-                with request.urlopen(request_obj, timeout=self.timeout) as response:
+                with request.urlopen(request_obj, timeout=timeout) as response:
                     status = response.getcode()
                     body = response.read()
                 if status >= 400:
@@ -156,10 +162,15 @@ class LMStudioClient:
                 if not self._should_retry(exc.code):
                     break
             except error.URLError as exc:
-                last_error = LMStudioConnectionError(str(exc.reason))
+                if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                    last_error = LMStudioConnectionError(
+                        self._format_timeout_message(timeout)
+                    )
+                else:
+                    last_error = LMStudioConnectionError(str(exc.reason))
             except TimeoutError:
                 last_error = LMStudioConnectionError(
-                    f"LMStudio request timed out after {self.timeout:.1f}s"
+                    self._format_timeout_message(timeout)
                 )
             if attempt < self.max_retries:
                 time.sleep(self.retry_backoff * (2**attempt))
@@ -212,6 +223,26 @@ class LMStudioClient:
             reasoning=reasoning,
             raw_response=data,
         )
+
+    def _compute_timeout(self, payload: dict[str, Any] | None) -> float:
+        """Return an adaptive timeout for the pending request."""
+
+        timeout = self.timeout
+        if payload:
+            raw_tokens = payload.get("max_tokens")
+            try:
+                max_tokens = int(raw_tokens)
+            except (TypeError, ValueError):
+                max_tokens = 0
+            if max_tokens > 0 and self.timeout_per_token > 0:
+                timeout += max_tokens * self.timeout_per_token
+        if self.timeout_max is not None:
+            timeout = min(timeout, self.timeout_max)
+        return max(timeout, 1.0)
+
+    @staticmethod
+    def _format_timeout_message(timeout: float) -> str:
+        return f"LMStudio request timed out after {timeout:.1f}s"
 
     @staticmethod
     def _normalize_message_content(content: Any) -> str:

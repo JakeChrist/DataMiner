@@ -1,2 +1,4 @@
+# Ignore Python cache directories everywhere in the project
 __pycache__/
+**/__pycache__/
 *.py[cod]

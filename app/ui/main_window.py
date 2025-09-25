@@ -21,7 +21,6 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QActionGroup,
     QApplication,
     QCheckBox,
     QComboBox,

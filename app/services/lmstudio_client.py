@@ -194,9 +194,8 @@ class LMStudioClient:
         message = first.get("message")
         if not isinstance(message, dict):
             raise LMStudioResponseError("LMStudio response missing message")
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise LMStudioResponseError("LMStudio message missing content")
+        content_raw = message.get("content")
+        content = LMStudioClient._normalize_message_content(content_raw)
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         citations = metadata.get("citations")
         if not isinstance(citations, list):
@@ -208,6 +207,25 @@ class LMStudioClient:
             reasoning=reasoning,
             raw_response=data,
         )
+
+    @staticmethod
+    def _normalize_message_content(content: Any) -> str:
+        """Return a usable string from ``content`` or raise an error."""
+
+        if isinstance(content, str):
+            return content
+        if isinstance(content, Iterable):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            if parts:
+                return "".join(parts)
+        raise LMStudioResponseError("LMStudio message missing content")
 
 
 __all__ = [

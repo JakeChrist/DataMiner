@@ -287,8 +287,8 @@ def test_lmstudio_client_allows_stream_override(
     assert first_request.get("stream") is True
 
 
-def test_lmstudio_client_scales_timeout_with_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorded: dict[str, float] = {}
+def test_lmstudio_client_does_not_set_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, request.Request] = {}
 
     class _Response:
         def __init__(self) -> None:
@@ -306,37 +306,41 @@ def test_lmstudio_client_scales_timeout_with_max_tokens(monkeypatch: pytest.Monk
         def read(self) -> bytes:
             return self._body
 
-    def _fake_urlopen(req: request.Request, timeout: float) -> _Response:  # type: ignore[override]
-        recorded["timeout"] = timeout
+    def _fake_urlopen(req: request.Request, *args: object, **kwargs: object) -> _Response:
+        if args:
+            raise AssertionError(f"Unexpected positional args: {args!r}")
+        if "timeout" in kwargs:
+            raise AssertionError("timeout should not be provided to urlopen")
+        captured["request"] = req
         return _Response()
 
     monkeypatch.setattr(request, "urlopen", _fake_urlopen)
 
-    client = LMStudioClient(timeout=10.0, timeout_per_token=0.05, max_retries=0)
+    client = LMStudioClient(max_retries=0)
     client.chat([{"role": "user", "content": "Hi"}], preset=AnswerLength.DETAILED)
 
-    expected_timeout = 10.0 + AnswerLength.DETAILED.to_request_params()["max_tokens"] * 0.05
-    assert recorded["timeout"] == pytest.approx(expected_timeout, rel=1e-6)
+    assert "request" in captured
 
 
-def test_lmstudio_client_reports_dynamic_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    timeouts: list[float] = []
+def test_lmstudio_client_reports_timeout_without_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
 
-    def _raise_timeout(req: request.Request, timeout: float) -> None:  # type: ignore[override]
-        timeouts.append(timeout)
+    def _raise_timeout(req: request.Request, *args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
         raise error.URLError(socket.timeout("timed out"))
 
     monkeypatch.setattr(request, "urlopen", _raise_timeout)
 
-    client = LMStudioClient(timeout=5.0, timeout_per_token=0.2, max_retries=0)
+    client = LMStudioClient(max_retries=0)
 
     with pytest.raises(LMStudioConnectionError) as excinfo:
         client.chat([{"role": "user", "content": "Hello"}], preset=AnswerLength.DETAILED)
 
-    assert timeouts, "Expected urlopen to be invoked"
-    expected_timeout = 5.0 + AnswerLength.DETAILED.to_request_params()["max_tokens"] * 0.2
-    assert timeouts[0] == pytest.approx(expected_timeout, rel=1e-6)
-    assert f"{expected_timeout:.1f}s" in str(excinfo.value)
+    assert calls == 1
+    assert "timed out" in str(excinfo.value).lower()
 
 
 def test_conversation_manager_handles_failures_and_recovers(

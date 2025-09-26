@@ -117,6 +117,45 @@ def test_lmstudio_client_parses_structured_content() -> None:
     assert message.citations == [{"source": "doc", "snippet": "text"}]
 
 
+def test_lmstudio_client_handles_message_level_citations() -> None:
+    data = {
+        "choices": [
+            {
+                "citations": [{"source": "root"}],
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "citations": [{"source": "message"}],
+                    "metadata": {},
+                },
+            }
+        ]
+    }
+
+    message = LMStudioClient._parse_chat_response(data)
+
+    assert message.citations == [{"source": "message"}]
+
+
+def test_lmstudio_client_falls_back_to_choice_level_citations() -> None:
+    data = {
+        "choices": [
+            {
+                "citations": [{"source": "choice"}],
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "metadata": {},
+                },
+            }
+        ]
+    }
+
+    message = LMStudioClient._parse_chat_response(data)
+
+    assert message.citations == [{"source": "choice"}]
+
+
 def _make_handler(state: dict[str, object]) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - signature defined by BaseHTTPRequestHandler

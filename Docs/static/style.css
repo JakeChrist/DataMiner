@@ -1,0 +1,50 @@
+/* Basic stylesheet for DocGen-LM output as referenced in the SRS. */
+body {
+    font-family: sans-serif;
+}
+
+.sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 220px; /* fixed width */
+    height: 100vh;
+    overflow-y: auto; /* scroll if links exceed viewport */
+    background: #f0f0f0;
+    padding: 1rem;
+    box-sizing: border-box;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+.sidebar ul {
+    list-style: none;
+    padding-left: 1em;
+}
+
+.sidebar details > summary {
+    cursor: pointer;
+}
+
+.content {
+    margin-left: 220px; /* push main content to the right */
+    padding: 1rem;
+}
+
+pre {
+    background: #eee;
+    padding: 0.5rem;
+    overflow-x: auto;
+}
+
+/* Responsive adjustments for narrow screens */
+@media (max-width: 768px) {
+    body { display: block; }
+    .sidebar {
+        position: relative;
+        width: 100%;
+        height: auto;
+        overflow: visible;
+    }
+    .content { margin-left: 0; }
+}

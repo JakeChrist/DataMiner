@@ -331,6 +331,13 @@ def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch, proje
     assert documents[0]["text"]
     assert documents[0]["id"]
 
+    reask_button = window._evidence_panel._reask_button
+    assert reask_button.isEnabled()
+    previous_calls = client.calls
+    reask_button.click()
+    qt_app.processEvents()
+    assert client.calls >= previous_calls + 1
+
     window.close()
 
 

@@ -244,12 +244,14 @@ class EvidencePanel(QWidget):
     evidence_selected = pyqtSignal(int, str)
     locate_requested = pyqtSignal(dict)
     copy_requested = pyqtSignal(str)
+    reask_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._records: list[EvidenceRecord] = []
         self._suppress_scope = False
         self._density = "comfortable"
+        self._allow_reask = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -281,6 +283,12 @@ class EvidencePanel(QWidget):
         self._metadata_label.setObjectName("evidenceMetadata")
         self._metadata_label.setWordWrap(True)
         meta_row.addWidget(self._metadata_label, 1)
+
+        self._reask_button = QPushButton("Re-ask", self)
+        self._reask_button.setObjectName("reaskEvidenceButton")
+        self._reask_button.setEnabled(False)
+        self._reask_button.clicked.connect(self.reask_requested.emit)
+        meta_row.addWidget(self._reask_button)
 
         self._reset_scope_button = QPushButton("Reset scope", self)
         self._reset_scope_button.setObjectName("resetScopeButton")
@@ -327,6 +335,7 @@ class EvidencePanel(QWidget):
         self._list.clear()
         self._empty_state()
         self._update_reset_button_state()
+        self._update_reask_button_state()
 
     def set_evidence(self, citations: Iterable[Any], *, emit_scope: bool = False) -> None:
         self._suppress_scope = True
@@ -341,6 +350,7 @@ class EvidencePanel(QWidget):
         else:
             self._empty_state()
         self._update_reset_button_state()
+        self._update_reask_button_state()
         if emit_scope:
             scope = self.current_scope
             self.scope_changed.emit(scope["include"], scope["exclude"])
@@ -377,14 +387,17 @@ class EvidencePanel(QWidget):
 
     # ------------------------------------------------------------------
     def _empty_state(self) -> None:
-        self._preview.setHtml("<p>No evidence available.</p>")
+        self._preview.setHtml(
+            "<p>No evidence yet. Broaden your scope filters or refine the question to gather supporting passages.</p>"
+        )
         self._metadata_label.setText("No evidence selected.")
         self._conflict_banner.setVisible(False)
         self._update_reset_button_state()
+        self._update_reask_button_state()
 
     def _populate_list(self) -> None:
         self._list.clear()
-        conflict_messages: list[str] = []
+        conflicts: list[EvidenceRecord] = []
         for index, record in enumerate(self._records):
             item = QListWidgetItem(self._list)
             widget = _EvidenceRow(record, self._list)
@@ -404,10 +417,11 @@ class EvidencePanel(QWidget):
             item.setSizeHint(widget.sizeHint())
             self._list.addItem(item)
             self._list.setItemWidget(item, widget)
-            if record.conflict_summary:
-                conflict_messages.append(record.conflict_summary)
-        self._set_conflict_banner(conflict_messages)
+            if record.conflict_summary or record.conflict_sources:
+                conflicts.append(record)
+        self._set_conflict_banner(conflicts)
         self._update_reset_button_state()
+        self._update_reask_button_state()
 
     def _normalize_citation(self, index: int, citation: Any) -> EvidenceRecord:
         score: float | None = None
@@ -599,6 +613,7 @@ class EvidencePanel(QWidget):
         style = (
             "<style>"
             ".snippet{font-size:13px;line-height:1.5;}"
+            ".snippet mark{background-color:rgba(255,230,128,0.8);padding:0 2px;border-radius:2px;}"
             ".meta{margin-top:8px;color:rgba(140,150,165,0.9);}"
             ".conflict{margin-top:6px;color:#d8893a;font-weight:600;}"
             ".tags{margin-top:4px;color:rgba(140,150,165,0.9);}"
@@ -618,6 +633,7 @@ class EvidencePanel(QWidget):
             header = f"{record.label} — {record.metadata_text}"
         self._metadata_label.setText(header)
         self._update_reset_button_state()
+        self._update_reask_button_state()
 
     def _on_state_changed(self, record: EvidenceRecord, state: str) -> None:
         if self._suppress_scope:
@@ -636,11 +652,28 @@ class EvidencePanel(QWidget):
             return
         self.reset_scope()
 
-    def _set_conflict_banner(self, messages: list[str]) -> None:
-        if messages:
-            unique = list(dict.fromkeys(messages))
-            joined = " • ".join(html.escape(msg) for msg in unique)
-            self._conflict_banner.setText(f"⚠️ Conflict detected: {joined}")
+    def _set_conflict_banner(self, records: list[EvidenceRecord]) -> None:
+        if records:
+            details: list[str] = []
+            for record in records:
+                opponents: list[str] = []
+                for conflict in record.conflict_sources:
+                    label = (
+                        conflict.get("source")
+                        or conflict.get("title")
+                        or conflict.get("document_id")
+                        or conflict.get("passage_id")
+                        or "other source"
+                    )
+                    opponents.append(str(label))
+                if opponents:
+                    unique = list(dict.fromkeys(opponents))
+                    summary = f"{record.label} vs {', '.join(unique[:2])}"
+                else:
+                    summary = record.conflict_summary or record.label
+                details.append(summary)
+            joined = " • ".join(html.escape(item) for item in details)
+            self._conflict_banner.setText(f"⚠️ Conflicting evidence: {joined}")
             self._conflict_banner.setVisible(True)
         else:
             self._conflict_banner.setVisible(False)
@@ -651,6 +684,17 @@ class EvidencePanel(QWidget):
         dirty = any(record.state != "include" for record in self._records)
         enabled = dirty and bool(self._records)
         self._reset_scope_button.setEnabled(enabled)
+        self._update_reask_button_state()
+
+    def set_reask_enabled(self, enabled: bool) -> None:
+        self._allow_reask = bool(enabled)
+        self._update_reask_button_state()
+
+    def _update_reask_button_state(self) -> None:
+        if not hasattr(self, "_reask_button"):
+            return
+        enabled = self._allow_reask and bool(self._records)
+        self._reask_button.setEnabled(enabled)
 
     def _plain_text(self, snippet: str) -> str:
         document = QTextDocument()

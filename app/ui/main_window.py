@@ -457,6 +457,7 @@ class MainWindow(QMainWindow):
         self._evidence_panel.evidence_selected.connect(self._on_evidence_selected)
         self._evidence_panel.locate_requested.connect(self._on_evidence_locate_requested)
         self._evidence_panel.copy_requested.connect(self._on_copy_evidence_snippet)
+        self._evidence_panel.reask_requested.connect(self._on_reask_requested)
         self._splitter.addWidget(self._evidence_panel)
 
         self._splitter.setStretchFactor(0, 1)
@@ -723,6 +724,7 @@ class MainWindow(QMainWindow):
             self._evidence_panel.set_evidence(self._turns[-1].citations)
         else:
             self._evidence_panel.clear()
+        self._evidence_panel.set_reask_enabled(bool(self._last_question))
         self._update_export_actions()
         self.export_snippet_action.setEnabled(self._evidence_panel.selected_index is not None)
         self._refresh_corpus_view()
@@ -1233,6 +1235,7 @@ class MainWindow(QMainWindow):
         self._current_retrieval_scope = {"include": [], "exclude": []}
         self._evidence_panel.clear()
         self._last_question = None
+        self._evidence_panel.set_reask_enabled(False)
         self._active_card = None
         self.export_snippet_action.setEnabled(False)
         self._update_export_actions()
@@ -1746,12 +1749,14 @@ class MainWindow(QMainWindow):
     def _update_evidence_panel(self, turn: ConversationTurn) -> None:
         if not turn.citations:
             self._evidence_panel.clear()
+            self._evidence_panel.set_reask_enabled(bool(self._last_question))
             self._current_retrieval_scope = {"include": [], "exclude": []}
             self._update_session(scope=self._current_retrieval_scope)
             self.export_snippet_action.setEnabled(False)
             self._update_scope_chip()
             return
         self._evidence_panel.set_evidence(turn.citations)
+        self._evidence_panel.set_reask_enabled(bool(self._last_question))
         self._current_retrieval_scope = self._evidence_panel.current_scope
         self._update_session(scope=self._current_retrieval_scope)
         self.export_snippet_action.setEnabled(self._evidence_panel.evidence_count > 0)
@@ -1763,6 +1768,7 @@ class MainWindow(QMainWindow):
             self._active_card = card
             self._evidence_panel.set_evidence(card.turn.citations)
             self._current_retrieval_scope = self._evidence_panel.current_scope
+            self._evidence_panel.set_reask_enabled(bool(self._last_question))
         self.answer_view.highlight_citation(card, index)
         self._evidence_panel.select_index(index - 1)
 
@@ -1778,6 +1784,16 @@ class MainWindow(QMainWindow):
         self._update_scope_chip()
         if self._last_question:
             self._ask_question(self._last_question, triggered_by_scope=True)
+
+    def _on_reask_requested(self) -> None:
+        if not self._last_question:
+            self.progress_service.notify(
+                "Ask a question first to enable re-asking.",
+                level="warning",
+                duration_ms=2200,
+            )
+            return
+        self._ask_question(self._last_question, triggered_by_scope=True)
 
     def _update_question_prerequisites(self, state: ConnectionState) -> None:
         ok = state.connected

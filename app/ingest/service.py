@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -761,8 +762,11 @@ class IngestService:
 
     def _load_known_files(self, root: str) -> dict[str, Any]:
         root_path = str(Path(root).resolve())
-        known_files: dict[str, Any] = {}
-        for task_name in ("ingest.rescan", "ingest.folder_crawl"):
+        latest_files: dict[str, Any] = {}
+        latest_timestamp: datetime | None = None
+        task_names = ("ingest.remove", "ingest.rescan", "ingest.folder_crawl")
+
+        for task_name in task_names:
             for record in self.repo.list_completed(task_name):
                 extra = record.get("extra_data") or {}
                 job_data = extra.get("job", {})
@@ -771,10 +775,33 @@ class IngestService:
                     continue
                 summary = extra.get("summary", {})
                 files = summary.get("known_files")
-                if files:
-                    known_files = dict(files)
-                    return known_files
-        return known_files
+                if not isinstance(files, dict):
+                    continue
+
+                timestamp_str = record.get("completed_at") or record.get("created_at")
+                timestamp = self._parse_timestamp(timestamp_str) if isinstance(timestamp_str, str) else None
+
+                if latest_timestamp is None or (
+                    timestamp is not None and timestamp > latest_timestamp
+                ):
+                    latest_timestamp = timestamp
+                    latest_files = dict(files)
+                break
+
+        return latest_files
+
+    @staticmethod
+    def _parse_timestamp(value: str) -> datetime | None:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            try:
+                normalized = value.replace("Z", "+00:00")
+                if "T" not in normalized and " " in normalized:
+                    normalized = normalized.replace(" ", "T")
+                return datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
 
     @staticmethod
     def _normalize_path(path: Path) -> str:

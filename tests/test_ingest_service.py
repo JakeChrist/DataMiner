@@ -246,6 +246,25 @@ def test_cancel_rolls_back_partial_progress(tmp_path: Path, db_manager: Database
     service.shutdown()
 
 
+def test_load_known_files_reflects_removals(tmp_path: Path, db_manager: DatabaseManager) -> None:
+    root = tmp_path / "removal"
+    root.mkdir()
+    tracked = root / "tracked.txt"
+    tracked.write_text("payload", encoding="utf-8")
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    first_job = service.queue_folder_crawl(None, root, include=["*.txt"])
+    assert service.wait_for_completion(first_job, timeout=5.0)
+
+    remove_job = service.queue_remove(None, root, [tracked])
+    assert service.wait_for_completion(remove_job, timeout=5.0)
+
+    known_files = service._load_known_files(str(root))
+    assert known_files == {}
+
+    service.shutdown()
+
+
 def test_pdf_without_text_flags_ocr(tmp_path: Path, db_manager: DatabaseManager) -> None:
     pdf_path = tmp_path / "blank.pdf"
     fitz = pytest.importorskip("fitz")

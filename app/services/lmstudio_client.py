@@ -238,22 +238,60 @@ class LMStudioClient:
     ) -> list[Any]:
         """Return citation payloads from a variety of LMStudio response shapes."""
 
-        def _as_list(value: Any) -> list[Any] | None:
-            return value if isinstance(value, list) else None
+        def _coerce_list(value: Any, *, seen: set[int] | None = None) -> list[Any] | None:
+            if seen is None:
+                seen = set()
+            if isinstance(value, list):
+                return value
+            if not isinstance(value, dict):
+                return None
+            identity = id(value)
+            if identity in seen:
+                return None
+            seen.add(identity)
 
-        candidates: list[list[Any] | None] = [
-            _as_list(metadata.get("citations")),
-            _as_list(message.get("citations")),
-            _as_list(choice.get("citations")),
+            candidate_keys = (
+                "citations",
+                "items",
+                "entries",
+                "evidence",
+                "records",
+                "sources",
+                "list",
+                "results",
+                "data",
+            )
+            for key in candidate_keys:
+                if key not in value:
+                    continue
+                nested = value.get(key)
+                result = _coerce_list(nested, seen=seen)
+                if result:
+                    return result
+
+            for key, nested in value.items():
+                if key in {"scope", "include", "exclude", "filters"}:
+                    continue
+                if isinstance(nested, dict):
+                    result = _coerce_list(nested, seen=seen)
+                    if result:
+                        return result
+            return None
+
+        candidates: list[Any] = [
+            metadata.get("citations"),
+            message.get("citations"),
+            choice.get("citations"),
         ]
 
         context = metadata.get("context") if isinstance(metadata.get("context"), dict) else {}
         if context:
-            candidates.append(_as_list(context.get("citations")))
+            candidates.append(context.get("citations"))
 
         for candidate in candidates:
-            if candidate:
-                return list(candidate)
+            resolved = _coerce_list(candidate)
+            if resolved:
+                return list(resolved)
         return []
 
 

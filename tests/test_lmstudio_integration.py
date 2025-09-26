@@ -117,6 +117,63 @@ def test_lmstudio_client_parses_structured_content() -> None:
     assert message.citations == [{"source": "doc", "snippet": "text"}]
 
 
+def test_lmstudio_client_handles_nested_citation_container() -> None:
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "metadata": {
+                        "citations": {
+                            "items": [
+                                {"source": "doc A", "snippet": "alpha"},
+                                {"source": "doc B", "snippet": "beta"},
+                            ],
+                            "scope": {"include": ["tag:a"], "exclude": []},
+                        }
+                    },
+                }
+            }
+        ]
+    }
+
+    message = LMStudioClient._parse_chat_response(data)
+
+    assert message.citations == [
+        {"source": "doc A", "snippet": "alpha"},
+        {"source": "doc B", "snippet": "beta"},
+    ]
+
+
+def test_lmstudio_client_handles_context_level_nested_citations() -> None:
+    data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "Answer",
+                    "metadata": {
+                        "context": {
+                            "citations": {
+                                "data": {
+                                    "records": [
+                                        {"source": "ctx", "snippet": "gamma"}
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        ]
+    }
+
+    message = LMStudioClient._parse_chat_response(data)
+
+    assert message.citations == [{"source": "ctx", "snippet": "gamma"}]
+
+
 def test_lmstudio_client_handles_message_level_citations() -> None:
     data = {
         "choices": [

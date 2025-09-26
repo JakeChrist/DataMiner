@@ -99,5 +99,6 @@ def test_dynamic_plan_notes_missing_citations() -> None:
 
     assert len(turn.step_results) == 2
     assert turn.reasoning_artifacts is not None
-    assert any("No citations" in text for text in turn.reasoning_artifacts.assumptions)
-    assert all(result.citation_indexes == [] for result in turn.step_results)
+    assert any("No direct evidence" in text for text in turn.reasoning_artifacts.assumptions)
+    assert all(result.citation_indexes for result in turn.step_results)
+    assert all(turn.citations)

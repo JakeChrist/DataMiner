@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 import copy
+import html
 import json
 import re
+import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -411,9 +413,13 @@ class ConversationManager:
                 contexts=used_contexts,
             )
             if not result.citations:
-                assumptions.append(
-                    f"No citations available for step {index}: {plan_item.description}"
-                )
+                inferred = self._fallback_citations_from_contexts(used_contexts)
+                if inferred:
+                    result.citations = inferred
+                else:
+                    assumptions.append(
+                        f"No citations available for step {index}: {plan_item.description}"
+                    )
             step_results.append(result)
 
         aggregated, citation_index_map = self._aggregate_citations(step_results)
@@ -635,6 +641,109 @@ class ConversationManager:
                 text = f"{text} {markers}".strip()
             lines.append(text)
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _fallback_citations_from_contexts(
+        contexts: Sequence[StepContextBatch],
+    ) -> list[dict[str, Any]]:
+        """Build citation dictionaries from retrieval contexts when the model omits them."""
+
+        candidates: list[dict[str, Any]] = []
+        for batch in contexts:
+            for document in getattr(batch, "documents", []) or []:
+                if not isinstance(document, dict):
+                    continue
+                citation = ConversationManager._context_document_to_citation(document)
+                if citation:
+                    candidates.append(citation)
+        if not candidates:
+            return []
+        return ConversationManager._deduplicate_citations(candidates)
+
+    @staticmethod
+    def _context_document_to_citation(document: dict[str, Any]) -> dict[str, Any] | None:
+        source = str(
+            document.get("source")
+            or document.get("title")
+            or document.get("path")
+            or document.get("id")
+            or ""
+        ).strip()
+        if not source:
+            source = "Document"
+
+        snippet_raw = (
+            document.get("snippet")
+            or document.get("highlight")
+            or document.get("text")
+            or ""
+        )
+        snippet_text = str(snippet_raw).strip()
+        if not snippet_text:
+            return None
+        snippet_text = ConversationManager._trim_snippet(snippet_text)
+        if "<" in snippet_text:
+            snippet = snippet_text
+        else:
+            snippet = html.escape(snippet_text)
+        if "<mark" not in snippet:
+            snippet = f"<mark>{snippet}</mark>"
+
+        citation: dict[str, Any] = {
+            "id": document.get("id") or document.get("document_id") or source,
+            "source": source,
+            "snippet": snippet,
+            "path": document.get("path"),
+        }
+
+        document_id = document.get("document_id")
+        if document_id is not None:
+            try:
+                citation["document_id"] = int(document_id)
+            except (TypeError, ValueError):
+                pass
+
+        chunk_id = document.get("chunk_id") or document.get("passage_id")
+        if chunk_id is not None:
+            citation["passage_id"] = str(chunk_id)
+
+        page = document.get("page") or document.get("page_number")
+        if page is not None:
+            try:
+                citation["page"] = int(page)
+            except (TypeError, ValueError):
+                citation["page"] = page
+
+        section = document.get("section") or document.get("heading")
+        if section:
+            citation["section"] = str(section)
+        elif document.get("chunk_index") is not None:
+            try:
+                citation["section"] = f"Chunk {int(document['chunk_index']) + 1}"
+            except (TypeError, ValueError, KeyError):
+                pass
+
+        score = document.get("score")
+        if score is not None:
+            try:
+                citation["score"] = float(score)
+            except (TypeError, ValueError):
+                pass
+
+        identifiers = document.get("identifiers")
+        if isinstance(identifiers, list) and identifiers:
+            citation["tag_names"] = [str(identifier) for identifier in identifiers[:3]]
+
+        citation.setdefault("tag_names", []).append("Context")
+
+        return citation
+
+    @staticmethod
+    def _trim_snippet(snippet: str, *, max_chars: int = 320) -> str:
+        compact = " ".join(snippet.split())
+        if len(compact) <= max_chars:
+            return compact
+        return textwrap.shorten(compact, width=max_chars, placeholder="…")
 
     @staticmethod
     def _parse_reasoning_artifacts(

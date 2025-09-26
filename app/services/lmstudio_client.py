@@ -202,9 +202,7 @@ class LMStudioClient:
         content_raw = message.get("content")
         content = LMStudioClient._normalize_message_content(content_raw)
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-        citations = metadata.get("citations")
-        if not isinstance(citations, list):
-            citations = []
+        citations = LMStudioClient._extract_citations(first, message, metadata)
         reasoning = metadata.get("reasoning") if isinstance(metadata.get("reasoning"), dict) else None
         return ChatMessage(
             content=content,
@@ -231,6 +229,32 @@ class LMStudioClient:
             if parts:
                 return "".join(parts)
         raise LMStudioResponseError("LMStudio message missing content")
+
+    @staticmethod
+    def _extract_citations(
+        choice: dict[str, Any],
+        message: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> list[Any]:
+        """Return citation payloads from a variety of LMStudio response shapes."""
+
+        def _as_list(value: Any) -> list[Any] | None:
+            return value if isinstance(value, list) else None
+
+        candidates: list[list[Any] | None] = [
+            _as_list(metadata.get("citations")),
+            _as_list(message.get("citations")),
+            _as_list(choice.get("citations")),
+        ]
+
+        context = metadata.get("context") if isinstance(metadata.get("context"), dict) else {}
+        if context:
+            candidates.append(_as_list(context.get("citations")))
+
+        for candidate in candidates:
+            if candidate:
+                return list(candidate)
+        return []
 
 
 __all__ = [

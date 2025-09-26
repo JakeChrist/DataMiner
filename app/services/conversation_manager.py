@@ -631,16 +631,78 @@ class ConversationManager:
         }
         return sorted(indexes)
 
+    _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
+
+    @staticmethod
+    def _strip_citation_markers(text: str) -> str:
+        return ConversationManager._CITATION_PATTERN.sub("", text)
+
+    @staticmethod
+    def _normalize_answer_text(text: str) -> str:
+        stripped = ConversationManager._strip_citation_markers(text)
+        collapsed = " ".join(stripped.split())
+        collapsed = collapsed.strip(".,;:!?")
+        return collapsed.lower()
+
     @staticmethod
     def _compose_final_answer(step_results: Sequence[StepResult]) -> str:
-        lines: list[str] = []
+        paragraphs: list[tuple[str, set[int]]] = []
+        seen: dict[str, int] = {}
+
         for result in step_results:
-            text = result.answer.strip() or result.description
-            markers = "".join(f"[{index}]" for index in result.citation_indexes)
+            raw_text = (result.answer or "").strip()
+            fallback = result.description.strip()
+            base_text = ConversationManager._strip_citation_markers(raw_text).strip()
+            if not base_text:
+                base_text = ConversationManager._strip_citation_markers(fallback).strip() or fallback
+            if not base_text:
+                continue
+
+            normalized = ConversationManager._normalize_answer_text(base_text)
+            citation_indexes: set[int] = set()
+            for index in result.citation_indexes:
+                try:
+                    citation_indexes.add(int(index))
+                except (TypeError, ValueError):
+                    continue
+
+            if normalized and normalized in seen:
+                paragraphs[seen[normalized]][1].update(citation_indexes)
+                continue
+
+            paragraphs.append((base_text, set(citation_indexes)))
+            if normalized:
+                seen[normalized] = len(paragraphs) - 1
+
+        merged_paragraphs: list[tuple[str, set[int]]] = []
+        for text, citation_set in paragraphs:
+            if (
+                merged_paragraphs
+                and len(merged_paragraphs[-1][0]) <= 80
+                and len(text) <= 80
+                and not merged_paragraphs[-1][0].rstrip().endswith((".", "!", "?"))
+                and not text.rstrip().endswith((".", "!", "?"))
+                and "\n" not in merged_paragraphs[-1][0]
+                and "\n" not in text
+            ):
+                previous_text, previous_citations = merged_paragraphs[-1]
+                combined_text = f"{previous_text} {text}".strip()
+                merged_paragraphs[-1] = (
+                    combined_text,
+                    previous_citations | set(citation_set),
+                )
+            else:
+                merged_paragraphs.append((text, set(citation_set)))
+
+        formatted: list[str] = []
+        for text, citation_set in merged_paragraphs:
+            markers = "".join(f"[{index}]" for index in sorted(citation_set))
+            text = text.strip()
             if markers:
                 text = f"{text} {markers}".strip()
-            lines.append(text)
-        return "\n\n".join(lines)
+            formatted.append(text)
+
+        return "\n\n".join(formatted)
 
     @staticmethod
     def _fallback_citations_from_contexts(

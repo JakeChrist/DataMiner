@@ -50,3 +50,30 @@ def test_compose_final_answer_deduplicates_and_merges_citations():
         "Quick tip Another tip [5][6]"
     )
     assert final_answer == expected
+
+
+def test_compose_final_answer_strips_step_prefixes():
+    step_results = [
+        StepResult(
+            index=1,
+            description="First",
+            answer="Step 1: Value found. [1]",
+            citation_indexes=[1],
+        ),
+        StepResult(
+            index=2,
+            description="Second",
+            answer="step 2 - Value found. [2]",
+            citation_indexes=[2],
+        ),
+        StepResult(
+            index=3,
+            description="Third",
+            answer="1) Value found. [3]",
+            citation_indexes=[3],
+        ),
+    ]
+
+    final_answer = ConversationManager._compose_final_answer(step_results)
+
+    assert final_answer == "Value found. [1][2][3]"

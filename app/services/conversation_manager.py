@@ -632,14 +632,39 @@ class ConversationManager:
         return sorted(indexes)
 
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
+    _STEP_PREFIX_PATTERN = re.compile(
+        r"""
+        ^\s*
+        (
+            (?:(?:step|pass|plan\s+item)\s+\d+(?:\s*(?:of|/)\s*\d+)?[:\.\)\-\]]*)
+            |
+            (?:\(?\d{1,3}\)?[:\.\)\-])
+            |
+            (?:[A-Za-z][:\.\)\-])
+            |
+            (?:[ivxlcdm]{1,4}[:\.\)\-])
+        )
+        \s*
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
 
     @staticmethod
     def _strip_citation_markers(text: str) -> str:
         return ConversationManager._CITATION_PATTERN.sub("", text)
 
     @staticmethod
+    def _remove_step_prefix(text: str) -> str:
+        """Remove leading step/number markers used in intermediate outputs."""
+
+        cleaned = ConversationManager._STEP_PREFIX_PATTERN.sub("", text, count=1)
+        cleaned = cleaned.lstrip(" \t-–—:.)]")
+        return cleaned.lstrip()
+
+    @staticmethod
     def _normalize_answer_text(text: str) -> str:
         stripped = ConversationManager._strip_citation_markers(text)
+        stripped = ConversationManager._remove_step_prefix(stripped)
         collapsed = " ".join(stripped.split())
         collapsed = collapsed.strip(".,;:!?")
         return collapsed.lower()
@@ -658,7 +683,11 @@ class ConversationManager:
             if not base_text:
                 continue
 
-            normalized = ConversationManager._normalize_answer_text(base_text)
+            clean_text = ConversationManager._remove_step_prefix(base_text)
+            if not clean_text:
+                clean_text = base_text
+
+            normalized = ConversationManager._normalize_answer_text(clean_text)
             citation_indexes: set[int] = set()
             for index in result.citation_indexes:
                 try:
@@ -670,7 +699,7 @@ class ConversationManager:
                 paragraphs[seen[normalized]][1].update(citation_indexes)
                 continue
 
-            paragraphs.append((base_text, set(citation_indexes)))
+            paragraphs.append((clean_text, set(citation_indexes)))
             if normalized:
                 seen[normalized] = len(paragraphs) - 1
 

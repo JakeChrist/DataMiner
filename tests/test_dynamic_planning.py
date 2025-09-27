@@ -68,8 +68,7 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert len(client.requests) == 2
     assert len(turn.step_results) == 2
     assert all(item.status == "done" for item in turn.plan)
-    assert "Step 1 finding" in turn.answer
-    assert "[1]" in turn.answer
+    assert turn.answer == "finding [1][2]"
     assert len(turn.citations) == 2
     assert turn.citations[0].get("steps") == [1]
     assert turn.step_results[0].citation_indexes == [1]

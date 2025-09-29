@@ -69,10 +69,20 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert len(turn.step_results) == 4
     assert [item.status for item in turn.plan] == ["done"] * 4
     assert turn.plan[0].description.startswith("Scan corpus for background")
-    assert turn.answer == "finding [1][2][3][4]"
+    assert turn.answer == "Context & Background: Finding. [1][2][3][4]"
     assert len(turn.citations) == 4
     assert turn.citations[0].get("steps") == [1]
+    assert "Context & Background" in turn.citations[0].get("tag_names", [])
     assert turn.step_results[0].citation_indexes == [1]
+    assert turn.reasoning is not None
+    assert turn.reasoning.get("final_sections") == [
+        {
+            "title": "Context & Background",
+            "sentences": ["Finding. [1][2][3][4]"],
+            "citations": [1, 2, 3, 4],
+        }
+    ]
+    assert not turn.reasoning.get("conflicts")
 
 
 def test_dynamic_plan_notes_missing_citations() -> None:

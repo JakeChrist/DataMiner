@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 import sys
 
 import pytest
@@ -208,3 +209,82 @@ def test_ingest_chunk_storage(
         "SELECT COUNT(*) FROM ingest_document_chunks"
     ).fetchone()[0]
     assert count >= 1
+
+
+def test_initialize_migrates_context_chunking_schema(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ingest_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                checksum TEXT,
+                size INTEGER,
+                mtime REAL,
+                ctime REAL,
+                metadata TEXT,
+                text TEXT,
+                normalized_text TEXT,
+                preview TEXT,
+                sections TEXT,
+                pages TEXT,
+                needs_ocr INTEGER NOT NULL DEFAULT 0,
+                ocr_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE ingest_document_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                token_count INTEGER NOT NULL,
+                start_offset INTEGER NOT NULL,
+                end_offset INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE VIRTUAL TABLE ingest_document_index
+            USING fts5(
+                content,
+                path UNINDEXED,
+                document_id UNINDEXED,
+                tokenize='porter'
+            );
+            INSERT INTO ingest_documents (path, version) VALUES ('/tmp/doc.txt', 1);
+            INSERT INTO ingest_document_chunks (
+                document_id, chunk_index, text, token_count, start_offset, end_offset
+            )
+            VALUES (1, 0, 'Legacy content for migration', 4, 0, 24);
+            INSERT INTO ingest_document_index (rowid, content, path, document_id)
+            VALUES (1, 'Legacy content for migration', '/tmp/doc.txt', 1);
+            PRAGMA user_version = 4;
+            """
+        )
+
+    manager = DatabaseManager(db_path)
+    manager.initialize()
+
+    connection = manager.connect()
+    columns = connection.execute("PRAGMA table_info(ingest_document_chunks)").fetchall()
+    assert any(row["name"] == "metadata" for row in columns)
+
+    schema_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ingest_document_index'"
+    ).fetchone()
+    assert schema_sql_row is not None
+    assert "chunk_id" in schema_sql_row["sql"]
+    assert "chunk_index" in schema_sql_row["sql"]
+
+    migrated_row = connection.execute(
+        "SELECT chunk_id, chunk_index, path FROM ingest_document_index"
+    ).fetchone()
+    assert migrated_row is not None
+    assert migrated_row["chunk_id"] == 1
+    assert migrated_row["chunk_index"] == 0
+    assert migrated_row["path"] == "/tmp/doc.txt"
+
+    metadata_value = connection.execute(
+        "SELECT metadata FROM ingest_document_chunks WHERE id = 1"
+    ).fetchone()["metadata"]
+    assert metadata_value == "{}"

@@ -80,11 +80,86 @@ class DatabaseManager:
         self._set_user_version(connection, SCHEMA_VERSION)
 
     def _apply_migrations(self, connection: sqlite3.Connection, current: int) -> None:
-        """Placeholder for future migrations from ``current`` to ``SCHEMA_VERSION``."""
+        """Apply incremental migrations until the schema reaches ``SCHEMA_VERSION``."""
+
         if current >= SCHEMA_VERSION:
             return
-        # No incremental migrations yet; reapply schema to fill gaps.
-        self._install_base_schema(connection)
+
+        if current < 5:
+            self._migrate_to_v5(connection)
+            current = 5
+
+        if current < SCHEMA_VERSION:
+            self._set_user_version(connection, SCHEMA_VERSION)
+
+    @staticmethod
+    def _table_has_column(
+        connection: sqlite3.Connection, table: str, column: str
+    ) -> bool:
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(row["name"] == column for row in rows)
+
+    def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
+        """Add chunk metadata storage required for context aware chunking."""
+
+        if not self._table_has_column(connection, "ingest_document_chunks", "metadata"):
+            connection.execute("ALTER TABLE ingest_document_chunks ADD COLUMN metadata TEXT")
+        connection.execute("UPDATE ingest_document_chunks SET metadata = '{}' WHERE metadata IS NULL")
+
+        rows = connection.execute(
+            """
+            SELECT
+                chunks.id AS chunk_id,
+                chunks.chunk_index AS chunk_index,
+                chunks.text AS chunk_text,
+                chunks.document_id AS document_id,
+                docs.path AS document_path
+            FROM ingest_document_chunks AS chunks
+            LEFT JOIN ingest_documents AS docs ON docs.id = chunks.document_id
+            ORDER BY chunks.id ASC
+            """
+        ).fetchall()
+
+        connection.execute("DROP TABLE IF EXISTS ingest_document_index")
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE ingest_document_index
+            USING fts5(
+                content,
+                path UNINDEXED,
+                document_id UNINDEXED,
+                chunk_id UNINDEXED,
+                chunk_index UNINDEXED,
+                tokenize='porter'
+            )
+            """
+        )
+
+        def _normalize(value: str | None) -> str:
+            if not value:
+                return ""
+            collapsed = re.sub(r"\s+", " ", value.strip())
+            return collapsed
+
+        for row in rows:
+            chunk_id = int(row["chunk_id"])
+            chunk_index = int(row["chunk_index"])
+            document_id = int(row["document_id"]) if row["document_id"] is not None else None
+            path = row["document_path"] or ""
+            if document_id is None:
+                continue
+            search_text = _normalize(row["chunk_text"])
+            connection.execute(
+                """
+                INSERT INTO ingest_document_index (
+                    rowid, content, path, document_id, chunk_id, chunk_index
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, search_text, path, document_id, chunk_id, chunk_index),
+            )
+
+        self._set_user_version(connection, 5)
 
     @staticmethod
     def _get_user_version(connection: sqlite3.Connection) -> int:

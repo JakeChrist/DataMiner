@@ -14,6 +14,7 @@ import pytest
 
 from app.ingest.service import IngestService, TaskStatus
 from app.storage import (
+    DatabaseError,
     DatabaseManager,
     DocumentRepository,
     IngestDocumentRepository,
@@ -362,4 +363,62 @@ def test_resume_after_restart(tmp_path: Path, db_manager: DatabaseManager) -> No
     assert final_record["extra_data"]["summary"]["success_count"] == 4
 
     service_two.shutdown()
+
+
+def test_project_document_sync_retries_when_locked(
+    tmp_path: Path, db_manager: DatabaseManager
+) -> None:
+    project = ProjectRepository(db_manager).create("Retry Project")
+    sample = tmp_path / "doc.txt"
+    sample.write_text("content", encoding="utf-8")
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    try:
+        original_create = service.project_documents.create
+        attempts = {"count": 0}
+
+        def flaky_create(*args, **kwargs):
+            if attempts["count"] == 0:
+                attempts["count"] += 1
+                raise DatabaseError("database is locked")
+            return original_create(*args, **kwargs)
+
+        service.project_documents.create = flaky_create  # type: ignore[assignment]
+
+        job_id = service.queue_file_add(project["id"], [sample])
+        assert service.wait_for_completion(job_id, timeout=5.0)
+        record = service.repo.get(job_id)
+        assert record is not None
+        assert record["status"] == TaskStatus.COMPLETED
+
+        repo = DocumentRepository(db_manager)
+        documents = repo.list_for_project(project["id"])
+        assert any(doc.get("source_path") == str(sample.resolve()) for doc in documents)
+    finally:
+        service.shutdown()
+
+
+def test_project_document_sync_failure_marks_job_failed(
+    tmp_path: Path, db_manager: DatabaseManager
+) -> None:
+    project = ProjectRepository(db_manager).create("Failure Project")
+    sample = tmp_path / "doc.txt"
+    sample.write_text("content", encoding="utf-8")
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    try:
+        def always_locked(*args, **kwargs):
+            raise DatabaseError("database is locked")
+
+        service.project_documents.create = always_locked  # type: ignore[assignment]
+
+        job_id = service.queue_file_add(project["id"], [sample])
+        assert service.wait_for_completion(job_id, timeout=5.0)
+        record = service.repo.get(job_id)
+        assert record is not None
+        assert record["status"] == TaskStatus.FAILED
+        errors = record["extra_data"].get("errors", [])
+        assert any("project documents" in str(error).lower() for error in errors)
+    finally:
+        service.shutdown()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 import difflib
 import copy
@@ -149,6 +150,7 @@ class ConversationTurn:
     raw_response: dict[str, Any] | None = None
     step_results: list["StepResult"] = field(default_factory=list)
     ledger_claims: list[dict[str, Any]] = field(default_factory=list)
+    adversarial_review: JudgeReport | None = None
 
     @property
     def reasoning_bullets(self) -> list[str]:
@@ -235,6 +237,562 @@ class ConsolidationOutput:
     sections: list[ConsolidatedSection]
     conflicts: list[ConflictNote]
     section_usage: dict[int, set[str]]
+
+
+@dataclass
+class JudgeReport:
+    """Outcome of the adversarial judge review for a turn."""
+
+    decision: Literal["approve", "insufficient"]
+    revised: bool
+    reasons: list[str] = field(default_factory=list)
+    reason_codes: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    cycles: int = 0
+
+
+@dataclass
+class _JudgeVerdict:
+    """Internal representation of the judge's decision for a draft answer."""
+
+    decision: Literal["approve", "fail", "insufficient"]
+    reasons: list[str]
+    reason_codes: list[str]
+    metrics: dict[str, Any]
+
+
+@dataclass
+class _JudgeFixResult:
+    """Outcome of automatic repairs applied after a failed review."""
+
+    consolidation: ConsolidationOutput
+    citations: list[Any]
+    citation_mapping: dict[int, int]
+    duplicates_removed: int
+    sentences_removed: int
+
+
+class _AdversarialJudge:
+    """Validate consolidated answers against strict quality rules."""
+
+    _CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+    _BANNED_HEADINGS = {"recommendations", "next steps", "context"}
+
+    def __init__(self, *, max_cycles: int = 3) -> None:
+        self.max_cycles = max(1, max_cycles)
+
+    def review(
+        self,
+        consolidation: ConsolidationOutput,
+        citations: Sequence[Any],
+        *,
+        ledger_snapshot: Sequence[dict[str, Any]] | None,
+        scope: dict[str, Any] | None,
+        answer_length: AnswerLength,
+        response_mode: ResponseMode,
+    ) -> _JudgeVerdict:
+        ledger_map = self._build_ledger_map(ledger_snapshot)
+        claim_records: list[dict[str, Any]] = []
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+        missing_citations: list[str] = []
+        invalid_citations: list[str] = []
+        unsupported_claims: list[str] = []
+        reason_codes: list[str] = []
+        reasons: list[str] = []
+
+        for section in consolidation.sections:
+            title_key = (section.title or "").strip().lower()
+            if title_key in self._BANNED_HEADINGS:
+                reasons.append(
+                    f"Banned heading '{section.title}' detected; rename or remove section."
+                )
+                reason_codes.append("banned_heading")
+            for sentence in section.sentences:
+                normalized, indexes = self._parse_sentence(sentence)
+                if not normalized:
+                    continue
+                claim_records.append(
+                    {
+                        "normalized": normalized,
+                        "sentence": sentence,
+                        "indexes": indexes,
+                    }
+                )
+                if normalized in seen:
+                    snippet = self._sentence_snippet(sentence)
+                    reasons.append(f"Claim '{snippet}' duplicates earlier content.")
+                    if "duplicate_claim" not in reason_codes:
+                        reason_codes.append("duplicate_claim")
+                    duplicates.append(normalized)
+                else:
+                    seen[normalized] = sentence
+                if not indexes:
+                    missing_citations.append(normalized)
+                else:
+                    invalid = [index for index in indexes if not self._index_valid(index, citations)]
+                    if invalid:
+                        invalid_citations.append(normalized)
+                    elif not self._claim_supported(normalized, indexes, ledger_map):
+                        unsupported_claims.append(normalized)
+
+        citations_total = sum(len(record["indexes"]) for record in claim_records)
+        citations_verified_ok = 0
+        for record in claim_records:
+            indexes = [
+                index
+                for index in record["indexes"]
+                if self._index_valid(index, citations)
+                and (not ledger_map or self._claim_supported(record["normalized"], [index], ledger_map))
+            ]
+            citations_verified_ok += len(indexes)
+
+        if missing_citations:
+            reason_codes.append("missing_citation")
+            for normalized in missing_citations:
+                snippet = self._sentence_snippet(seen.get(normalized, normalized))
+                reasons.append(f"Claim '{snippet}' is missing supporting citations.")
+
+        if invalid_citations:
+            reason_codes.append("invalid_citation")
+            for normalized in invalid_citations:
+                snippet = self._sentence_snippet(seen.get(normalized, normalized))
+                reasons.append(f"Claim '{snippet}' cites unavailable evidence.")
+
+        if unsupported_claims:
+            reason_codes.append("unsupported_claim")
+            for normalized in unsupported_claims:
+                snippet = self._sentence_snippet(seen.get(normalized, normalized))
+                reasons.append(f"Claim '{snippet}' is not backed by the evidence set.")
+
+        used_indexes = self._collect_used_indexes(consolidation, claim_records)
+        unused = [index for index in range(1, len(citations) + 1) if index not in used_indexes]
+        if unused:
+            reason_codes.append("unused_evidence")
+            markers = ", ".join(f"[{index}]" for index in unused)
+            reasons.append(f"Evidence entries {markers} are not referenced in the answer.")
+
+        metrics = {
+            "retrieved_k": len(citations),
+            "unique_claims": len(seen),
+            "duplicates_identified": len(duplicates),
+            "citations_total": citations_total,
+            "citations_verified_ok": citations_verified_ok,
+            "conflict_notes": len(consolidation.conflicts),
+        }
+
+        no_claims = not claim_records and not consolidation.conflicts
+        no_citations = len(citations) == 0
+        if no_claims and no_citations:
+            scope_reason = "No supporting evidence in current scope"
+            reason_codes = ["insufficient_evidence"]
+            if self._scope_active(scope):
+                scope_reason += "; active filters returned no results"
+                reason_codes.append("overscoped_scope")
+            return _JudgeVerdict("insufficient", [scope_reason], reason_codes, metrics)
+
+        if no_citations:
+            scope_reason = "No supporting evidence in current scope"
+            reason_codes = ["insufficient_evidence"]
+            if self._scope_active(scope):
+                scope_reason += "; active filters returned no results"
+                reason_codes.append("overscoped_scope")
+            return _JudgeVerdict("insufficient", [scope_reason], reason_codes, metrics)
+
+        if reasons:
+            return _JudgeVerdict("fail", reasons, reason_codes, metrics)
+
+        return _JudgeVerdict("approve", [], [], metrics)
+
+    def apply_fixes(
+        self,
+        consolidation: ConsolidationOutput,
+        citations: Sequence[Any],
+        *,
+        verdict: _JudgeVerdict,
+        ledger_snapshot: Sequence[dict[str, Any]] | None,
+    ) -> _JudgeFixResult:
+        sections = [
+            ConsolidatedSection(
+                title=section.title,
+                sentences=list(section.sentences),
+                citation_indexes=list(section.citation_indexes),
+            )
+            for section in consolidation.sections
+        ]
+        conflicts = [
+            ConflictNote(
+                summary=note.summary,
+                citation_indexes=list(note.citation_indexes),
+                variants=[
+                    {"text": variant.get("text", ""), "citations": list(variant.get("citations", []))}
+                    for variant in note.variants
+                ],
+            )
+            for note in consolidation.conflicts
+        ]
+
+        duplicates_removed = 0
+        sentences_removed = 0
+        ledger_map = self._build_ledger_map(ledger_snapshot)
+
+        if "banned_heading" in verdict.reason_codes:
+            sections = self._rename_banned_sections(sections)
+
+        if "duplicate_claim" in verdict.reason_codes:
+            sections, removed = self._drop_duplicate_sentences(sections)
+            duplicates_removed += removed
+
+        if {"missing_citation", "invalid_citation", "unsupported_claim"}.intersection(
+            verdict.reason_codes
+        ):
+            sections, removed = self._drop_unsupported_sentences(
+                sections, len(citations), ledger_map
+            )
+            sentences_removed += removed
+
+        result = self._finalize_output(sections, conflicts, citations)
+        sentences_removed += result.sentences_removed
+        return _JudgeFixResult(
+            consolidation=result.consolidation,
+            citations=result.citations,
+            citation_mapping=result.citation_mapping,
+            duplicates_removed=duplicates_removed,
+            sentences_removed=sentences_removed,
+        )
+
+    @staticmethod
+    def _sentence_snippet(sentence: str | None, *, limit: int = 80) -> str:
+        if not sentence:
+            return ""
+        clean = ConversationManager._strip_citation_markers(sentence)
+        clean = ConversationManager._polish_sentence(clean)
+        if len(clean) <= limit:
+            return clean
+        return clean[: limit - 1].rstrip() + "…"
+
+    @classmethod
+    def _parse_sentence(cls, sentence: str) -> tuple[str, list[int]]:
+        normalized = ConversationManager._normalize_answer_text(sentence)
+        indexes = []
+        for match in cls._CITATION_PATTERN.finditer(sentence):
+            try:
+                indexes.append(int(match.group(1)))
+            except (TypeError, ValueError):
+                continue
+        return normalized, indexes
+
+    @staticmethod
+    def _index_valid(index: int, citations: Sequence[Any]) -> bool:
+        return 1 <= index <= len(citations)
+
+    @staticmethod
+    def _build_ledger_map(
+        ledger_snapshot: Sequence[dict[str, Any]] | None,
+    ) -> dict[str, set[int]]:
+        ledger_map: dict[str, set[int]] = {}
+        if not ledger_snapshot:
+            return ledger_map
+        for entry in ledger_snapshot:
+            normalized = str(entry.get("normalized") or "").strip().lower()
+            if not normalized:
+                continue
+            citations = entry.get("citations")
+            if isinstance(citations, Iterable) and not isinstance(citations, (str, bytes)):
+                indexes: set[int] = set()
+                for value in citations:
+                    try:
+                        index = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if index > 0:
+                        indexes.add(index)
+                if indexes:
+                    ledger_map[normalized] = indexes
+        return ledger_map
+
+    @staticmethod
+    def _claim_supported(
+        normalized: str, indexes: Sequence[int], ledger_map: dict[str, set[int]]
+    ) -> bool:
+        if not ledger_map:
+            return True
+        citations = ledger_map.get(normalized)
+        if not citations:
+            return False
+        return any(index in citations for index in indexes)
+
+    @classmethod
+    def _collect_used_indexes(
+        cls, consolidation: ConsolidationOutput, claims: Sequence[dict[str, Any]]
+    ) -> set[int]:
+        used: set[int] = set()
+        for record in claims:
+            for index in record.get("indexes", []):
+                if index > 0:
+                    used.add(index)
+        for section in consolidation.sections:
+            for index in section.citation_indexes:
+                if index > 0:
+                    used.add(index)
+        for note in consolidation.conflicts:
+            for index in note.citation_indexes:
+                if index > 0:
+                    used.add(index)
+            for variant in note.variants:
+                citations = variant.get("citations")
+                if isinstance(citations, Iterable) and not isinstance(
+                    citations, (str, bytes)
+                ):
+                    for index in citations:
+                        try:
+                            value = int(index)
+                        except (TypeError, ValueError):
+                            continue
+                        if value > 0:
+                            used.add(value)
+        return used
+
+    @staticmethod
+    def _scope_active(scope: dict[str, Any] | None) -> bool:
+        if not scope:
+            return False
+        for key in ("include", "exclude", "tags", "folders", "date"):
+            value = scope.get(key)
+            if isinstance(value, dict):
+                if any(value.values()):
+                    return True
+            elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+                if any(str(item).strip() for item in value):
+                    return True
+            elif value:
+                return True
+        return False
+
+    @staticmethod
+    def _rename_banned_sections(
+        sections: Sequence[ConsolidatedSection],
+    ) -> list[ConsolidatedSection]:
+        renamed: list[ConsolidatedSection] = []
+        for section in sections:
+            title_key = (section.title or "").strip().lower()
+            if title_key in _AdversarialJudge._BANNED_HEADINGS:
+                title = "Key Points"
+            else:
+                title = section.title
+            renamed.append(
+                ConsolidatedSection(
+                    title=title,
+                    sentences=list(section.sentences),
+                    citation_indexes=list(section.citation_indexes),
+                )
+            )
+        return renamed
+
+    @classmethod
+    def _drop_duplicate_sentences(
+        cls, sections: Sequence[ConsolidatedSection]
+    ) -> tuple[list[ConsolidatedSection], int]:
+        seen: set[str] = set()
+        updated: list[ConsolidatedSection] = []
+        removed = 0
+        for section in sections:
+            sentences: list[str] = []
+            citation_indexes: set[int] = set()
+            for sentence in section.sentences:
+                normalized = ConversationManager._normalize_answer_text(sentence)
+                if normalized and normalized in seen:
+                    removed += 1
+                    continue
+                if normalized:
+                    seen.add(normalized)
+                sentences.append(sentence)
+                citation_indexes.update(
+                    int(match.group(1))
+                    for match in cls._CITATION_PATTERN.finditer(sentence)
+                    if match.group(1).isdigit()
+                )
+            if sentences:
+                updated.append(
+                    ConsolidatedSection(
+                        title=section.title,
+                        sentences=sentences,
+                        citation_indexes=sorted(index for index in citation_indexes if index > 0),
+                    )
+                )
+        return updated, removed
+
+    @classmethod
+    def _drop_unsupported_sentences(
+        cls,
+        sections: Sequence[ConsolidatedSection],
+        citation_count: int,
+        ledger_map: dict[str, set[int]],
+    ) -> tuple[list[ConsolidatedSection], int]:
+        updated: list[ConsolidatedSection] = []
+        removed = 0
+        for section in sections:
+            sentences: list[str] = []
+            section_indexes: set[int] = set()
+            for sentence in section.sentences:
+                normalized = ConversationManager._normalize_answer_text(sentence)
+                indexes = [
+                    int(match.group(1))
+                    for match in cls._CITATION_PATTERN.finditer(sentence)
+                    if match.group(1).isdigit()
+                ]
+                if not indexes:
+                    removed += 1
+                    continue
+                if any(index <= 0 or index > citation_count for index in indexes):
+                    removed += 1
+                    continue
+                if ledger_map and not cls._claim_supported(normalized, indexes, ledger_map):
+                    removed += 1
+                    continue
+                sentences.append(sentence)
+                section_indexes.update(indexes)
+            if sentences:
+                updated.append(
+                    ConsolidatedSection(
+                        title=section.title,
+                        sentences=sentences,
+                        citation_indexes=sorted(section_indexes),
+                    )
+                )
+        return updated, removed
+
+    @classmethod
+    def _finalize_output(
+        cls,
+        sections: Sequence[ConsolidatedSection],
+        conflicts: Sequence[ConflictNote],
+        citations: Sequence[Any],
+    ) -> _JudgeFixResult:
+        used_indexes: list[int] = []
+        for section in sections:
+            for sentence in section.sentences:
+                for match in cls._CITATION_PATTERN.finditer(sentence):
+                    if match.group(1).isdigit():
+                        value = int(match.group(1))
+                        if value > 0:
+                            used_indexes.append(value)
+        for note in conflicts:
+            for index in note.citation_indexes:
+                if index > 0:
+                    used_indexes.append(index)
+            for variant in note.variants:
+                citations_list = variant.get("citations")
+                if isinstance(citations_list, Iterable) and not isinstance(
+                    citations_list, (str, bytes)
+                ):
+                    for index in citations_list:
+                        try:
+                            value = int(index)
+                        except (TypeError, ValueError):
+                            continue
+                        if value > 0:
+                            used_indexes.append(value)
+
+        ordered = sorted({index for index in used_indexes if 0 < index <= len(citations)})
+        citation_mapping: dict[int, int] = {
+            old: new for new, old in enumerate(ordered, start=1)
+        }
+        new_citations = [copy.deepcopy(citations[old - 1]) for old in ordered]
+
+        remapped_sections: list[ConsolidatedSection] = []
+        sentences_removed = 0
+        for section in sections:
+            sentences: list[str] = []
+            section_indexes: set[int] = set()
+            for sentence in section.sentences:
+                indexes = [
+                    citation_mapping.get(int(match.group(1)))
+                    for match in cls._CITATION_PATTERN.finditer(sentence)
+                    if match.group(1).isdigit()
+                ]
+                indexes = [index for index in indexes if index]
+                if not indexes:
+                    sentences_removed += 1
+                    continue
+                sentences.append(cls._remap_sentence(sentence, citation_mapping))
+                section_indexes.update(indexes)
+            if sentences:
+                remapped_sections.append(
+                    ConsolidatedSection(
+                        title=section.title,
+                        sentences=sentences,
+                        citation_indexes=sorted(section_indexes),
+                    )
+                )
+
+        remapped_conflicts: list[ConflictNote] = []
+        for note in conflicts:
+            mapped_note_indexes = sorted(
+                {
+                    citation_mapping[index]
+                    for index in note.citation_indexes
+                    if index in citation_mapping
+                }
+            )
+            variants: list[dict[str, Any]] = []
+            for variant in note.variants:
+                mapped_variant_indexes = sorted(
+                    {
+                        citation_mapping[index]
+                        for index in variant.get("citations", [])
+                        if index in citation_mapping
+                    }
+                )
+                if mapped_variant_indexes:
+                    variants.append(
+                        {
+                            "text": variant.get("text", ""),
+                            "citations": mapped_variant_indexes,
+                        }
+                    )
+            if len(variants) >= 2 and mapped_note_indexes:
+                remapped_conflicts.append(
+                    ConflictNote(
+                        summary=note.summary,
+                        citation_indexes=mapped_note_indexes,
+                        variants=variants,
+                    )
+                )
+
+        section_usage: dict[int, set[str]] = {}
+        for section in remapped_sections:
+            for index in section.citation_indexes:
+                section_usage.setdefault(index, set()).add(section.title)
+
+        text = ConversationManager._assemble_answer_text(remapped_sections, remapped_conflicts)
+        consolidation = ConsolidationOutput(
+            text=text,
+            sections=remapped_sections,
+            conflicts=remapped_conflicts,
+            section_usage=section_usage,
+        )
+
+        return _JudgeFixResult(
+            consolidation=consolidation,
+            citations=new_citations,
+            citation_mapping=citation_mapping,
+            duplicates_removed=0,
+            sentences_removed=sentences_removed,
+        )
+
+    @classmethod
+    def _remap_sentence(
+        cls, sentence: str, citation_mapping: dict[int, int]
+    ) -> str:
+        def replace(match: re.Match[str]) -> str:
+            value = int(match.group(1)) if match.group(1).isdigit() else 0
+            mapped = citation_mapping.get(value)
+            return f"[{mapped}]" if mapped else ""
+
+        updated = cls._CITATION_PATTERN.sub(replace, sentence)
+        updated = " ".join(updated.split())
+        return updated
 
 
 @dataclass
@@ -448,6 +1006,8 @@ class ConversationManager:
         self._connection_error: str | None = None
         self._listeners: list[Callable[[ConnectionState], None]] = []
         self._ledger = _EvidenceLedger()
+        self._judge = _AdversarialJudge()
+        self._judge_log: deque[dict[str, Any]] = deque(maxlen=50)
 
     def add_connection_listener(
         self, listener: Callable[[ConnectionState], None]
@@ -559,6 +1119,143 @@ class ConversationManager:
         self._update_connection(True, None)
         turn = self._register_turn(question, response, response_mode, preset)
         return turn
+
+    def _apply_adversarial_review(
+        self,
+        consolidation: ConsolidationOutput,
+        citations: list[Any],
+        *,
+        ledger_snapshot: Sequence[dict[str, Any]] | None,
+        scope: dict[str, Any] | None,
+        preset: AnswerLength,
+        response_mode: ResponseMode,
+    ) -> tuple[ConsolidationOutput, list[Any], dict[int, int], JudgeReport]:
+        cycles = 0
+        revisions = False
+        duplicates_removed_total = 0
+        sentences_removed_total = 0
+        mapping_overall: dict[int, int] = {
+            index: index for index in range(1, len(citations) + 1)
+        }
+        last_verdict: _JudgeVerdict | None = None
+
+        while True:
+            cycles += 1
+            verdict = self._judge.review(
+                consolidation,
+                citations,
+                ledger_snapshot=ledger_snapshot,
+                scope=scope,
+                answer_length=preset,
+                response_mode=response_mode,
+            )
+            last_verdict = verdict
+            if verdict.decision == "approve":
+                break
+            if verdict.decision == "insufficient":
+                consolidation = ConsolidationOutput(
+                    text="No supporting evidence in current scope",
+                    sections=[],
+                    conflicts=[],
+                    section_usage={},
+                )
+                citations = []
+                mapping_overall = {}
+                revisions = True
+                break
+            if cycles >= self._judge.max_cycles:
+                metrics = verdict.metrics if verdict else {}
+                consolidation = ConsolidationOutput(
+                    text="No supporting evidence in current scope",
+                    sections=[],
+                    conflicts=[],
+                    section_usage={},
+                )
+                citations = []
+                mapping_overall = {}
+                last_verdict = _JudgeVerdict(
+                    decision="insufficient",
+                    reasons=["No supporting evidence in current scope"],
+                    reason_codes=["insufficient_evidence"],
+                    metrics=metrics,
+                )
+                revisions = True
+                break
+
+            previous_citation_count = len(citations)
+            fix = self._judge.apply_fixes(
+                consolidation,
+                citations,
+                verdict=verdict,
+                ledger_snapshot=ledger_snapshot,
+            )
+            consolidation = fix.consolidation
+            citations = fix.citations
+            duplicates_removed_total += fix.duplicates_removed
+            sentences_removed_total += fix.sentences_removed
+            if (
+                fix.duplicates_removed > 0
+                or fix.sentences_removed > 0
+                or len(citations) != previous_citation_count
+            ):
+                revisions = True
+
+            if mapping_overall:
+                composed: dict[int, int] = {}
+                for original, current in mapping_overall.items():
+                    if current in fix.citation_mapping:
+                        composed[original] = fix.citation_mapping[current]
+                mapping_overall = composed
+            else:
+                mapping_overall = {
+                    index: value
+                    for index, value in fix.citation_mapping.items()
+                    if value is not None
+                }
+
+        if last_verdict is None:
+            last_verdict = _JudgeVerdict(
+                decision="approve",
+                reasons=[],
+                reason_codes=[],
+                metrics={
+                    "retrieved_k": len(citations),
+                    "unique_claims": 0,
+                    "duplicates_identified": 0,
+                    "citations_total": 0,
+                    "citations_verified_ok": 0,
+                    "conflict_notes": 0,
+                },
+            )
+
+        metrics = dict(last_verdict.metrics)
+        metrics["dup_claims_removed"] = duplicates_removed_total
+        metrics["sentences_removed"] = sentences_removed_total
+
+        log_entry = {
+            "retrieved_k": metrics.get("retrieved_k", len(citations)),
+            "unique_claims": metrics.get("unique_claims", 0),
+            "dup_claims_removed": duplicates_removed_total,
+            "citations_verified_ok": metrics.get("citations_verified_ok", 0),
+            "citations_total": metrics.get("citations_total", 0),
+            "conflict_notes_count": metrics.get("conflict_notes", 0),
+            "reason_codes": list(last_verdict.reason_codes),
+            "cycles_to_approve": cycles,
+        }
+        self._judge_log.append(log_entry)
+
+        report = JudgeReport(
+            decision="insufficient"
+            if last_verdict.decision == "insufficient"
+            else "approve",
+            revised=revisions,
+            reasons=list(last_verdict.reasons),
+            reason_codes=list(last_verdict.reason_codes),
+            metrics=metrics,
+            cycles=cycles,
+        )
+
+        return consolidation, citations, mapping_overall, report
 
     _PLAN_STOPWORDS = {
         "a",
@@ -785,6 +1482,41 @@ class ConversationManager:
         consolidation = self._compose_final_answer(
             step_results, ledger=self._ledger, turn_id=turn_id
         )
+        retrieval_scope = None
+        if extra_options and isinstance(extra_options.get("retrieval"), dict):
+            retrieval_scope = copy.deepcopy(extra_options["retrieval"])
+        ledger_snapshot_initial = self._ledger.snapshot_for_turn(turn_id)
+        (
+            consolidation,
+            aggregated,
+            citation_mapping,
+            review_report,
+        ) = self._apply_adversarial_review(
+            consolidation,
+            aggregated,
+            ledger_snapshot=ledger_snapshot_initial,
+            scope=retrieval_scope,
+            preset=preset,
+            response_mode=response_mode,
+        )
+
+        if citation_mapping:
+            for result in step_results:
+                remapped = [
+                    citation_mapping[index]
+                    for index in result.citation_indexes
+                    if index in citation_mapping and citation_mapping[index] > 0
+                ]
+                result.citation_indexes = sorted(dict.fromkeys(remapped))
+        else:
+            for result in step_results:
+                result.citation_indexes = []
+
+        self._ledger.clear_turn(turn_id)
+        for result in step_results:
+            self._ledger.record_step(turn_id, result)
+
+        ledger_snapshot = self._ledger.snapshot_for_turn(turn_id)
         answer = consolidation.text
         summary = f"Executed {total_steps} dynamic step{'s' if total_steps != 1 else ''}."
         artifacts = ReasoningArtifacts(
@@ -808,7 +1540,6 @@ class ConversationManager:
                 for result in step_results
             ],
         }
-        ledger_snapshot = self._ledger.snapshot_for_turn(turn_id)
         if ledger_snapshot:
             reasoning_payload["ledger"] = ledger_snapshot
         if consolidation.sections:
@@ -876,6 +1607,7 @@ class ConversationManager:
             raw_response=raw_response,
             step_results=step_results,
             ledger_claims=ledger_snapshot,
+            adversarial_review=review_report,
         )
         self.turns.append(turn)
         return turn
@@ -1543,6 +2275,20 @@ class ConversationManager:
                 )
             )
 
+        final_text = ConversationManager._assemble_answer_text(sections, conflict_notes)
+
+        return ConsolidationOutput(
+            text=final_text,
+            sections=sections,
+            conflicts=conflict_notes,
+            section_usage=section_usage,
+        )
+
+    @staticmethod
+    def _assemble_answer_text(
+        sections: Sequence[ConsolidatedSection],
+        conflicts: Sequence[ConflictNote],
+    ) -> str:
         sections_text: list[str] = []
         for section in sections:
             body = " ".join(section.sentences).strip()
@@ -1550,10 +2296,10 @@ class ConversationManager:
                 sections_text.append(f"{section.title}: {body}")
 
         conflict_note_text: list[str] = []
-        if conflict_notes:
+        if conflicts:
             summaries: list[str] = []
             citation_union: set[int] = set()
-            for note in conflict_notes:
+            for note in conflicts:
                 summaries.append(note.summary.rstrip("."))
                 citation_union.update(index for index in note.citation_indexes if index > 0)
             summary_body = " / ".join(part for part in summaries if part)
@@ -1566,14 +2312,7 @@ class ConversationManager:
             conflict_note_text.append(conflict_statement)
 
         parts = [part for part in sections_text + conflict_note_text if part]
-        final_text = "\n\n".join(parts).strip()
-
-        return ConsolidationOutput(
-            text=final_text,
-            sections=sections,
-            conflicts=conflict_notes,
-            section_usage=section_usage,
-        )
+        return "\n\n".join(parts).strip()
 
     @staticmethod
     def _fallback_citations_from_contexts(

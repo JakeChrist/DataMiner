@@ -1557,6 +1557,13 @@ class MainWindow(QMainWindow):
         turn.answered_at = answered_at
         turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
         turn.token_usage = self._extract_token_usage(turn)
+        review = getattr(turn, "adversarial_review", None)
+        if review and getattr(review, "revised", False):
+            self._show_toast(
+                "Answer revised for accuracy/clarity.",
+                level="info",
+                duration_ms=3500,
+            )
         self._turns.append(turn)
         self._update_session(turns=list(self._turns))
         card = self.answer_view.add_turn(turn)

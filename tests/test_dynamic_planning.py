@@ -65,11 +65,12 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
         context_provider=provider,
     )
 
-    assert len(client.requests) == 2
-    assert len(turn.step_results) == 2
-    assert all(item.status == "done" for item in turn.plan)
-    assert turn.answer == "finding [1][2]"
-    assert len(turn.citations) == 2
+    assert len(client.requests) == 4
+    assert len(turn.step_results) == 4
+    assert [item.status for item in turn.plan] == ["done"] * 4
+    assert turn.plan[0].description.startswith("Scan corpus for background")
+    assert turn.answer == "finding [1][2][3][4]"
+    assert len(turn.citations) == 4
     assert turn.citations[0].get("steps") == [1]
     assert turn.step_results[0].citation_indexes == [1]
 
@@ -96,7 +97,7 @@ def test_dynamic_plan_notes_missing_citations() -> None:
         context_provider=provider,
     )
 
-    assert len(turn.step_results) == 2
+    assert len(turn.step_results) == 4
     assert turn.reasoning_artifacts is not None
     assert any("No direct evidence" in text for text in turn.reasoning_artifacts.assumptions)
     assert all(result.citation_indexes for result in turn.step_results)

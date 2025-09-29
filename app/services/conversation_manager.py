@@ -72,7 +72,7 @@ class PlanItem:
     """A single plan entry returned by the model."""
 
     description: str
-    status: str = "pending"
+    status: str = "queued"
 
     @property
     def is_complete(self) -> bool:
@@ -319,6 +319,76 @@ class ConversationManager:
         turn = self._register_turn(question, response, response_mode, preset)
         return turn
 
+    _PLAN_STOPWORDS = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "for",
+        "from",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "please",
+        "provide",
+        "should",
+        "tell",
+        "that",
+        "the",
+        "to",
+        "what",
+        "when",
+        "where",
+        "which",
+        "why",
+        "with",
+    }
+
+    _PLAN_ACTION_STARTERS = {
+        "analyze",
+        "assess",
+        "build",
+        "calculate",
+        "check",
+        "collect",
+        "compare",
+        "compile",
+        "create",
+        "determine",
+        "develop",
+        "evaluate",
+        "examine",
+        "explain",
+        "gather",
+        "highlight",
+        "identify",
+        "list",
+        "map",
+        "outline",
+        "prepare",
+        "propose",
+        "recommend",
+        "research",
+        "review",
+        "summarize",
+        "synthesize",
+    }
+
+    _PLAN_CONNECTOR_PATTERN = re.compile(
+        r"\b(?:and then|and|then|after that|next|finally)\b",
+        flags=re.IGNORECASE,
+    )
+
     def _ask_with_plan(
         self,
         question: str,
@@ -338,8 +408,7 @@ class ConversationManager:
         shared_context = "\n\n".join(context_snippets or [])
         base_options = copy.deepcopy(extra_options) if extra_options else {}
         executed_plan: list[PlanItem] = [
-            PlanItem(description=item.description, status="not_started")
-            for item in plan_items
+            PlanItem(description=item.description, status="queued") for item in plan_items
         ]
         step_results: list[StepResult] = []
         assumptions: list[str] = []
@@ -475,16 +544,139 @@ class ConversationManager:
         normalized = question.strip()
         if not normalized:
             return []
-        segments = re.split(r"[\n\.!?]+", normalized)
+
+        actions = self._split_question_into_actions(normalized)
         plan: list[PlanItem] = []
+
+        keyword_list = self._extract_plan_keywords(normalized)
+        if keyword_list:
+            keyword_text = ", ".join(keyword_list)
+            plan.append(
+                PlanItem(
+                    description=f"Scan corpus for background on {keyword_text}.",
+                    status="queued",
+                )
+            )
+
+        for action in actions:
+            formatted = self._format_plan_action(action)
+            if formatted:
+                plan.append(PlanItem(description=formatted, status="queued"))
+
+        plan.append(
+            PlanItem(
+                description="Synthesize findings into a final answer with citations.",
+                status="queued",
+            )
+        )
+
+        if len(plan) > 8:
+            trimmed = plan[:7] + [plan[-1]]
+        else:
+            trimmed = list(plan)
+        if not trimmed:
+            trimmed = [PlanItem(description=normalized, status="queued")]
+        return trimmed
+
+    def _split_question_into_actions(self, question: str) -> list[str]:
+        """Break a question into granular, executable action strings."""
+
+        segments = re.split(r"[\n\.!?]+", question)
+        actions: list[str] = []
         for segment in segments:
             text = segment.strip()
-            if len(text) < 4:
+            if len(text) < 3:
                 continue
-            plan.append(PlanItem(description=text, status="not_started"))
-        if not plan:
-            plan = [PlanItem(description=normalized, status="not_started")]
-        return plan[:6]
+            actions.extend(self._split_segment_on_connectors(text))
+        return [action for action in actions if action]
+
+    def _split_segment_on_connectors(self, segment: str) -> list[str]:
+        """Split a sentence on conjunctions that likely denote separate actions."""
+
+        if not segment:
+            return []
+
+        parts: list[str] = []
+        queue = [segment]
+
+        while queue:
+            current = queue.pop(0).strip()
+            if not current:
+                continue
+
+            match = self._PLAN_CONNECTOR_PATTERN.search(current)
+            if not match:
+                parts.append(current)
+                continue
+
+            prefix = current[: match.start()].strip()
+            suffix = current[match.end() :].strip()
+
+            if not prefix or not suffix:
+                parts.append(current)
+                continue
+
+            if self._looks_like_action(suffix):
+                queue.append(prefix)
+                queue.append(suffix)
+                continue
+
+            parts.append(current)
+
+        normalized_parts: list[str] = []
+        for part in parts:
+            stripped = part.strip(" ,;:-")
+            if stripped:
+                normalized_parts.append(stripped)
+        return normalized_parts
+
+    def _looks_like_action(self, text: str) -> bool:
+        if not text:
+            return False
+        word = text.split()[0].lower()
+        return word in self._PLAN_ACTION_STARTERS
+
+    def _extract_plan_keywords(self, question: str) -> list[str]:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", question)
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            lower = token.lower()
+            if lower in self._PLAN_STOPWORDS or lower in seen:
+                continue
+            seen.add(lower)
+            keywords.append(token)
+            if len(keywords) >= 3:
+                break
+        return keywords
+
+    @classmethod
+    def _format_plan_action(cls, action: str) -> str:
+        text = action.strip()
+        if not text:
+            return ""
+
+        text = re.sub(
+            r"^(?:please|kindly|could you|would you|let's|lets|we need to|need to|i need to|i want to|should)\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = text.strip()
+        if not text:
+            return ""
+        if text[-1] in "?!.":
+            text = text[:-1]
+        text = text.strip()
+        if not text:
+            return ""
+        if not text[0].isupper():
+            text = text[0].upper() + text[1:]
+        if not text.lower().startswith(tuple(cls._PLAN_ACTION_STARTERS)):
+            text = f"Investigate {text}" if not text.lower().startswith("investigate") else text
+        if not text.endswith("."):
+            text = f"{text}."
+        return text
 
     def _register_turn(
         self,

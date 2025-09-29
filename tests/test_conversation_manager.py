@@ -226,7 +226,7 @@ def test_adversarial_judge_detects_duplicate_claims():
         response_mode=ResponseMode.GENERATIVE,
     )
 
-    assert verdict.decision == "fail"
+    assert verdict.decision == "repair"
     assert "duplicate_claim" in verdict.reason_codes
 
 
@@ -256,7 +256,7 @@ def test_adversarial_judge_trims_unused_evidence():
         response_mode=ResponseMode.GENERATIVE,
     )
 
-    assert verdict.decision == "fail"
+    assert verdict.decision == "repair"
     assert "unused_evidence" in verdict.reason_codes
 
     fix = judge.apply_fixes(
@@ -269,3 +269,37 @@ def test_adversarial_judge_trims_unused_evidence():
     assert len(fix.citations) == 1
     assert fix.citation_mapping == {1: 1}
     assert fix.consolidation.sections[0].sentences == ["Fact. [1]"]
+
+
+def test_adversarial_judge_requires_claim_coverage():
+    judge = _AdversarialJudge()
+    sections = [
+        ConsolidatedSection(
+            title="Key Points",
+            sentences=["Insight A. [1]"],
+            citation_indexes=[1],
+        )
+    ]
+    consolidation = ConsolidationOutput(
+        text=ConversationManager._assemble_answer_text(sections, []),
+        sections=sections,
+        conflicts=[],
+        section_usage={1: {"Key Points"}},
+    )
+    citations = [{"id": 1}, {"id": 2}]
+    ledger_snapshot = [
+        {"normalized": "insight a", "text": "Insight A", "citations": [1]},
+        {"normalized": "insight b", "text": "Insight B", "citations": [2]},
+    ]
+
+    verdict = judge.review(
+        consolidation,
+        citations,
+        ledger_snapshot=ledger_snapshot,
+        scope=None,
+        answer_length=AnswerLength.NORMAL,
+        response_mode=ResponseMode.GENERATIVE,
+    )
+
+    assert verdict.decision == "replan"
+    assert "missing_claim" in verdict.reason_codes

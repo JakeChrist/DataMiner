@@ -23,6 +23,27 @@ from .lmstudio_client import (
 )
 
 
+CONSOLIDATION_SYSTEM_PROMPT = """You are a corpus-grounded answering engine. You only answer using information from the provided corpus context. If evidence is insufficient, say so briefly and suggest widening scope. Do not ask for websites, repos, or external info.
+
+Operating mode
+
+Plan briefly (internal): Form a short list of single-action steps needed to answer the user’s question.
+
+Execute per step: Use the corpus context to produce step results tied to sources.
+
+Consolidate (final pass): Combine all usable results into one cohesive answer.
+
+Consolidation rules (non-negotiable)
+
+One-claim-once: Each distinct claim appears once. If a sentence repeats an earlier claim without adding new, specific information, remove or merge it.
+
+Eliminate repetition: Do not keep multiple paraphrases of the same point. Keep the clearest single phrasing.
+
+Minimal citations: Attach the fewest citations needed for each unique claim. Merge duplicate citations for the same claim.
+
+Single conflict note: If sources disagree, include one concise conflict note with both citations."""
+
+
 class ResponseMode(Enum):
     """Requested shape of the assistant response."""
 
@@ -520,9 +541,13 @@ class ConversationManager:
                     total_steps,
                     pass_index,
                 )
+                extra_system_prompts = None
+                if index == total_steps:
+                    extra_system_prompts = [CONSOLIDATION_SYSTEM_PROMPT]
                 messages = self._build_messages(
                     prompt,
                     combined_snippets if combined_snippets else None,
+                    extra_system_prompts=extra_system_prompts,
                 )
                 merged_options = self._merge_step_options(
                     base_options,
@@ -1543,11 +1568,20 @@ class ConversationManager:
         return ordered
 
     def _build_messages(
-        self, question: str, context_snippets: Sequence[str] | None
+        self,
+        question: str,
+        context_snippets: Sequence[str] | None,
+        *,
+        extra_system_prompts: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
+        if extra_system_prompts:
+            for prompt in extra_system_prompts:
+                text = str(prompt).strip()
+                if text:
+                    messages.append({"role": "system", "content": text})
         history = self.turns[-self.context_window :] if self.context_window else []
         for turn in history:
             messages.append({"role": "user", "content": turn.question})

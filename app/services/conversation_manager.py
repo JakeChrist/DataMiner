@@ -781,6 +781,34 @@ class _AdversarialJudge:
             sentences_removed=sentences_removed,
         )
 
+    @staticmethod
+    def _sanitize_consolidation_without_citations(
+        consolidation: ConsolidationOutput,
+    ) -> ConsolidationOutput:
+        sections: list[ConsolidatedSection] = []
+        for section in consolidation.sections:
+            cleaned_sentences: list[str] = []
+            for sentence in section.sentences:
+                cleaned = ConversationManager._strip_citation_markers(sentence).strip()
+                if cleaned:
+                    cleaned_sentences.append(cleaned)
+            if cleaned_sentences:
+                sections.append(
+                    ConsolidatedSection(
+                        title=section.title,
+                        sentences=cleaned_sentences,
+                        citation_indexes=[],
+                    )
+                )
+
+        text = ConversationManager._assemble_answer_text(sections, [])
+        return ConsolidationOutput(
+            text=text,
+            sections=sections,
+            conflicts=[],
+            section_usage={},
+        )
+
     @classmethod
     def _remap_sentence(
         cls, sentence: str, citation_mapping: dict[int, int]
@@ -1378,6 +1406,7 @@ class ConversationManager:
         preset: AnswerLength,
         response_mode: ResponseMode,
     ) -> tuple[ConsolidationOutput, list[Any], dict[int, int], JudgeReport]:
+        original_consolidation = copy.deepcopy(consolidation)
         cycles = 0
         revisions = False
         duplicates_removed_total = 0
@@ -1401,24 +1430,36 @@ class ConversationManager:
             if verdict.decision == "approve":
                 break
             if verdict.decision == "insufficient":
-                consolidation = ConsolidationOutput(
-                    text="No supporting evidence in current scope",
-                    sections=[],
-                    conflicts=[],
-                    section_usage={},
+                sanitized = self._judge._sanitize_consolidation_without_citations(
+                    original_consolidation
                 )
+                if sanitized.text:
+                    consolidation = sanitized
+                else:
+                    consolidation = ConsolidationOutput(
+                        text="No supporting evidence in current scope",
+                        sections=[],
+                        conflicts=[],
+                        section_usage={},
+                    )
                 citations = []
                 mapping_overall = {}
                 revisions = True
                 break
             if cycles >= self._judge.max_cycles:
                 metrics = verdict.metrics if verdict else {}
-                consolidation = ConsolidationOutput(
-                    text="No supporting evidence in current scope",
-                    sections=[],
-                    conflicts=[],
-                    section_usage={},
+                sanitized = self._judge._sanitize_consolidation_without_citations(
+                    original_consolidation
                 )
+                if sanitized.text:
+                    consolidation = sanitized
+                else:
+                    consolidation = ConsolidationOutput(
+                        text="No supporting evidence in current scope",
+                        sections=[],
+                        conflicts=[],
+                        section_usage={},
+                    )
                 citations = []
                 mapping_overall = {}
                 last_verdict = _JudgeVerdict(

@@ -1534,11 +1534,16 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
+        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
         step_context_provider = self._build_step_context_provider(question)
-        extra_options = self._build_extra_request_options(question)
+        extra_options = self._build_extra_request_options(
+            question,
+            retrieval_documents=retrieval_documents or None,
+        )
         try:
             turn = self._conversation_manager.ask(
                 question,
+                context_snippets=context_snippets or None,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 preset=self.conversation_settings.answer_length,
@@ -1655,6 +1660,7 @@ class MainWindow(QMainWindow):
             project_id=project_id,
             include_identifiers=include,
             exclude_identifiers=exclude,
+            limit=9,
         )
         return self._context_payload_from_records(records, project_id)
 

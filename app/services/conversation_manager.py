@@ -892,21 +892,37 @@ class ConversationManager:
         if keyword_list:
             keyword_text = ", ".join(keyword_list)
             plan.append(
-                PlanItem(
-                    description=f"Scan corpus for background on {keyword_text}.",
-                    status="queued",
+                self._build_structured_plan_item(
+                    input_hint="Corpus context",
+                    action=f"Identify background references on {keyword_text}",
+                    output_hint="List background notes paired with source document and location details",
                 )
             )
 
         for action in actions:
             formatted = self._format_plan_action(action)
-            if formatted:
-                plan.append(PlanItem(description=formatted, status="queued"))
+            if not formatted:
+                continue
+            input_hint = "Relevant corpus snippets and prior findings"
+            if not plan:
+                input_hint = "Corpus context"
+            plan.append(
+                self._build_structured_plan_item(
+                    input_hint=input_hint,
+                    action=f"{formatted} using the provided evidence",
+                    output_hint="Specific finding noting which document snippets support the conclusion",
+                )
+            )
 
+        previous_steps = len(plan)
         plan.append(
-            PlanItem(
-                description="Synthesize findings into a final answer with citations.",
-                status="queued",
+            self._build_structured_plan_item(
+                input_hint=(
+                    "Findings from "
+                    + ("steps 1-" + str(previous_steps) if previous_steps > 1 else "step 1" if previous_steps == 1 else "gathered evidence")
+                ),
+                action=f"Synthesize an answer for '{normalized}'",
+                output_hint="Cohesive response organized by theme with consolidated citations and conflict checks",
             )
         )
 
@@ -1005,18 +1021,21 @@ class ConversationManager:
         text = text.strip()
         if not text:
             return ""
-        if text[-1] in "?!.":
-            text = text[:-1]
-        text = text.strip()
-        if not text:
-            return ""
         if not text[0].isupper():
             text = text[0].upper() + text[1:]
         if not text.lower().startswith(tuple(cls._PLAN_ACTION_STARTERS)):
             text = f"Investigate {text}" if not text.lower().startswith("investigate") else text
-        if not text.endswith("."):
-            text = f"{text}."
-        return text
+        return text.rstrip("?.! ")
+
+    @staticmethod
+    def _build_structured_plan_item(
+        *, input_hint: str, action: str, output_hint: str
+    ) -> PlanItem:
+        description = (
+            f"Input: {input_hint.strip()} → Action: {action.strip()} → "
+            f"Output: {output_hint.strip()}"
+        )
+        return PlanItem(description=description, status="queued")
 
     def _register_turn(
         self,

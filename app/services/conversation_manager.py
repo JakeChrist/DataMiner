@@ -243,7 +243,7 @@ class ConsolidationOutput:
 class JudgeReport:
     """Outcome of the adversarial judge review for a turn."""
 
-    decision: Literal["approve", "insufficient"]
+    decision: Literal["publish", "insufficient_evidence", "replan"]
     revised: bool
     reasons: list[str] = field(default_factory=list)
     reason_codes: list[str] = field(default_factory=list)
@@ -255,7 +255,7 @@ class JudgeReport:
 class _JudgeVerdict:
     """Internal representation of the judge's decision for a draft answer."""
 
-    decision: Literal["approve", "fail", "insufficient"]
+    decision: Literal["publish", "repair", "replan", "insufficient_evidence"]
     reasons: list[str]
     reason_codes: list[str]
     metrics: dict[str, Any]
@@ -292,12 +292,14 @@ class _AdversarialJudge:
         response_mode: ResponseMode,
     ) -> _JudgeVerdict:
         ledger_map = self._build_ledger_map(ledger_snapshot)
+        expected_claims = self._expected_claims(ledger_snapshot)
         claim_records: list[dict[str, Any]] = []
         seen: dict[str, str] = {}
         duplicates: list[str] = []
         missing_citations: list[str] = []
         invalid_citations: list[str] = []
         unsupported_claims: list[str] = []
+        missing_required_claims: list[dict[str, Any]] = []
         reason_codes: list[str] = []
         reasons: list[str] = []
 
@@ -336,6 +338,11 @@ class _AdversarialJudge:
                     elif not self._claim_supported(normalized, indexes, ledger_map):
                         unsupported_claims.append(normalized)
 
+        for normalized, record in expected_claims.items():
+            if normalized in seen:
+                continue
+            missing_required_claims.append(record)
+
         citations_total = sum(len(record["indexes"]) for record in claim_records)
         citations_verified_ok = 0
         for record in claim_records:
@@ -348,29 +355,50 @@ class _AdversarialJudge:
             citations_verified_ok += len(indexes)
 
         if missing_citations:
-            reason_codes.append("missing_citation")
+            if "missing_citation" not in reason_codes:
+                reason_codes.append("missing_citation")
             for normalized in missing_citations:
                 snippet = self._sentence_snippet(seen.get(normalized, normalized))
                 reasons.append(f"Claim '{snippet}' is missing supporting citations.")
 
         if invalid_citations:
-            reason_codes.append("invalid_citation")
+            if "invalid_citation" not in reason_codes:
+                reason_codes.append("invalid_citation")
             for normalized in invalid_citations:
                 snippet = self._sentence_snippet(seen.get(normalized, normalized))
                 reasons.append(f"Claim '{snippet}' cites unavailable evidence.")
 
         if unsupported_claims:
-            reason_codes.append("unsupported_claim")
+            if "unsupported_claim" not in reason_codes:
+                reason_codes.append("unsupported_claim")
             for normalized in unsupported_claims:
                 snippet = self._sentence_snippet(seen.get(normalized, normalized))
                 reasons.append(f"Claim '{snippet}' is not backed by the evidence set.")
 
+        if missing_required_claims:
+            if "missing_claim" not in reason_codes:
+                reason_codes.append("missing_claim")
+            for record in missing_required_claims:
+                text = record.get("text") or record.get("normalized") or ""
+                snippet = self._sentence_snippet(text)
+                reasons.append(f"Claim '{snippet}' is absent from the draft answer.")
+
         used_indexes = self._collect_used_indexes(consolidation, claim_records)
         unused = [index for index in range(1, len(citations) + 1) if index not in used_indexes]
         if unused:
-            reason_codes.append("unused_evidence")
+            if "unused_evidence" not in reason_codes:
+                reason_codes.append("unused_evidence")
             markers = ", ".join(f"[{index}]" for index in unused)
             reasons.append(f"Evidence entries {markers} are not referenced in the answer.")
+
+        total_sentences = sum(len(section.sentences) for section in consolidation.sections)
+        length_cap = self._length_cap(answer_length)
+        if length_cap and total_sentences > length_cap:
+            if "length_exceeded" not in reason_codes:
+                reason_codes.append("length_exceeded")
+            reasons.append(
+                "Draft is too long for the requested length preset; remove redundant sentences."
+            )
 
         metrics = {
             "retrieved_k": len(citations),
@@ -379,6 +407,11 @@ class _AdversarialJudge:
             "citations_total": citations_total,
             "citations_verified_ok": citations_verified_ok,
             "conflict_notes": len(consolidation.conflicts),
+            "expected_claims": len(expected_claims),
+            "covered_claims": len(expected_claims) - len(missing_required_claims),
+            "missing_claims": len(missing_required_claims),
+            "sentence_count": total_sentences,
+            "length_cap": length_cap,
         }
 
         no_claims = not claim_records and not consolidation.conflicts
@@ -389,7 +422,7 @@ class _AdversarialJudge:
             if self._scope_active(scope):
                 scope_reason += "; active filters returned no results"
                 reason_codes.append("overscoped_scope")
-            return _JudgeVerdict("insufficient", [scope_reason], reason_codes, metrics)
+            return _JudgeVerdict("insufficient_evidence", [scope_reason], reason_codes, metrics)
 
         if no_citations:
             scope_reason = "No supporting evidence in current scope"
@@ -397,12 +430,15 @@ class _AdversarialJudge:
             if self._scope_active(scope):
                 scope_reason += "; active filters returned no results"
                 reason_codes.append("overscoped_scope")
-            return _JudgeVerdict("insufficient", [scope_reason], reason_codes, metrics)
+            return _JudgeVerdict("insufficient_evidence", [scope_reason], reason_codes, metrics)
 
         if reasons:
-            return _JudgeVerdict("fail", reasons, reason_codes, metrics)
+            decision = "repair"
+            if "missing_claim" in reason_codes and not missing_citations:
+                decision = "replan"
+            return _JudgeVerdict(decision, reasons, reason_codes, metrics)
 
-        return _JudgeVerdict("approve", [], [], metrics)
+        return _JudgeVerdict("publish", [], [], metrics)
 
     def apply_fixes(
         self,
@@ -512,6 +548,37 @@ class _AdversarialJudge:
         return ledger_map
 
     @staticmethod
+    def _expected_claims(
+        ledger_snapshot: Sequence[dict[str, Any]] | None,
+    ) -> dict[str, dict[str, Any]]:
+        expected: dict[str, dict[str, Any]] = {}
+        if not ledger_snapshot:
+            return expected
+        for entry in ledger_snapshot:
+            normalized = str(entry.get("normalized") or "").strip().lower()
+            if not normalized:
+                continue
+            text_raw = str(entry.get("text") or "").strip()
+            text = ConversationManager._strip_citation_markers(text_raw)
+            citations = []
+            raw_citations = entry.get("citations")
+            if isinstance(raw_citations, Iterable) and not isinstance(
+                raw_citations, (str, bytes)
+            ):
+                for value in raw_citations:
+                    try:
+                        index = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if index > 0:
+                        citations.append(index)
+            expected[normalized] = {
+                "text": text,
+                "citations": citations,
+            }
+        return expected
+
+    @staticmethod
     def _claim_supported(
         normalized: str, indexes: Sequence[int], ledger_map: dict[str, set[int]]
     ) -> bool:
@@ -552,6 +619,16 @@ class _AdversarialJudge:
                         if value > 0:
                             used.add(value)
         return used
+
+    @staticmethod
+    def _length_cap(answer_length: AnswerLength) -> int:
+        if answer_length is AnswerLength.BRIEF:
+            return 6
+        if answer_length is AnswerLength.NORMAL:
+            return 12
+        if answer_length is AnswerLength.DETAILED:
+            return 20
+        return 0
 
     @staticmethod
     def _scope_active(scope: dict[str, Any] | None) -> bool:
@@ -1427,9 +1504,9 @@ class ConversationManager:
                 response_mode=response_mode,
             )
             last_verdict = verdict
-            if verdict.decision == "approve":
+            if verdict.decision == "publish":
                 break
-            if verdict.decision == "insufficient":
+            if verdict.decision == "insufficient_evidence":
                 sanitized = self._judge._sanitize_consolidation_without_citations(
                     original_consolidation
                 )
@@ -1444,6 +1521,9 @@ class ConversationManager:
                     )
                 citations = []
                 mapping_overall = {}
+                revisions = True
+                break
+            if verdict.decision == "replan":
                 revisions = True
                 break
             if cycles >= self._judge.max_cycles:
@@ -1463,7 +1543,7 @@ class ConversationManager:
                 citations = []
                 mapping_overall = {}
                 last_verdict = _JudgeVerdict(
-                    decision="insufficient",
+                    decision="insufficient_evidence",
                     reasons=["No supporting evidence in current scope"],
                     reason_codes=["insufficient_evidence"],
                     metrics=metrics,
@@ -1504,7 +1584,7 @@ class ConversationManager:
 
         if last_verdict is None:
             last_verdict = _JudgeVerdict(
-                decision="approve",
+                decision="publish",
                 reasons=[],
                 reason_codes=[],
                 metrics={
@@ -1533,10 +1613,11 @@ class ConversationManager:
         }
         self._judge_log.append(log_entry)
 
+        final_decision = last_verdict.decision
+        if final_decision not in {"publish", "insufficient_evidence", "replan"}:
+            final_decision = "publish"
         report = JudgeReport(
-            decision="insufficient"
-            if last_verdict.decision == "insufficient"
-            else "approve",
+            decision=final_decision,
             revised=revisions,
             reasons=list(last_verdict.reasons),
             reason_codes=list(last_verdict.reason_codes),

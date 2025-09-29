@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import difflib
 import json
 import re
 import shutil
 import sqlite3
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:
     from app.ingest.parsers import ParsedDocument
 
-SCHEMA_VERSION = 4
+from app.ingest.parsers import DocumentSection
+
+SCHEMA_VERSION = 5
 SCHEMA_FILENAME = "schema.sql"
 
 
@@ -603,8 +606,8 @@ class IngestDocumentRepository(BaseRepository):
                 connection,
                 document_id,
                 normalized_path,
-                parsed.text,
-                normalized_text,
+                parsed,
+                normalized_text=normalized_text,
             )
         return self.get(document_id)  # type: ignore[return-value]
 
@@ -694,7 +697,8 @@ class IngestDocumentRepository(BaseRepository):
                 chunks.text AS chunk_text,
                 chunks.token_count AS token_count,
                 chunks.start_offset AS start_offset,
-                chunks.end_offset AS end_offset
+                chunks.end_offset AS end_offset,
+                chunks.metadata AS metadata
             FROM ingest_document_index
             INNER JOIN ingest_document_chunks AS chunks ON chunks.id = ingest_document_index.rowid
             WHERE ingest_document_index MATCH ?
@@ -715,11 +719,15 @@ class IngestDocumentRepository(BaseRepository):
                 documents[doc_id] = document
 
         results: list[dict[str, Any]] = []
+        normalized_query = (query or "").lower()
+        results: list[dict[str, Any]] = []
         for row in rows:
             doc_id = int(row["document_id"])
             document = documents.get(doc_id)
             if document is None:
                 continue
+            metadata_raw = row["metadata"]
+            chunk_metadata = json.loads(metadata_raw) if metadata_raw else {}
             chunk = {
                 "id": int(row["chunk_id"]),
                 "document_id": doc_id,
@@ -728,17 +736,35 @@ class IngestDocumentRepository(BaseRepository):
                 "token_count": int(row["token_count"]),
                 "start_offset": int(row["start_offset"]),
                 "end_offset": int(row["end_offset"]),
+                "metadata": chunk_metadata,
+            }
+            chunk_metadata.setdefault("bm25", float(row["score"]))
+            hierarchy_weight = float(chunk_metadata.get("hierarchy_weight", 1.0) or 1.0)
+            raw_score = float(row["score"])
+            keyword_score = 1.0 / (1.0 + max(raw_score, 0.0))
+            semantic_score = 0.0
+            chunk_text_lower = (row["chunk_text"] or "").lower()
+            if normalized_query and chunk_text_lower:
+                matcher = difflib.SequenceMatcher(None, normalized_query, chunk_text_lower)
+                semantic_score = matcher.ratio()
+            combined_score = (0.5 * keyword_score + 0.5 * semantic_score) * hierarchy_weight
+            score_breakdown = {
+                "keyword": keyword_score,
+                "semantic": semantic_score,
+                "hierarchy_weight": hierarchy_weight,
             }
             results.append(
                 {
                     "chunk": chunk,
                     "document": document,
                     "highlight": row["snippet"],
-                    "score": float(row["score"]),
+                    "score": combined_score,
+                    "score_breakdown": score_breakdown,
                     "path": document.get("path"),
                 }
             )
-        return results
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return results[:limit]
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -774,10 +800,11 @@ class IngestDocumentRepository(BaseRepository):
         connection: sqlite3.Connection,
         document_id: int,
         path: str,
-        text: str,
+        parsed: "ParsedDocument",
+        *,
         normalized_text: str,
     ) -> None:
-        chunks = self._chunk_document(text, normalized_text=normalized_text)
+        chunks = self._semantic_chunk_document(parsed, normalized_text=normalized_text, path=path)
         connection.execute(
             "DELETE FROM ingest_document_chunks WHERE document_id = ?",
             (document_id,),
@@ -786,9 +813,9 @@ class IngestDocumentRepository(BaseRepository):
             cursor = connection.execute(
                 """
                 INSERT INTO ingest_document_chunks (
-                    document_id, chunk_index, text, token_count, start_offset, end_offset
+                    document_id, chunk_index, text, token_count, start_offset, end_offset, metadata
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     document_id,
@@ -797,6 +824,7 @@ class IngestDocumentRepository(BaseRepository):
                     chunk["token_count"],
                     chunk["start_offset"],
                     chunk["end_offset"],
+                    json.dumps(chunk.get("metadata", {}), ensure_ascii=False),
                 ),
             )
             chunk_id = cursor.lastrowid
@@ -817,75 +845,230 @@ class IngestDocumentRepository(BaseRepository):
                 ),
             )
 
-    def _chunk_document(
-        self, text: str, *, normalized_text: str, max_tokens: int = 200, overlap: int = 40
+    def _semantic_chunk_document(
+        self,
+        parsed: "ParsedDocument",
+        *,
+        normalized_text: str,
+        path: str,
+        min_chars: int = 400,
     ) -> list[dict[str, Any]]:
-        max_tokens = max(1, int(max_tokens))
-        overlap = max(0, min(int(overlap), max_tokens - 1))
-        matches = list(re.finditer(r"\S+", text))
+        sections: list[DocumentSection] = list(parsed.sections or [])
+        if not sections:
+            sections = [
+                DocumentSection(
+                    title=None,
+                    content=parsed.text,
+                    level=None,
+                    page_number=1,
+                    start_offset=0,
+                    end_offset=len(parsed.text),
+                    line_start=1 if parsed.text else None,
+                    line_end=parsed.text.count("\n") + 1 if parsed.text else None,
+                )
+            ]
+
+        section_paths = self._build_section_paths(sections)
+        windows: list[list[int]] = []
+        index = 0
+        total = len(sections)
+        while index < total:
+            section = sections[index]
+            level = section.level if section.level is not None else 6
+            if section.title and level <= 3:
+                next_index = index + 1
+                while next_index < total:
+                    candidate = sections[next_index]
+                    candidate_level = candidate.level if candidate.level is not None else 6
+                    if candidate.title and candidate_level <= level:
+                        break
+                    next_index += 1
+                windows.append(list(range(index, next_index)))
+                index = next_index
+            else:
+                windows.append([index])
+                index += 1
+
+        def window_length(indices: Sequence[int]) -> int:
+            return len(self._render_sections(sections, indices))
+
+        final_windows: list[list[int]] = []
+        buffer: list[int] | None = None
+        for window in windows:
+            if buffer is None:
+                buffer = list(window)
+                continue
+            if window_length(buffer) < min_chars:
+                buffer.extend(window)
+                continue
+            final_windows.append(buffer)
+            buffer = list(window)
+
+        if buffer is not None:
+            if final_windows and window_length(buffer) < min_chars:
+                final_windows[-1].extend(buffer)
+            else:
+                final_windows.append(buffer)
+
+        if not final_windows:
+            final_windows = [[0]]
+
         chunks: list[dict[str, Any]] = []
-        if not matches:
-            trimmed = text.strip()
-            chunk_text = trimmed if trimmed else normalized_text
-            chunks.append(
-                {
-                    "index": 0,
-                    "text": chunk_text,
-                    "token_count": 0,
-                    "start_offset": 0,
-                    "end_offset": len(chunk_text),
-                    "search_text": self._normalize_text(chunk_text),
-                }
-            )
-            return chunks
-
-        step = max_tokens - overlap if max_tokens > overlap else max_tokens
-        start_token = 0
         chunk_index = 0
-        text_length = len(text)
-
-        while start_token < len(matches):
-            end_token = min(start_token + max_tokens, len(matches))
-            start_offset = matches[start_token].start()
-            end_offset = matches[end_token - 1].end() if end_token > start_token else start_offset
-            if end_token >= len(matches):
-                end_offset = text_length
-            chunk_text = text[start_offset:end_offset].strip()
-            if not chunk_text:
-                if chunks:
-                    start_token += step
-                    chunk_index += 1
-                    continue
-                chunk_text = normalized_text
-            search_text = self._normalize_text(chunk_text)
+        for indices in final_windows:
+            chunk_text = self._render_sections(sections, indices)
+            if not chunk_text.strip():
+                continue
+            start_offset = min(
+                (sections[i].start_offset for i in indices if sections[i].start_offset is not None),
+                default=0,
+            )
+            end_offset = max(
+                (sections[i].end_offset for i in indices if sections[i].end_offset is not None),
+                default=start_offset + len(chunk_text),
+            )
+            token_count = len(chunk_text.split())
+            metadata = self._build_chunk_metadata(sections, section_paths, indices, path)
+            metadata.setdefault("token_count", token_count)
+            search_terms = " ".join(metadata.get("section_path", []))
+            search_basis = f"{search_terms} {chunk_text}" if search_terms else chunk_text
             chunks.append(
                 {
                     "index": chunk_index,
                     "text": chunk_text,
-                    "token_count": end_token - start_token,
+                    "token_count": token_count,
                     "start_offset": start_offset,
                     "end_offset": end_offset,
-                    "search_text": search_text,
+                    "search_text": self._normalize_text(search_basis or normalized_text),
+                    "metadata": metadata,
                 }
             )
-            if end_token >= len(matches):
-                break
-            start_token += step
             chunk_index += 1
 
         if not chunks:
-            chunk_text = normalized_text
             chunks.append(
                 {
                     "index": 0,
-                    "text": chunk_text,
-                    "token_count": len(matches),
+                    "text": parsed.text or normalized_text,
+                    "token_count": len((parsed.text or "").split()),
                     "start_offset": 0,
-                    "end_offset": len(chunk_text),
-                    "search_text": self._normalize_text(chunk_text),
+                    "end_offset": len(parsed.text or normalized_text),
+                    "search_text": self._normalize_text(parsed.text or normalized_text),
+                    "metadata": {
+                        "section_path": [],
+                        "sections": [],
+                        "hierarchy_weight": 1.0,
+                        "source_path": path,
+                    },
                 }
             )
         return chunks
+
+    @staticmethod
+    def _build_section_paths(sections: Sequence[DocumentSection]) -> list[list[str]]:
+        paths: list[list[str]] = []
+        stack: list[tuple[int, str]] = []
+        for section in sections:
+            level = section.level if section.level is not None else 6
+            if section.title:
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+                stack.append((level, section.title))
+            paths.append([title for _, title in stack])
+        return paths
+
+    @staticmethod
+    def _render_sections(
+        sections: Sequence[DocumentSection], indices: Sequence[int]
+    ) -> str:
+        parts: list[str] = []
+        for index in indices:
+            section = sections[index]
+            local_parts: list[str] = []
+            if section.title:
+                level = section.level if section.level and section.level > 0 else 1
+                prefix = "#" * min(level, 6)
+                header = f"{prefix} {section.title}" if prefix else section.title
+                local_parts.append(header.strip())
+            if section.content:
+                local_parts.append(section.content.strip("\n"))
+            if local_parts:
+                parts.append("\n".join(local_parts))
+        return "\n\n".join(parts).strip()
+
+    def _build_chunk_metadata(
+        self,
+        sections: Sequence[DocumentSection],
+        section_paths: Sequence[Sequence[str]],
+        indices: Sequence[int],
+        source_path: str,
+    ) -> dict[str, Any]:
+        first_idx = indices[0]
+        path = list(section_paths[first_idx])
+        hierarchy_weight = self._hierarchy_weight(path)
+        page_numbers = [
+            sections[i].page_number for i in indices if sections[i].page_number is not None
+        ]
+        line_start = min(
+            (sections[i].line_start for i in indices if sections[i].line_start is not None),
+            default=None,
+        )
+        line_end = max(
+            (sections[i].line_end for i in indices if sections[i].line_end is not None),
+            default=None,
+        )
+        start_offset = min(
+            (sections[i].start_offset for i in indices if sections[i].start_offset is not None),
+            default=None,
+        )
+        end_offset = max(
+            (sections[i].end_offset for i in indices if sections[i].end_offset is not None),
+            default=None,
+        )
+        section_summaries = [
+            {
+                "index": i,
+                "title": sections[i].title,
+                "level": sections[i].level,
+                "path": list(section_paths[i]),
+                "page": sections[i].page_number,
+                "line_start": sections[i].line_start,
+                "line_end": sections[i].line_end,
+            }
+            for i in indices
+        ]
+        return {
+            "section_path": path,
+            "sections": section_summaries,
+            "hierarchy_weight": hierarchy_weight,
+            "page_range": {
+                "start": min(page_numbers) if page_numbers else None,
+                "end": max(page_numbers) if page_numbers else None,
+            },
+            "position": {
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+                "line_start": line_start,
+                "line_end": line_end,
+            },
+            "source_path": source_path,
+        }
+
+    @staticmethod
+    def _hierarchy_weight(path: Sequence[str]) -> float:
+        if not path:
+            return 1.0
+        title = path[-1].lower()
+        if any(keyword in title for keyword in ("appendix", "annex", "supplement")):
+            base = 0.6
+        elif any(keyword in title for keyword in ("reference", "bibliography")):
+            base = 0.7
+        elif any(keyword in title for keyword in ("abstract", "summary")):
+            base = 0.85
+        else:
+            base = 1.0
+        depth_penalty = min(0.05 * max(len(path) - 1, 0), 0.25)
+        return max(0.4, base - depth_penalty)
 
     @staticmethod
     def _build_preview(text: str, *, limit: int = 320) -> str:

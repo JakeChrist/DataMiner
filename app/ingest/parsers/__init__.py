@@ -27,6 +27,10 @@ class DocumentSection:
     content: str
     level: int | None = None
     page_number: int | None = None
+    start_offset: int | None = None
+    end_offset: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -25,6 +25,18 @@ def parse_text(path: Path) -> ParsedDocument:
             text = raw.decode(encoding, errors="replace")
 
     metadata = {"encoding": encoding}
-    sections = [DocumentSection(title=None, content=text)]
+    line_count = text.count("\n") + 1 if text else 0
+    sections = [
+        DocumentSection(
+            title=None,
+            content=text,
+            level=None,
+            page_number=1,
+            start_offset=0,
+            end_offset=len(text),
+            line_start=1 if line_count else None,
+            line_end=line_count if line_count else None,
+        )
+    ]
     pages = [PageContent(number=1, text=text)]
     return ParsedDocument(text=text, metadata=metadata, sections=sections, pages=pages)

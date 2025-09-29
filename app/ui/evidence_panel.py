@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import html
 from typing import Any, Iterable
 
@@ -559,10 +560,56 @@ class EvidencePanel(QWidget):
 
     def _build_identifier(self, citation: Any, *, fallback: str) -> str:
         if isinstance(citation, dict):
-            for key in ("id", "document_id", "source", "path", "file_path"):
+            passage_id = citation.get("passage_id") or citation.get("chunk_id")
+            if passage_id:
+                text = str(passage_id).strip()
+                if text:
+                    return text
+
+            doc_value: str | None = None
+            for key in ("document_id", "id", "source", "title", "document", "path", "file_path"):
                 value = citation.get(key)
-                if value:
-                    return str(value)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    doc_value = text
+                    break
+
+            location_value: str | None = None
+            for key in ("passage", "page", "page_number", "section", "heading", "locator"):
+                value = citation.get(key)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    location_value = text
+                    break
+
+            components: list[str] = []
+            if doc_value:
+                components.append(doc_value)
+            if location_value:
+                components.append(location_value)
+            if len(components) >= 2:
+                return "::".join(components)
+
+            snippet_candidate = (
+                citation.get("snippet")
+                or citation.get("highlight")
+                or citation.get("preview")
+                or citation.get("text")
+            )
+            snippet_text = str(snippet_candidate).strip() if snippet_candidate is not None else ""
+            if snippet_text:
+                digest = hashlib.sha1(snippet_text.encode("utf-8", "ignore")).hexdigest()[:12]
+                if components:
+                    return f"{components[0]}::{digest}"
+                return digest
+
+            if components:
+                return components[0]
+
         if isinstance(citation, str) and citation.strip():
             return citation.strip()
         return fallback

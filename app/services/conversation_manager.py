@@ -2225,9 +2225,13 @@ class ConversationManager:
         preset: AnswerLength,
     ) -> ConversationTurn:
         artifacts = self._parse_reasoning_artifacts(response.reasoning)
+        answer = self._ensure_answer_citation_markers(
+            response.content, response.citations
+        )
+
         turn = ConversationTurn(
             question=question,
-            answer=response.content,
+            answer=answer,
             citations=response.citations,
             reasoning=response.reasoning,
             reasoning_artifacts=artifacts,
@@ -2238,6 +2242,31 @@ class ConversationManager:
         )
         self.turns.append(turn)
         return turn
+
+    @staticmethod
+    def _ensure_answer_citation_markers(
+        answer: str, citations: Sequence[Any]
+    ) -> str:
+        """Ensure single-shot answers reference returned citations."""
+
+        if not answer or not citations:
+            return answer
+
+        if ConversationManager._CITATION_PATTERN.search(answer):
+            return answer
+
+        markers = " ".join(f"[{index}]" for index in range(1, len(citations) + 1))
+        if not markers:
+            return answer
+
+        trimmed = answer.rstrip()
+        if trimmed and trimmed[-1] not in ".!?":
+            trimmed = f"{trimmed}."
+
+        if not trimmed:
+            return markers
+
+        return f"{trimmed} {markers}".strip()
 
     @staticmethod
     def _build_request_options(

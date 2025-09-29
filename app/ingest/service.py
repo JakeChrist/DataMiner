@@ -431,13 +431,32 @@ class IngestService:
                 "error": f"Missing file: {path}",
             }
 
-        stat = path.stat()
+        normalized_path = self._normalize_path(path)
+
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            return {
+                "status": "failed",
+                "metadata": {"path": normalized_path},
+                "error": f"Unable to access file metadata: {exc}",
+            }
+
         metadata = {
-            "path": self._normalize_path(path),
+            "path": normalized_path,
             "mtime": stat.st_mtime,
             "size": stat.st_size,
-            "checksum": self._hash_file(path),
         }
+
+        try:
+            metadata["checksum"] = self._hash_file(path)
+        except OSError as exc:
+            metadata["hash_error"] = str(exc)
+            return {
+                "status": "failed",
+                "metadata": metadata,
+                "error": f"Unable to read file contents: {exc}",
+            }
 
         if job.job_type == "rescan":
             previous = job.state.get("known_files_snapshot", {}).get(metadata["path"])
@@ -469,15 +488,23 @@ class IngestService:
                 "checksum": metadata["checksum"],
             }
         }
-        record = self.documents.store_version(
-            path=metadata["path"],
-            checksum=metadata["checksum"],
-            size=stat.st_size,
-            mtime=stat.st_mtime,
-            ctime=stat.st_ctime,
-            parsed=parsed,
-            base_metadata=base_metadata,
-        )
+        try:
+            record = self.documents.store_version(
+                path=metadata["path"],
+                checksum=metadata["checksum"],
+                size=stat.st_size,
+                mtime=stat.st_mtime,
+                ctime=stat.st_ctime,
+                parsed=parsed,
+                base_metadata=base_metadata,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            metadata["storage_error"] = str(exc)
+            return {
+                "status": "failed",
+                "metadata": metadata,
+                "error": str(exc),
+            }
         metadata["document_id"] = record.get("id")
         metadata["version"] = record.get("version")
         metadata["preview"] = record.get("preview")

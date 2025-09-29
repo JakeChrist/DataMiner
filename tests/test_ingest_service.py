@@ -182,6 +182,40 @@ def test_rescan_detects_changes_and_removals(tmp_path: Path, db_manager: Databas
     service.shutdown()
 
 
+def test_folder_crawl_handles_unreadable_files(
+    tmp_path: Path, db_manager: DatabaseManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "restricted"
+    root.mkdir()
+    unreadable = root / "secret.txt"
+    unreadable.write_text("top secret", encoding="utf-8")
+
+    def fake_hash(_path: Path) -> str:
+        raise OSError("denied")
+
+    monkeypatch.setattr(
+        IngestService,
+        "_hash_file",
+        staticmethod(fake_hash),
+    )
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    job_id = service.queue_folder_crawl(None, root, include=["*.txt"])
+    assert service.wait_for_completion(job_id, timeout=5.0)
+
+    record = service.repo.get(job_id)
+    assert record is not None
+    assert record["status"] == TaskStatus.COMPLETED
+    summary = record["extra_data"]["summary"]
+    assert summary["success_count"] == 0
+    assert summary["failure_count"] == 1
+    assert summary["known_files"] == {}
+    errors = record["extra_data"].get("errors", [])
+    assert any("Unable to read" in str(error) for error in errors)
+
+    service.shutdown()
+
+
 def test_pause_and_resume_persists_progress(tmp_path: Path, db_manager: DatabaseManager) -> None:
     root = tmp_path / "pause"
     root.mkdir()

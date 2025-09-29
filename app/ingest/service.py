@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import queue
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, TypeVar
 
 from app.ingest.parsers import ParserError, parse_file
 from app.storage import (
     BackgroundTaskLogRepository,
+    DatabaseError,
     DatabaseManager,
     DocumentRepository,
     IngestDocumentRepository,
@@ -21,6 +24,10 @@ from app.storage import (
 
 
 TaskCallback = Callable[[int, dict[str, Any]], None]
+T = TypeVar("T")
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class TaskStatus:
@@ -680,47 +687,58 @@ class IngestService:
             return
 
         repo = self.project_documents
+        connection = repo.db.connect()
         try:
-            connection = repo.db.connect()
             project_exists = connection.execute(
                 "SELECT 1 FROM projects WHERE id = ?",
                 (project_id,),
             ).fetchone()
-            if project_exists is None:
-                return
-            existing_docs = {
-                str(Path(doc["source_path"]).resolve()): doc
-                for doc in repo.list_for_project(project_id)
-                if doc.get("source_path")
-            }
-        except Exception:  # pragma: no cover - defensive
+        except sqlite3.DatabaseError as exc:  # pragma: no cover - defensive
+            raise RuntimeError("Unable to query project metadata") from exc
+
+        if project_exists is None:
             return
+
+        def _load_existing() -> dict[str, dict[str, Any]]:
+            entries = repo.list_for_project(project_id)
+            mapping: dict[str, dict[str, Any]] = {}
+            for doc in entries:
+                source_path = doc.get("source_path")
+                if not source_path:
+                    continue
+                mapping[str(Path(source_path).resolve())] = doc
+            return mapping
+
+        existing_docs = self._execute_with_retry(_load_existing)
 
         known_files_param = job.summary.get("known_files", {})
         if not isinstance(known_files_param, dict):
             known_files_param = {}
 
-        normalized_known: dict[str, dict[str, Any]] = {}
         for path, metadata in known_files_param.items():
             if not isinstance(path, str):
                 continue
             normalized_path = str(Path(path).resolve())
             data = dict(metadata) if isinstance(metadata, dict) else {}
-            normalized_known[normalized_path] = data
             document = existing_docs.get(normalized_path)
             payload = {"file": data}
             if document is None:
                 title = Path(normalized_path).stem or Path(normalized_path).name
-                try:
-                    repo.create(
+
+                def _create() -> dict[str, Any]:
+                    created = repo.create(
                         project_id,
                         title,
                         source_type="file",
                         source_path=normalized_path,
                         metadata=payload,
                     )
-                except Exception:  # pragma: no cover - defensive
-                    continue
+                    return created
+
+                created = self._execute_with_retry(_create)
+                if created and created.get("source_path"):
+                    key = str(Path(created["source_path"]).resolve())
+                    existing_docs[key] = created
             else:
                 updates: dict[str, Any] = {}
                 if document.get("source_path") != normalized_path:
@@ -729,10 +747,20 @@ class IngestService:
                 if current_meta.get("file") != data:
                     updates["metadata"] = payload
                 if updates:
-                    try:
-                        repo.update(document["id"], **updates)
-                    except Exception:  # pragma: no cover - defensive
-                        continue
+
+                    def _update() -> dict[str, Any] | None:
+                        return repo.update(document["id"], **updates)
+
+                    updated = self._execute_with_retry(_update)
+                    if updated is None:
+
+                        def _reload() -> dict[str, Any] | None:
+                            return repo.get(document["id"])
+
+                        updated = self._execute_with_retry(_reload)
+                    if updated and updated.get("source_path"):
+                        key = str(Path(updated["source_path"]).resolve())
+                        existing_docs[key] = updated
 
         removed_paths: set[str] = set()
         removed = job.summary.get("removed")
@@ -743,16 +771,41 @@ class IngestService:
                 removed_paths.add(str(Path(entry).resolve()))
 
         if removed_paths:
-            for document in repo.list_for_project(project_id):
-                source_path = document.get("source_path")
-                if not source_path:
+            for path, document in list(existing_docs.items()):
+                if path not in removed_paths:
                     continue
-                normalized = str(Path(source_path).resolve())
-                if normalized in removed_paths:
-                    try:
-                        repo.delete(document["id"])
-                    except Exception:  # pragma: no cover - defensive
-                        continue
+
+                def _delete(doc_id: int = document["id"]) -> None:
+                    repo.delete(doc_id)
+
+                self._execute_with_retry(_delete)
+                existing_docs.pop(path, None)
+
+    def _execute_with_retry(
+        self,
+        func: Callable[[], T],
+        *,
+        attempts: int = 5,
+        delay: float = 0.2,
+    ) -> T:
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return func()
+            except (sqlite3.OperationalError, DatabaseError) as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                last_exc = exc
+                LOGGER.warning(
+                    "Database locked while syncing project documents (attempt %s/%s)",
+                    attempt,
+                    attempts,
+                )
+                time.sleep(delay * attempt)
+        raise RuntimeError(
+            "Unable to sync project documents due to persistent database locks"
+        ) from last_exc
 
     @staticmethod
     def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:

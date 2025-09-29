@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services import ChatMessage, ConversationManager, StepContextBatch
+from app.services import ChatMessage, ConversationManager, PlanItem, StepContextBatch
 
 
 class StubLMStudioClient:
@@ -65,17 +65,15 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
         context_provider=provider,
     )
 
-    assert len(client.requests) == 4
-    assert len(turn.step_results) == 4
-    assert [item.status for item in turn.plan] == ["done"] * 4
+    assert len(client.requests) == 3
+    assert len(turn.step_results) == 3
+    assert [item.status for item in turn.plan] == ["done"] * 3
     assert turn.plan[0].description.startswith(
-        "Input: Corpus context → Action: Identify background references on"
+        "Input: Corpus context → Action: Collect background references on"
     )
-    assert turn.plan[-1].description.startswith(
-        ("Input: Findings from steps", "Input: Findings from step")
-    )
-    assert turn.answer == "Context & Background: Finding. [1][2][3][4]"
-    assert len(turn.citations) == 4
+    assert "document citations" in turn.plan[-1].description.lower()
+    assert turn.answer.startswith("Context & Background:")
+    assert len(turn.citations) == 3
     assert turn.citations[0].get("steps") == [1]
     assert "Context & Background" in turn.citations[0].get("tag_names", [])
     assert turn.step_results[0].citation_indexes == [1]
@@ -83,8 +81,8 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert turn.reasoning.get("final_sections") == [
         {
             "title": "Context & Background",
-            "sentences": ["Finding. [1][2][3][4]"],
-            "citations": [1, 2, 3, 4],
+            "sentences": ["Finding. [1][2][3]"],
+            "citations": [1, 2, 3],
         }
     ]
     assert not turn.reasoning.get("conflicts")
@@ -112,8 +110,40 @@ def test_dynamic_plan_notes_missing_citations() -> None:
         context_provider=provider,
     )
 
-    assert len(turn.step_results) == 4
+    assert len(turn.step_results) == 3
     assert turn.reasoning_artifacts is not None
     assert any("No direct evidence" in text for text in turn.reasoning_artifacts.assumptions)
     assert all(result.citation_indexes for result in turn.step_results)
     assert all(turn.citations)
+
+
+def test_plan_critic_rejects_meta_steps() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+    critic = manager._plan_critic
+
+    plan = [
+        PlanItem(
+            description=(
+                "Input: Corpus context → Action: Write final answer → Output: Paragraph response"
+            )
+        )
+    ]
+
+    approved, reasons = critic.review(plan)
+
+    assert not approved
+    assert any("banned" in reason.lower() or "unsupported" in reason.lower() for reason in reasons)
+
+
+def test_generate_plan_produces_atomic_steps() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+
+    plan = manager._generate_plan("Explain the derivation of the path integral.")
+
+    assert plan
+    for item in plan:
+        assert " → " in item.description
+        assert "explain" not in item.description.lower()
+        assert "write" not in item.description.lower()

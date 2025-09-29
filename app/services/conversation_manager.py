@@ -988,6 +988,117 @@ class DynamicPlanningError(RuntimeError):
     """Raised when dynamic planning cannot be completed."""
 
 
+class _PlanCritic:
+    """Reject plan steps that are vague, overlapping, or non-executable."""
+
+    _STEP_PATTERN = re.compile(
+        r"^Input: (?P<input>.+?) → Action: (?P<action>.+?) → Output: (?P<output>.+)$"
+    )
+    _APPROVED_VERBS = {
+        "analyze",
+        "assess",
+        "check",
+        "collect",
+        "compare",
+        "determine",
+        "evaluate",
+        "extract",
+        "gather",
+        "identify",
+        "list",
+        "map",
+        "profile",
+        "trace",
+        "verify",
+    }
+    _BANNED_TOKENS = {
+        "answer",
+        "compose",
+        "explain",
+        "execute",
+        "final",
+        "plan",
+        "respond",
+        "solution",
+        "summarize",
+        "synthesize",
+        "write",
+    }
+    _ARTIFACT_KEYWORDS = {
+        "list",
+        "table",
+        "matrix",
+        "map",
+        "note",
+        "profile",
+        "summary",
+        "timeline",
+        "catalog",
+        "finding",
+    }
+    _EVIDENCE_KEYWORDS = {"citation", "source", "document", "evidence", "snippet"}
+
+    def ensure(self, plan: Sequence[PlanItem]) -> None:
+        approved, reasons = self.review(plan)
+        if not approved:
+            reason_text = ", ".join(reasons)
+            raise DynamicPlanningError(f"Plan critic rejection: {reason_text}")
+
+    def review(self, plan: Sequence[PlanItem]) -> tuple[bool, list[str]]:
+        issues: list[str] = []
+        if not plan:
+            return False, ["Plan is empty"]
+
+        seen_artifacts: set[str] = set()
+
+        for index, item in enumerate(plan, start=1):
+            description = (item.description or "").strip()
+            match = self._STEP_PATTERN.match(description)
+            if not match:
+                issues.append(
+                    f"Step {index} is not structured as 'Input → Action → Output'."
+                )
+                continue
+
+            action = match.group("action").strip()
+            output = match.group("output").strip()
+            verb, _, remainder = action.partition(" ")
+            verb_lower = verb.lower()
+            remainder_lower = remainder.strip().lower()
+
+            if verb_lower not in self._APPROVED_VERBS:
+                issues.append(
+                    f"Step {index} uses unsupported action verb '{verb_lower}'."
+                )
+
+            lowered_action = action.lower()
+            if any(token in lowered_action for token in self._BANNED_TOKENS):
+                issues.append(f"Step {index} contains banned meta language.")
+
+            if " and " in remainder_lower or ";" in remainder_lower:
+                issues.append(f"Step {index} bundles multiple actions.")
+
+            if not remainder_lower:
+                issues.append(f"Step {index} is missing a concrete target.")
+
+            artifact_key = remainder_lower or lowered_action
+            if artifact_key in seen_artifacts:
+                issues.append(f"Step {index} duplicates an earlier artifact.")
+            else:
+                seen_artifacts.add(artifact_key)
+
+            normalized_output = output.lower()
+            if not any(keyword in normalized_output for keyword in self._ARTIFACT_KEYWORDS):
+                issues.append(f"Step {index} output lacks a concrete artifact description.")
+
+            if not any(keyword in normalized_output for keyword in self._EVIDENCE_KEYWORDS):
+                issues.append(
+                    f"Step {index} output does not specify how evidence or citations will be recorded."
+                )
+
+        return len(issues) == 0, issues
+
+
 class ConversationManager:
     """Track conversation history and orchestrate LMStudio requests."""
 
@@ -1007,6 +1118,7 @@ class ConversationManager:
         self._listeners: list[Callable[[ConnectionState], None]] = []
         self._ledger = _EvidenceLedger()
         self._judge = _AdversarialJudge()
+        self._plan_critic = _PlanCritic()
         self._judge_log: deque[dict[str, Any]] = deque(maxlen=50)
 
     def add_connection_listener(
@@ -1626,45 +1738,139 @@ class ConversationManager:
             plan.append(
                 self._build_structured_plan_item(
                     input_hint="Corpus context",
-                    action=f"Identify background references on {keyword_text}",
-                    output_hint="List background notes paired with source document and location details",
+                    action=self._compose_action("collect", f"background references on {keyword_text}"),
+                    output_hint="Background reference list (up to 5 entries) with source titles and citation-ready locations",
                 )
             )
 
         for action in actions:
-            formatted = self._format_plan_action(action)
-            if not formatted:
+            normalized_action = self._normalize_plan_action(action)
+            if normalized_action is None:
                 continue
-            input_hint = "Relevant corpus snippets and prior findings"
-            if not plan:
-                input_hint = "Corpus context"
+            verb, target = normalized_action
+            input_hint = "Corpus context" if not plan else "Targeted corpus snippets for this step"
             plan.append(
                 self._build_structured_plan_item(
                     input_hint=input_hint,
-                    action=f"{formatted} using the provided evidence",
-                    output_hint="Specific finding noting which document snippets support the conclusion",
+                    action=self._compose_action(verb, target),
+                    output_hint=self._describe_output_artifact(verb, target),
                 )
             )
 
-        previous_steps = len(plan)
-        plan.append(
-            self._build_structured_plan_item(
-                input_hint=(
-                    "Findings from "
-                    + ("steps 1-" + str(previous_steps) if previous_steps > 1 else "step 1" if previous_steps == 1 else "gathered evidence")
-                ),
-                action=f"Synthesize an answer for '{normalized}'",
-                output_hint="Cohesive response organized by theme with consolidated citations and conflict checks",
-            )
-        )
-
         if len(plan) > 8:
-            trimmed = plan[:7] + [plan[-1]]
-        else:
-            trimmed = list(plan)
-        if not trimmed:
-            trimmed = [PlanItem(description=normalized, status="queued")]
-        return trimmed
+            plan = plan[:8]
+        if not plan:
+            plan = [PlanItem(description=normalized, status="queued")]
+
+        self._plan_critic.ensure(plan)
+        return plan
+
+    @staticmethod
+    def _compose_action(verb: str, target: str) -> str:
+        cleaned_target = re.sub(r"\s+", " ", target).strip().rstrip("?.!")
+        if not cleaned_target:
+            return verb.capitalize()
+        return f"{verb.capitalize()} {cleaned_target}"
+
+    def _normalize_plan_action(self, action: str) -> tuple[str, str] | None:
+        text = action.strip()
+        if not text:
+            return None
+
+        text = re.sub(
+            r"^(?:please|kindly|could you|would you|let's|lets|we need to|need to|i need to|i want to|should)\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not text:
+            return None
+
+        words = text.split()
+        if not words:
+            return None
+
+        verb_raw = words[0].lower()
+        remainder_words = words[1:]
+
+        verb = self._canonicalize_action_verb(verb_raw)
+        if verb is None:
+            verb = "identify"
+            remainder_words = words[1:] if len(words) > 1 else []
+
+        target = " ".join(remainder_words).strip()
+        target = self._clean_action_target(target)
+        if not target:
+            return None
+        return verb, target
+
+    _PLAN_VERB_SYNONYMS = {
+        "analyze": "analyze",
+        "assess": "assess",
+        "audit": "evaluate",
+        "categorize": "map",
+        "check": "check",
+        "collect": "collect",
+        "compare": "compare",
+        "compile": "collect",
+        "contrast": "compare",
+        "determine": "determine",
+        "develop": "determine",
+        "document": "list",
+        "explain": "identify",
+        "evaluate": "evaluate",
+        "examine": "analyze",
+        "extract": "extract",
+        "gather": "gather",
+        "highlight": "identify",
+        "identify": "identify",
+        "investigate": "collect",
+        "list": "list",
+        "map": "map",
+        "outline": "identify",
+        "profile": "profile",
+        "recommend": "determine",
+        "research": "collect",
+        "review": "gather",
+        "study": "analyze",
+        "summarize": "identify",
+        "trace": "trace",
+        "verify": "verify",
+    }
+
+    def _canonicalize_action_verb(self, verb: str) -> str | None:
+        canonical = self._PLAN_VERB_SYNONYMS.get(verb)
+        if canonical in _PlanCritic._APPROVED_VERBS:
+            return canonical
+        return None
+
+    @staticmethod
+    def _clean_action_target(target: str) -> str:
+        cleaned = re.sub(r"\s+", " ", target or "").strip()
+        cleaned = cleaned.strip(" ,;:-")
+        cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+        return cleaned
+
+    def _describe_output_artifact(self, verb: str, target: str) -> str:
+        normalized_target = re.sub(r"\s+", " ", target).strip()
+        lower_target = normalized_target.lower()
+        if verb in {"compare", "analyze", "evaluate", "assess"}:
+            return (
+                f"Comparison table for {normalized_target} with cited source snippets"
+            )
+        if verb in {"check", "determine", "verify"}:
+            return (
+                f"Verification note on {normalized_target} referencing supporting evidence"
+            )
+        if verb in {"map", "trace"}:
+            return (
+                f"Mapping of {normalized_target} paired with citation references"
+            )
+        if verb == "profile":
+            return f"Profile of {normalized_target} annotated with source citations"
+        if verb == "list" and "timeline" in lower_target:
+            return f"Timeline list covering {normalized_target} with citation references"
+        return f"Bullet list of {normalized_target} with document citations"
 
     def _split_question_into_actions(self, question: str) -> list[str]:
         """Break a question into granular, executable action strings."""
@@ -1730,34 +1936,18 @@ class ConversationManager:
         seen: set[str] = set()
         for token in tokens:
             lower = token.lower()
-            if lower in self._PLAN_STOPWORDS or lower in seen:
+            if (
+                lower in self._PLAN_STOPWORDS
+                or lower in _PlanCritic._APPROVED_VERBS
+                or lower in self._PLAN_VERB_SYNONYMS
+                or lower in seen
+            ):
                 continue
             seen.add(lower)
             keywords.append(token)
             if len(keywords) >= 3:
                 break
         return keywords
-
-    @classmethod
-    def _format_plan_action(cls, action: str) -> str:
-        text = action.strip()
-        if not text:
-            return ""
-
-        text = re.sub(
-            r"^(?:please|kindly|could you|would you|let's|lets|we need to|need to|i need to|i want to|should)\s+",
-            "",
-            text,
-            flags=re.IGNORECASE,
-        )
-        text = text.strip()
-        if not text:
-            return ""
-        if not text[0].isupper():
-            text = text[0].upper() + text[1:]
-        if not text.lower().startswith(tuple(cls._PLAN_ACTION_STARTERS)):
-            text = f"Investigate {text}" if not text.lower().startswith("investigate") else text
-        return text.rstrip("?.! ")
 
     @staticmethod
     def _build_structured_plan_item(

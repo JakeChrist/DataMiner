@@ -422,3 +422,24 @@ def test_project_document_sync_failure_marks_job_failed(
     finally:
         service.shutdown()
 
+
+def test_project_document_sync_accepts_string_project_id(
+    tmp_path: Path, db_manager: DatabaseManager
+) -> None:
+    project = ProjectRepository(db_manager).create("String Project")
+    sample = tmp_path / "doc.txt"
+    sample.write_text("content", encoding="utf-8")
+
+    service = IngestService(db_manager, worker_idle_sleep=0.01)
+    try:
+        project_id = project["id"]
+        job_id = service.queue_file_add(str(project_id), [sample])  # type: ignore[arg-type]
+        assert service.wait_for_completion(job_id, timeout=5.0)
+        record = service.repo.get(job_id)
+        assert record is not None
+        assert record["status"] == TaskStatus.COMPLETED
+        documents = DocumentRepository(db_manager).list_for_project(int(project_id))
+        assert any(doc.get("source_path") == str(sample.resolve()) for doc in documents)
+    finally:
+        service.shutdown()
+

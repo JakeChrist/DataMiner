@@ -7,6 +7,7 @@ import queue
 from datetime import datetime
 from functools import partial
 from importlib import metadata
+from numbers import Integral
 from pathlib import Path
 import threading
 from typing import Any, Callable, Iterable
@@ -73,6 +74,30 @@ from .question_input_widget import QuestionInputWidget
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _coerce_project_id(value: Any) -> int | None:
+    """Convert ``value`` into an integer project identifier when possible."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            return int(cleaned)
+        except ValueError:
+            return None
+    return None
 
 
 class ToastWidget(QFrame):
@@ -693,8 +718,8 @@ class MainWindow(QMainWindow):
         self._load_project_session(project.id)
 
     def _on_project_combo_changed(self, index: int) -> None:
-        project_id = self._project_combo.itemData(index)
-        if not isinstance(project_id, int):
+        project_id = _coerce_project_id(self._project_combo.itemData(index))
+        if project_id is None:
             return
         if project_id == self.project_service.active_project_id:
             return
@@ -942,9 +967,10 @@ class MainWindow(QMainWindow):
         root: str | None = None,
     ) -> None:
         task_id = f"ingest-{job_id}"
+        normalized_project_id = _coerce_project_id(project_id)
         self._ingest_jobs[job_id] = {
             "task_id": task_id,
-            "project_id": project_id,
+            "project_id": normalized_project_id,
             "description": description,
             "root": root,
         }
@@ -1007,8 +1033,8 @@ class MainWindow(QMainWindow):
         self._ingest_jobs.pop(job_id, None)
 
     def _apply_ingest_results(self, job_info: dict[str, Any], payload: dict[str, Any]) -> None:
-        project_id = job_info.get("project_id")
-        if not isinstance(project_id, int):
+        project_id = _coerce_project_id(job_info.get("project_id"))
+        if project_id is None:
             return
         summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
         known_files = summary.get("known_files", {}) if isinstance(summary, dict) else {}

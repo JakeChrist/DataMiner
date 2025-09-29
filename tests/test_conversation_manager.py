@@ -306,6 +306,42 @@ def test_adversarial_judge_requires_claim_coverage():
     assert "missing_claim" in verdict.reason_codes
 
 
+def test_insufficient_step_result_is_ignored_in_final_answer():
+    step_results = [
+        StepResult(
+            index=1,
+            description="Evidence scan",
+            answer="INSUFFICIENT_EVIDENCE: No snippets matched.",
+            insufficient=True,
+        ),
+        StepResult(
+            index=2,
+            description="Key metric",
+            answer="Metric X increased in 2023. [1]",
+            citation_indexes=[1],
+        ),
+    ]
+
+    final_answer = ConversationManager._compose_final_answer(step_results)
+
+    assert "INSUFFICIENT_EVIDENCE" not in final_answer.text
+    assert final_answer.sections[0].sentences == ["Metric X increased in 2023. [1]"]
+
+
+def test_ledger_skips_insufficient_step_results():
+    ledger = _EvidenceLedger()
+    result = StepResult(
+        index=1,
+        description="Evidence scan",
+        answer="INSUFFICIENT_EVIDENCE: Nothing found.",
+        insufficient=True,
+    )
+
+    ledger.record_step(turn_id=1, result=result)
+
+    assert ledger.snapshot_for_turn(1) == []
+
+
 class _NoMarkerClient:
     def health_check(self) -> bool:
         return True

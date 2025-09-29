@@ -228,16 +228,27 @@ class IngestService:
 
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
-            job = self._jobs.get(job_id)
-            if job and job.status in TaskStatus.FINAL:
-                return True
             record = self.repo.get(job_id)
-            if record is None:
-                return False
-            if record["status"] in TaskStatus.FINAL:
+            if record is not None and record["status"] in TaskStatus.FINAL:
+                job = self._jobs.get(job_id)
                 if job is not None:
                     job.status = record["status"]
                 return True
+
+            job = self._jobs.get(job_id)
+            if job and job.status in TaskStatus.FINAL:
+                # The worker has finished but the persistence thread may not have
+                # written the final status to the database yet. Wait briefly for
+                # the record to reach a terminal state so callers observe
+                # consistent results.
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
+                continue
+
+            if record is None and job is None:
+                return False
+
             if deadline is not None and time.monotonic() >= deadline:
                 return False
             time.sleep(0.05)

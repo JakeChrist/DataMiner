@@ -198,6 +198,10 @@ def test_ingest_chunk_storage(
     assert record is not None
     chunk_results = ingest_repo.search_chunks("gamma", limit=5)
     assert chunk_results
+    first_chunk = chunk_results[0]["chunk"]
+    assert "metadata" in first_chunk
+    assert "hierarchy_weight" in first_chunk["metadata"]
+    assert "score_breakdown" in chunk_results[0]
     texts = [entry["chunk"]["text"] for entry in chunk_results if entry.get("chunk")]
     assert any("gamma" in text for text in texts)
     count = ingest_repo.db.connect().execute(

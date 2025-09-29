@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+import difflib
 import copy
 import html
 import json
@@ -224,6 +225,8 @@ class _Claim:
     section: str
     steps: list[int]
     has_negation: bool
+    tokens: set[str] = field(default_factory=set)
+    numbers: set[str] = field(default_factory=set)
 
 
 class DynamicPlanningError(RuntimeError):
@@ -428,6 +431,44 @@ class ConversationManager:
         r"\b(?:and then|and|then|after that|next|finally)\b",
         flags=re.IGNORECASE,
     )
+
+    _CLAIM_STOPWORDS = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "because",
+        "but",
+        "by",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "their",
+        "there",
+        "this",
+        "to",
+        "was",
+        "were",
+        "which",
+        "with",
+    }
+
+    _WORD_PATTERN = re.compile(r"[A-Za-z0-9%$€£¥]+")
+    _NUMBER_PATTERN = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?%?")
 
     def _ask_with_plan(
         self,
@@ -957,6 +998,80 @@ class ConversationManager:
         return compact
 
     @staticmethod
+    def _claim_tokens(text: str) -> set[str]:
+        tokens: set[str] = set()
+        for match in ConversationManager._WORD_PATTERN.findall(text.lower()):
+            token = match.strip()
+            if not token or token in ConversationManager._CLAIM_STOPWORDS:
+                continue
+            tokens.add(token)
+        return tokens
+
+    @staticmethod
+    def _extract_numbers(text: str) -> set[str]:
+        numbers: set[str] = set()
+        for match in ConversationManager._NUMBER_PATTERN.findall(text):
+            cleaned = match.strip()
+            if not cleaned:
+                continue
+            normalized = cleaned.replace(",", "")
+            numbers.add(normalized)
+        return numbers
+
+    @staticmethod
+    def _claims_redundant(primary: _Claim, candidate: _Claim) -> bool:
+        if not candidate.tokens:
+            return False
+        shared = primary.tokens & candidate.tokens
+        if not shared:
+            return False
+        candidate_size = max(len(candidate.tokens), 1)
+        coverage = len(shared) / candidate_size
+        union = primary.tokens | candidate.tokens
+        jaccard = len(shared) / max(len(union), 1)
+        if candidate.tokens <= primary.tokens and candidate.numbers <= primary.numbers:
+            return True
+        if coverage >= 0.85 and candidate.numbers <= primary.numbers:
+            return True
+        if jaccard >= 0.9 and candidate.numbers <= primary.numbers:
+            return True
+        ratio = difflib.SequenceMatcher(
+            None, primary.normalized, candidate.normalized
+        ).ratio()
+        if ratio >= 0.92 and candidate.numbers <= primary.numbers:
+            return True
+        return False
+
+    @staticmethod
+    def _filter_redundant_claims(claims: Sequence[_Claim]) -> list[_Claim]:
+        filtered: list[_Claim] = []
+        for claim in claims:
+            merged = False
+            for existing in filtered:
+                if ConversationManager._claims_redundant(existing, claim):
+                    existing.citations.update(claim.citations)
+                    existing.steps.extend(claim.steps)
+                    existing.tokens.update(claim.tokens)
+                    existing.numbers.update(claim.numbers)
+                    existing.steps = sorted(set(existing.steps))
+                    merged = True
+                    break
+                if ConversationManager._claims_redundant(claim, existing):
+                    existing.text = claim.text
+                    existing.normalized = claim.normalized
+                    existing.has_negation = claim.has_negation
+                    existing.citations.update(claim.citations)
+                    existing.steps.extend(claim.steps)
+                    existing.tokens.update(claim.tokens)
+                    existing.numbers.update(claim.numbers)
+                    existing.steps = sorted(set(existing.steps))
+                    merged = True
+                    break
+            if not merged:
+                filtered.append(claim)
+        return filtered
+
+    @staticmethod
     def _categorize_claim(description: str, answer_text: str) -> str:
         lookup = [
             ("Context & Background", ("background", "context", "overview", "history", "landscape", "scan")),
@@ -1069,11 +1184,15 @@ class ConversationManager:
 
             section = ConversationManager._categorize_claim(result.description, polished_text)
             has_negation = ConversationManager._has_negation(polished_text)
+            tokens = ConversationManager._claim_tokens(polished_text)
+            numbers = ConversationManager._extract_numbers(polished_text)
 
             if normalized in seen_by_normalized:
                 claim = seen_by_normalized[normalized]
                 claim.citations.update(citation_indexes)
                 claim.steps.append(result.index)
+                claim.tokens.update(tokens)
+                claim.numbers.update(numbers)
             else:
                 claim = _Claim(
                     text=polished_text,
@@ -1082,6 +1201,8 @@ class ConversationManager:
                     section=section,
                     steps=[result.index],
                     has_negation=has_negation,
+                    tokens=set(tokens),
+                    numbers=set(numbers),
                 )
                 seen_by_normalized[normalized] = claim
                 section_claims.setdefault(section, []).append(claim)
@@ -1099,9 +1220,10 @@ class ConversationManager:
             if not claims:
                 continue
             claims.sort(key=lambda claim: min(claim.steps))
+            filtered_claims = ConversationManager._filter_redundant_claims(claims)
             sentences: list[str] = []
             section_citations: set[int] = set()
-            for claim in claims:
+            for claim in filtered_claims:
                 sentence = ConversationManager._format_sentence(claim.text, claim.citations)
                 if not sentence:
                     continue
@@ -1155,23 +1277,23 @@ class ConversationManager:
             if body:
                 sections_text.append(f"{section.title}: {body}")
 
-        conflict_text: list[str] = []
-        for note in conflict_notes:
-            pieces: list[str] = []
-            for variant in note.variants:
-                text = variant["text"].strip()
-                markers = "".join(f"[{index}]" for index in variant["citations"])
-                cleaned = text.rstrip(".")
-                if markers:
-                    pieces.append(f"{cleaned} {markers}".strip())
-                else:
-                    pieces.append(cleaned)
-            statement = "Evidence conflict: " + " vs ".join(pieces)
-            if not statement.endswith("."):
-                statement += "."
-            conflict_text.append(statement)
+        conflict_note_text: list[str] = []
+        if conflict_notes:
+            summaries: list[str] = []
+            citation_union: set[int] = set()
+            for note in conflict_notes:
+                summaries.append(note.summary.rstrip("."))
+                citation_union.update(index for index in note.citation_indexes if index > 0)
+            summary_body = " / ".join(part for part in summaries if part)
+            if not summary_body:
+                summary_body = "Conflicting evidence surfaced."
+            markers = "".join(f"[{index}]" for index in sorted(citation_union))
+            conflict_statement = f"Conflict: {summary_body}."
+            if markers:
+                conflict_statement = f"{conflict_statement.rstrip()} {markers}".strip()
+            conflict_note_text.append(conflict_statement)
 
-        parts = [part for part in sections_text + conflict_text if part]
+        parts = [part for part in sections_text + conflict_note_text if part]
         final_text = "\n\n".join(parts).strip()
 
         return ConsolidationOutput(

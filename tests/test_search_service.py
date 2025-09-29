@@ -187,6 +187,40 @@ def test_collect_context_records_includes_metadata(
     assert first["chunk"]["id"]
 
 
+def test_collect_context_records_handles_path_casing(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    base = tmp_path / "casefold"
+    base.mkdir(parents=True, exist_ok=True)
+    doc_path = base / "Report.TXT"
+    doc_path.write_text("Casefolding matters for retrieval.")
+
+    project = project_repo.create("Casefold Project")
+    document_repo.create(project["id"], "Report", source_path=doc_path)
+
+    ingest_repo.store_version(
+        path=str(doc_path).lower(),
+        checksum=None,
+        size=None,
+        mtime=None,
+        ctime=None,
+        parsed=ParsedDocument(text=doc_path.read_text(), metadata={}),
+    )
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    records = service.collect_context_records("casefolding", project_id=project["id"])
+
+    assert records, "Expected retrieval records despite path casing differences"
+    assert any(
+        record.get("context", "").lower().startswith("casefolding") for record in records
+    )
+
+
 def test_search_service_fallback_skips_unscoped_results(
     tmp_path: Path,
     project_repo: ProjectRepository,

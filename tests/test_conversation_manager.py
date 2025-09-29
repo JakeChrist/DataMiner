@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.services import ChatMessage
 from app.services.conversation_manager import (
     AnswerLength,
     ConversationManager,
@@ -303,3 +304,43 @@ def test_adversarial_judge_requires_claim_coverage():
 
     assert verdict.decision == "replan"
     assert "missing_claim" in verdict.reason_codes
+
+
+class _NoMarkerClient:
+    def health_check(self) -> bool:
+        return True
+
+    def chat(self, messages, *, preset, extra_options=None):  # type: ignore[override]
+        return ChatMessage(
+            content="Summary without markers",
+            citations=[{"source": "Doc", "snippet": "Detail"}],
+            reasoning=None,
+            raw_response={"choices": []},
+        )
+
+
+class _ExistingMarkerClient(_NoMarkerClient):
+    def chat(self, messages, *, preset, extra_options=None):  # type: ignore[override]
+        return ChatMessage(
+            content="Summary already cited [1].",
+            citations=[{"source": "Doc", "snippet": "Detail"}],
+            reasoning=None,
+            raw_response={"choices": []},
+        )
+
+
+def test_register_turn_appends_markers_when_missing() -> None:
+    manager = ConversationManager(_NoMarkerClient())
+
+    turn = manager.ask("What happened?")
+
+    assert "[1]" in turn.answer
+    assert turn.answer.rstrip().endswith("[1]")
+
+
+def test_register_turn_preserves_existing_markers() -> None:
+    manager = ConversationManager(_ExistingMarkerClient())
+
+    turn = manager.ask("What happened?")
+
+    assert turn.answer == "Summary already cited [1]."

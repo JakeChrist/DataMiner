@@ -1047,56 +1047,192 @@ class _PlanCritic:
     def review(self, plan: Sequence[PlanItem]) -> tuple[bool, list[str]]:
         issues: list[str] = []
         if not plan:
-            return False, ["Plan is empty"]
+            return False, [self._format_issue("PLAN_EMPTY", "Plan has no steps.", "Generate 2–5 atomic plan steps before execution.")]
+
+        if len(plan) < 2:
+            issues.append(
+                self._format_issue(
+                    "PLAN_SIZE",
+                    f"Plan only contains {len(plan)} step.",
+                    "Create at least two steps covering evidence gathering and synthesis inputs.",
+                )
+            )
+        if len(plan) > 10:
+            issues.append(
+                self._format_issue(
+                    "PLAN_SIZE",
+                    f"Plan contains {len(plan)} steps which exceeds reviewer allowance.",
+                    "Trim to the highest value 2–10 atomic steps or group related subtasks upstream.",
+                )
+            )
 
         seen_artifacts: set[str] = set()
 
         for index, item in enumerate(plan, start=1):
             description = (item.description or "").strip()
-            match = self._STEP_PATTERN.match(description)
-            if not match:
+            if not description:
                 issues.append(
-                    f"Step {index} is not structured as 'Input → Action → Output'."
+                    self._format_issue(
+                        "NO_DESCRIPTION",
+                        f"Step {index} is blank.",
+                        "Provide a full 'Input → Action → Output' description.",
+                    )
                 )
                 continue
 
+            match = self._STEP_PATTERN.match(description)
+            if not match:
+                issues.append(
+                    self._format_issue(
+                        "STRUCTURE",
+                        f"Step {index} is not structured as 'Input → Action → Output'.",
+                        "Reformat as 'Input: <source> → Action: <verb target> → Output: <artifact>'.",
+                    )
+                )
+                continue
+
+            input_section = match.group("input").strip()
             action = match.group("action").strip()
             output = match.group("output").strip()
+
+            if not input_section:
+                issues.append(
+                    self._format_issue(
+                        "NO_INPUT",
+                        f"Step {index} does not declare an input.",
+                        "Specify the evidence scope or prior artifact feeding the step.",
+                    )
+                )
+
             verb, _, remainder = action.partition(" ")
             verb_lower = verb.lower()
             remainder_lower = remainder.strip().lower()
 
             if verb_lower not in self._APPROVED_VERBS:
                 issues.append(
-                    f"Step {index} uses unsupported action verb '{verb_lower}'."
+                    self._format_issue(
+                        "UNSUPPORTED_VERB",
+                        f"Step {index} uses unsupported action verb '{verb_lower}'.",
+                        f"Start the action with one approved verb such as {sorted(self._APPROVED_VERBS)}.",
+                    )
                 )
 
             lowered_action = action.lower()
             if any(token in lowered_action for token in self._BANNED_TOKENS):
-                issues.append(f"Step {index} contains banned meta language.")
+                issues.append(
+                    self._format_issue(
+                        "META",
+                        f"Step {index} contains banned meta language.",
+                        "Remove response-oriented verbs such as 'write' or 'summarize'.",
+                    )
+                )
 
-            if " and " in remainder_lower or ";" in remainder_lower:
-                issues.append(f"Step {index} bundles multiple actions.")
-
-            if not remainder_lower:
-                issues.append(f"Step {index} is missing a concrete target.")
+            if remainder_lower:
+                connector_issue = self._detect_connector_issue(verb_lower, remainder_lower)
+                if connector_issue is not None:
+                    issues.append(
+                        self._format_issue(
+                            "NON_ATOMIC",
+                            f"Step {index} bundles multiple actions ({connector_issue}).",
+                            "Split into separate steps so each action yields one artifact.",
+                        )
+                    )
+                if remainder_lower.startswith("the question") or remainder_lower == "question":
+                    issues.append(
+                        self._format_issue(
+                            "RESTATES_QUESTION",
+                            f"Step {index} simply restates the user question.",
+                            "Target a concrete concept or evidence set instead of repeating the ask.",
+                        )
+                    )
+            else:
+                issues.append(
+                    self._format_issue(
+                        "NO_TARGET",
+                        f"Step {index} is missing a concrete target.",
+                        "Describe the focus (e.g., metrics, claims, sections) after the verb.",
+                    )
+                )
 
             artifact_key = remainder_lower or lowered_action
             if artifact_key in seen_artifacts:
-                issues.append(f"Step {index} duplicates an earlier artifact.")
+                issues.append(
+                    self._format_issue(
+                        "OVERLAP",
+                        f"Step {index} duplicates an earlier artifact.",
+                        "Merge overlapping steps or adjust the target to cover new ground.",
+                    )
+                )
             else:
                 seen_artifacts.add(artifact_key)
 
             normalized_output = output.lower()
-            if not any(keyword in normalized_output for keyword in self._ARTIFACT_KEYWORDS):
-                issues.append(f"Step {index} output lacks a concrete artifact description.")
-
-            if not any(keyword in normalized_output for keyword in self._EVIDENCE_KEYWORDS):
+            if not normalized_output:
                 issues.append(
-                    f"Step {index} output does not specify how evidence or citations will be recorded."
+                    self._format_issue(
+                        "NO_ARTIFACT",
+                        f"Step {index} output is empty.",
+                        "Declare a tangible artifact such as a list, table, or mapping.",
+                    )
+                )
+            elif not any(
+                keyword in normalized_output for keyword in self._ARTIFACT_KEYWORDS
+            ):
+                issues.append(
+                    self._format_issue(
+                        "NO_ARTIFACT",
+                        f"Step {index} output lacks a concrete artifact description.",
+                        "Describe the deliverable (list, table, map, profile, etc.).",
+                    )
                 )
 
+            if not normalized_output or not any(
+                keyword in normalized_output for keyword in self._EVIDENCE_KEYWORDS
+            ):
+                issues.append(
+                    self._format_issue(
+                        "NO_EVIDENCE",
+                        f"Step {index} output does not specify how evidence or citations will be recorded.",
+                        "Include a note that the artifact stores citations or document references.",
+                    )
+                )
+
+            referenced_steps = self._extract_referenced_steps(input_section)
+            for ref in referenced_steps:
+                if ref >= index:
+                    issues.append(
+                        self._format_issue(
+                            "ORDER_ERROR",
+                            f"Step {index} references Step {ref}, which is not yet available.",
+                            "Reorder steps or adjust inputs so dependencies flow forward.",
+                        )
+                    )
+
         return len(issues) == 0, issues
+
+    @staticmethod
+    def _format_issue(code: str, message: str, fix: str) -> str:
+        return f"{code}: {message} (Fix: {fix})"
+
+    @staticmethod
+    def _detect_connector_issue(verb: str, remainder_lower: str) -> str | None:
+        if any(token in remainder_lower for token in {";", " then ", " after ", " before "}):
+            return "sequence connector detected"
+        if " and " in remainder_lower and verb not in {"compare", "contrast"}:
+            return "contains conjunction 'and'"
+        if "," in remainder_lower and verb not in {"compare", "contrast"}:
+            return "comma-separated targets"
+        return None
+
+    @staticmethod
+    def _extract_referenced_steps(input_section: str) -> set[int]:
+        refs: set[int] = set()
+        for match in re.finditer(r"step\s*(\d+)", input_section.lower()):
+            try:
+                refs.add(int(match.group(1)))
+            except ValueError:
+                continue
+        return refs
 
 
 class ConversationManager:
@@ -1734,7 +1870,7 @@ class ConversationManager:
 
         keyword_list = self._extract_plan_keywords(normalized)
         if keyword_list:
-            keyword_text = ", ".join(keyword_list)
+            keyword_text = " ".join(keyword_list)
             plan.append(
                 self._build_structured_plan_item(
                     input_hint="Corpus context",

@@ -42,7 +42,13 @@ Eliminate repetition: Do not keep multiple paraphrases of the same point. Keep t
 
 Minimal citations: Attach the fewest citations needed for each unique claim. Merge duplicate citations for the same claim.
 
-Single conflict note: If sources disagree, include one concise conflict note with both citations."""
+Single conflict note: If sources disagree, include one concise conflict note with both citations.
+
+Grounding enforcement
+
+- Ignore any step outputs flagged as "INSUFFICIENT_EVIDENCE".
+- Drop sentences that lack citations or whose citations are not present in the retrieved corpus.
+- If supporting snippets are missing for a major claim, request a replan or state that the evidence is insufficient instead of guessing."""
 
 
 class ResponseMode(Enum):
@@ -209,6 +215,7 @@ class StepResult:
     citations: list[Any] = field(default_factory=list)
     contexts: list[StepContextBatch] = field(default_factory=list)
     citation_indexes: list[int] = field(default_factory=list)
+    insufficient: bool = False
 
 
 @dataclass
@@ -989,7 +996,12 @@ class _EvidenceLedger:
     def record_step(self, turn_id: int, result: "StepResult") -> None:
         """Store the findings from ``result`` in the ledger."""
 
+        if getattr(result, "insufficient", False):
+            return
+
         raw_text = (result.answer or "").strip()
+        if ConversationManager._text_declares_insufficient_evidence(raw_text):
+            return
         fallback = result.description.strip()
         base_text = ConversationManager._strip_citation_markers(raw_text).strip()
         if not base_text:
@@ -1821,19 +1833,27 @@ class ConversationManager:
 
             if not answer_parts:
                 message = (
-                    f"No direct evidence located for step {index}: {plan_item.description}"
+                    "INSUFFICIENT_EVIDENCE: No corpus snippet supported "
+                    f"step {index} ({plan_item.description})."
                 )
                 answer_parts.append(message)
                 assumptions.append(message)
             plan_item.status = "done"
+            combined_answer = "\n\n".join(answer_parts).strip()
+            insufficient = self._text_declares_insufficient_evidence(combined_answer)
             result = StepResult(
                 index=index,
                 description=plan_item.description,
-                answer="\n\n".join(answer_parts).strip(),
+                answer=combined_answer,
                 citations=self._deduplicate_citations(citations),
                 contexts=used_contexts,
+                insufficient=insufficient,
             )
-            if not result.citations:
+            if result.insufficient:
+                if combined_answer not in assumptions:
+                    assumptions.append(combined_answer)
+                result.citations = []
+            elif not result.citations:
                 inferred = self._fallback_citations_from_contexts(used_contexts)
                 if inferred:
                     result.citations = inferred
@@ -1847,7 +1867,8 @@ class ConversationManager:
         for result in step_results:
             indexes = self._collect_citation_indexes(result.citations, citation_index_map)
             result.citation_indexes = indexes
-            self._ledger.record_step(turn_id, result)
+            if not result.insufficient:
+                self._ledger.record_step(turn_id, result)
 
         consolidation = self._compose_final_answer(
             step_results, ledger=self._ledger, turn_id=turn_id
@@ -2212,8 +2233,9 @@ class ConversationManager:
         *, input_hint: str, action: str, output_hint: str
     ) -> PlanItem:
         description = (
-            f"Input: {input_hint.strip()} → Action: {action.strip()} → "
-            f"Output: {output_hint.strip()}"
+            f"Input: {input_hint.strip()} (retrieved corpus snippets with chunk IDs) → "
+            f"Action: {action.strip()} grounded strictly in those snippets → "
+            f"Output: {output_hint.strip()} (include chunk IDs used)"
         )
         return PlanItem(description=description, status="queued")
 
@@ -2330,10 +2352,14 @@ class ConversationManager:
         prefix = (
             f"Step {index} of {total_steps} (pass {pass_index}): {step_description}."
         )
-        instructions = (
-            "Respond with a concise factual finding for this step. "
-            "Do not include bracketed citation markers; they will be added later."
-        )
+        instructions = textwrap.dedent(
+            """Instructions:
+- Use only the corpus snippets provided in the Context section.
+- Tie every claim to the supporting snippet identifiers (e.g., "DOC17 chunk 3") using plain parentheses.
+- Do not rely on outside knowledge or speculate beyond what the snippets state.
+- If the snippets cannot answer the step, reply exactly with "INSUFFICIENT_EVIDENCE: <brief reason>".
+- Limit the response to at most two sentences and do not include bracketed citation markers; they will be added later."""
+        ).strip()
         return f"{prefix}\nOriginal question: {question}\n{instructions}"
 
     @staticmethod
@@ -2420,6 +2446,14 @@ class ConversationManager:
         cleaned = ConversationManager._STEP_PREFIX_PATTERN.sub("", text, count=1)
         cleaned = cleaned.lstrip(" \t-–—:.)]")
         return cleaned.lstrip()
+
+    @staticmethod
+    def _text_declares_insufficient_evidence(text: str) -> bool:
+        if not text:
+            return False
+        stripped = ConversationManager._strip_citation_markers(text).strip()
+        normalized = ConversationManager._remove_step_prefix(stripped)
+        return normalized.upper().startswith("INSUFFICIENT_EVIDENCE")
 
     @staticmethod
     def _normalize_answer_text(text: str) -> str:
@@ -2598,7 +2632,11 @@ class ConversationManager:
         conflict_groups: dict[str, list[_Claim]] = {}
 
         for result in step_results:
+            if getattr(result, "insufficient", False):
+                continue
             raw_text = (result.answer or "").strip()
+            if ConversationManager._text_declares_insufficient_evidence(raw_text):
+                continue
             fallback = result.description.strip()
             base_text = ConversationManager._strip_citation_markers(raw_text).strip()
             if not base_text:

@@ -69,7 +69,7 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert len(turn.step_results) == 3
     assert [item.status for item in turn.plan] == ["done"] * 3
     assert turn.plan[0].description.startswith(
-        "Input: Corpus context → Action: Collect background references on"
+        "Input: Corpus context (retrieved corpus snippets with chunk IDs) → Action: Collect background references on"
     )
     assert "document citations" in turn.plan[-1].description.lower()
     assert turn.answer.startswith("Context & Background:")
@@ -112,8 +112,15 @@ def test_dynamic_plan_notes_missing_citations() -> None:
 
     assert len(turn.step_results) == 3
     assert turn.reasoning_artifacts is not None
-    assert any("No direct evidence" in text for text in turn.reasoning_artifacts.assumptions)
-    assert all(result.citation_indexes for result in turn.step_results)
+    assert any(
+        "INSUFFICIENT_EVIDENCE" in text for text in turn.reasoning_artifacts.assumptions
+    )
+    assert any(result.insufficient for result in turn.step_results)
+    assert all(
+        result.citation_indexes
+        for result in turn.step_results
+        if not result.insufficient
+    )
     assert all(turn.citations)
 
 

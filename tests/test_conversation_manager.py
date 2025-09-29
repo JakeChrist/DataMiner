@@ -6,9 +6,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.conversation_manager import (
+    AnswerLength,
     ConversationManager,
+    ConsolidatedSection,
+    ConflictNote,
+    ConsolidationOutput,
+    ResponseMode,
     StepResult,
     _EvidenceLedger,
+    _AdversarialJudge,
 )
 
 
@@ -187,3 +193,79 @@ def test_ledger_retains_claims_for_follow_up_turns():
     assert len(claims_turn_two) == 1
     assert claims_turn_two[0].citations == {4}
     assert claims_turn_two[0].steps == [1]
+
+
+def test_adversarial_judge_detects_duplicate_claims():
+    judge = _AdversarialJudge()
+    sections = [
+        ConsolidatedSection(
+            title="Key Points",
+            sentences=["Insight A. [1]"],
+            citation_indexes=[1],
+        ),
+        ConsolidatedSection(
+            title="Key Points",
+            sentences=["Insight A. [2]"],
+            citation_indexes=[2],
+        ),
+    ]
+    conflicts: list[ConflictNote] = []
+    consolidation = ConsolidationOutput(
+        text=ConversationManager._assemble_answer_text(sections, conflicts),
+        sections=sections,
+        conflicts=conflicts,
+        section_usage={1: {"Key Points"}, 2: {"Key Points"}},
+    )
+    citations = [{"id": 1}, {"id": 2}]
+    verdict = judge.review(
+        consolidation,
+        citations,
+        ledger_snapshot=[{"normalized": "insight a", "citations": [1, 2]}],
+        scope=None,
+        answer_length=AnswerLength.NORMAL,
+        response_mode=ResponseMode.GENERATIVE,
+    )
+
+    assert verdict.decision == "fail"
+    assert "duplicate_claim" in verdict.reason_codes
+
+
+def test_adversarial_judge_trims_unused_evidence():
+    judge = _AdversarialJudge()
+    sections = [
+        ConsolidatedSection(
+            title="Key Points",
+            sentences=["Fact. [1]"],
+            citation_indexes=[1],
+        )
+    ]
+    conflicts: list[ConflictNote] = []
+    consolidation = ConsolidationOutput(
+        text=ConversationManager._assemble_answer_text(sections, conflicts),
+        sections=sections,
+        conflicts=conflicts,
+        section_usage={1: {"Key Points"}},
+    )
+    citations = [{"id": 1}, {"id": 2}]
+    verdict = judge.review(
+        consolidation,
+        citations,
+        ledger_snapshot=[{"normalized": "fact", "citations": [1]}],
+        scope=None,
+        answer_length=AnswerLength.NORMAL,
+        response_mode=ResponseMode.GENERATIVE,
+    )
+
+    assert verdict.decision == "fail"
+    assert "unused_evidence" in verdict.reason_codes
+
+    fix = judge.apply_fixes(
+        consolidation,
+        citations,
+        verdict=verdict,
+        ledger_snapshot=[{"normalized": "fact", "citations": [1]}],
+    )
+
+    assert len(fix.citations) == 1
+    assert fix.citation_mapping == {1: 1}
+    assert fix.consolidation.sections[0].sentences == ["Fact. [1]"]

@@ -133,7 +133,55 @@ def test_plan_critic_rejects_meta_steps() -> None:
     approved, reasons = critic.review(plan)
 
     assert not approved
-    assert any("banned" in reason.lower() or "unsupported" in reason.lower() for reason in reasons)
+    assert any(reason.startswith("META:") for reason in reasons)
+
+
+def test_plan_critic_flags_non_atomic_steps() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+    critic = manager._plan_critic
+
+    plan = [
+        PlanItem(
+            description=(
+                "Input: Corpus context → Action: Collect supplier list and metrics → Output: Bullet list of suppliers with document citations"
+            )
+        ),
+        PlanItem(
+            description=(
+                "Input: Step 1 output → Action: Compare supplier performance → Output: Comparison table for supplier performance with cited source snippets"
+            )
+        ),
+    ]
+
+    approved, reasons = critic.review(plan)
+
+    assert not approved
+    assert any(reason.startswith("NON_ATOMIC:") for reason in reasons)
+
+
+def test_plan_critic_catches_order_errors() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+    critic = manager._plan_critic
+
+    plan = [
+        PlanItem(
+            description=(
+                "Input: Step 2 output → Action: Analyze findings → Output: Bullet list of findings with document citations"
+            )
+        ),
+        PlanItem(
+            description=(
+                "Input: Corpus context → Action: Collect case studies → Output: Bullet list of case studies with document citations"
+            )
+        ),
+    ]
+
+    approved, reasons = critic.review(plan)
+
+    assert not approved
+    assert any(reason.startswith("ORDER_ERROR:") for reason in reasons)
 
 
 def test_generate_plan_produces_atomic_steps() -> None:

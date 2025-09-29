@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TypeVar
 
@@ -133,6 +134,7 @@ class IngestService:
     ) -> int:
         """Discover and ingest all files underneath ``root``."""
 
+        project_id = self._coerce_project_id(project_id)
         root_path = Path(root).resolve()
         params = {
             "project_id": project_id,
@@ -152,6 +154,7 @@ class IngestService:
     ) -> int:
         """Queue a job that ingests one or multiple explicit files."""
 
+        project_id = self._coerce_project_id(project_id)
         if isinstance(files, (str, Path)):
             file_list = [files]
         else:
@@ -178,6 +181,7 @@ class IngestService:
     ) -> int:
         """Re-ingest files that have changed since the previous crawl."""
 
+        project_id = self._coerce_project_id(project_id)
         root_path = Path(root).resolve()
         if known_files is None:
             known_files = self._load_known_files(str(root_path))
@@ -198,6 +202,7 @@ class IngestService:
     ) -> int:
         """Remove tracked files from the ingest index."""
 
+        project_id = self._coerce_project_id(project_id)
         root_path = Path(root).resolve()
         normalized = [str(Path(path).resolve()) for path in files]
         known_files = self._load_known_files(str(root_path))
@@ -682,8 +687,8 @@ class IngestService:
         }
 
     def _sync_project_documents(self, job: IngestJob) -> None:
-        project_id = job.params.get("project_id")
-        if not isinstance(project_id, int):
+        project_id = self._coerce_project_id(job.params.get("project_id"))
+        if project_id is None:
             return
 
         repo = self.project_documents
@@ -780,6 +785,30 @@ class IngestService:
 
                 self._execute_with_retry(_delete)
                 existing_docs.pop(path, None)
+
+    @staticmethod
+    def _coerce_project_id(value: Any) -> int | None:
+        """Return ``value`` converted to an ``int`` when possible."""
+
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, Integral):
+            return int(value)
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return None
+            try:
+                return int(cleaned)
+            except ValueError:
+                return None
+        return None
 
     def _execute_with_retry(
         self,

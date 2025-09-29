@@ -5,7 +5,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.services.conversation_manager import ConversationManager, StepResult
+from app.services.conversation_manager import (
+    ConversationManager,
+    StepResult,
+    _EvidenceLedger,
+)
 
 
 def test_compose_final_answer_deduplicates_and_merges_citations():
@@ -103,3 +107,83 @@ def test_compose_final_answer_strips_step_prefixes():
     assert final_answer.text == "Key Points: Value found. [1][2][3]"
     assert len(final_answer.sections) == 1
     assert final_answer.sections[0].sentences == ["Value found. [1][2][3]"]
+
+
+def test_ledger_merges_duplicate_claims_across_steps():
+    ledger = _EvidenceLedger()
+    step_results = [
+        StepResult(
+            index=1,
+            description="Alpha",
+            answer="Insight A.",
+            citation_indexes=[1],
+        ),
+        StepResult(
+            index=2,
+            description="Alpha follow",
+            answer="Insight A.",
+            citation_indexes=[2],
+        ),
+        StepResult(
+            index=3,
+            description="Beta",
+            answer="Next point.",
+            citation_indexes=[3],
+        ),
+    ]
+
+    for result in step_results:
+        ledger.record_step(turn_id=1, result=result)
+
+    final_answer = ConversationManager._compose_final_answer(
+        step_results, ledger=ledger, turn_id=1
+    )
+
+    assert final_answer.text == "Evidence & Findings: Insight A. [1][2]\n\nKey Points: Next point. [3]"
+    assert ledger.snapshot_for_turn(1) == [
+        {
+            "text": "Insight A.",
+            "normalized": "insight a",
+            "citations": [1, 2],
+            "section": "Evidence & Findings",
+            "steps": [1, 2],
+        },
+        {
+            "text": "Next point.",
+            "normalized": "next point",
+            "citations": [3],
+            "section": "Key Points",
+            "steps": [3],
+        },
+    ]
+
+
+def test_ledger_retains_claims_for_follow_up_turns():
+    ledger = _EvidenceLedger()
+
+    turn_one = StepResult(
+        index=1,
+        description="Alpha",
+        answer="Insight A.",
+        citation_indexes=[1],
+    )
+    ledger.record_step(turn_id=1, result=turn_one)
+
+    turn_two = StepResult(
+        index=1,
+        description="Follow up",
+        answer="Insight A.",
+        citation_indexes=[4],
+    )
+    ledger.record_step(turn_id=2, result=turn_two)
+
+    claims_turn_one = ledger.claims_for_turn(1)
+    claims_turn_two = ledger.claims_for_turn(2)
+
+    assert len(claims_turn_one) == 1
+    assert claims_turn_one[0].citations == {1}
+    assert claims_turn_one[0].steps == [1]
+
+    assert len(claims_turn_two) == 1
+    assert claims_turn_two[0].citations == {4}
+    assert claims_turn_two[0].steps == [1]

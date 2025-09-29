@@ -148,6 +148,7 @@ class ConversationTurn:
     token_usage: dict[str, int] | None = None
     raw_response: dict[str, Any] | None = None
     step_results: list["StepResult"] = field(default_factory=list)
+    ledger_claims: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def reasoning_bullets(self) -> list[str]:
@@ -248,6 +249,181 @@ class _Claim:
     has_negation: bool
     tokens: set[str] = field(default_factory=set)
     numbers: set[str] = field(default_factory=set)
+    turn_ids: set[int] = field(default_factory=set)
+
+
+@dataclass
+class _LedgerEntry:
+    """Persistent record for a claim stored in the evidence ledger."""
+
+    normalized: str
+    texts_by_turn: dict[int, str] = field(default_factory=dict)
+    citations_by_turn: dict[int, set[int]] = field(default_factory=dict)
+    sections_by_turn: dict[int, str] = field(default_factory=dict)
+    steps_by_turn: dict[int, set[int]] = field(default_factory=dict)
+    tokens_by_turn: dict[int, set[str]] = field(default_factory=dict)
+    numbers_by_turn: dict[int, set[str]] = field(default_factory=dict)
+    has_negation_by_turn: dict[int, bool] = field(default_factory=dict)
+    insertion_order: list[tuple[int, int]] = field(default_factory=list)
+
+    def record(
+        self,
+        *,
+        turn_id: int,
+        step_index: int,
+        text: str,
+        citations: set[int],
+        section: str,
+        tokens: set[str],
+        numbers: set[str],
+        has_negation: bool,
+    ) -> None:
+        steps = self.steps_by_turn.setdefault(turn_id, set())
+        steps.add(step_index)
+        if (turn_id, step_index) not in self.insertion_order:
+            self.insertion_order.append((turn_id, step_index))
+        citations_set = self.citations_by_turn.setdefault(turn_id, set())
+        citations_set.update(citations)
+        tokens_set = self.tokens_by_turn.setdefault(turn_id, set())
+        tokens_set.update(tokens)
+        numbers_set = self.numbers_by_turn.setdefault(turn_id, set())
+        numbers_set.update(numbers)
+        previous_text = self.texts_by_turn.get(turn_id)
+        if not previous_text or len(text) > len(previous_text):
+            self.texts_by_turn[turn_id] = text
+        self.sections_by_turn.setdefault(turn_id, section)
+        if has_negation:
+            self.has_negation_by_turn[turn_id] = True
+        else:
+            self.has_negation_by_turn.setdefault(turn_id, False)
+
+
+class _EvidenceLedger:
+    """Track claims across turns so consolidation can reuse prior findings."""
+
+    def __init__(self) -> None:
+        self._entries: dict[str, _LedgerEntry] = {}
+        self._order: list[str] = []
+
+    def clear_turn(self, turn_id: int) -> None:
+        """Remove any existing records for ``turn_id``."""
+
+        for key, entry in list(self._entries.items()):
+            entry.texts_by_turn.pop(turn_id, None)
+            entry.citations_by_turn.pop(turn_id, None)
+            entry.sections_by_turn.pop(turn_id, None)
+            entry.steps_by_turn.pop(turn_id, None)
+            entry.tokens_by_turn.pop(turn_id, None)
+            entry.numbers_by_turn.pop(turn_id, None)
+            entry.has_negation_by_turn.pop(turn_id, None)
+            entry.insertion_order = [
+                item for item in entry.insertion_order if item[0] != turn_id
+            ]
+            if not entry.texts_by_turn:
+                self._entries.pop(key, None)
+                self._order = [candidate for candidate in self._order if candidate != key]
+
+    def record_step(self, turn_id: int, result: "StepResult") -> None:
+        """Store the findings from ``result`` in the ledger."""
+
+        raw_text = (result.answer or "").strip()
+        fallback = result.description.strip()
+        base_text = ConversationManager._strip_citation_markers(raw_text).strip()
+        if not base_text:
+            base_text = (
+                ConversationManager._strip_citation_markers(fallback).strip() or fallback
+            )
+        if not base_text:
+            return
+
+        clean_text = ConversationManager._remove_step_prefix(base_text).strip()
+        if not clean_text:
+            clean_text = base_text.strip()
+        polished_text = ConversationManager._polish_sentence(clean_text)
+        normalized = ConversationManager._normalize_answer_text(polished_text)
+        if not normalized:
+            return
+
+        citation_indexes: set[int] = set()
+        for index in result.citation_indexes:
+            try:
+                value = int(index)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                citation_indexes.add(value)
+
+        section = ConversationManager._categorize_claim(result.description, polished_text)
+        tokens = ConversationManager._claim_tokens(polished_text)
+        numbers = ConversationManager._extract_numbers(polished_text)
+        has_negation = ConversationManager._has_negation(polished_text)
+
+        entry = self._entries.get(normalized)
+        if entry is None:
+            entry = _LedgerEntry(normalized=normalized)
+            self._entries[normalized] = entry
+            self._order.append(normalized)
+
+        entry.record(
+            turn_id=turn_id,
+            step_index=result.index,
+            text=polished_text,
+            citations=citation_indexes,
+            section=section,
+            tokens=tokens,
+            numbers=numbers,
+            has_negation=has_negation,
+        )
+
+    def claims_for_turn(self, turn_id: int) -> list[_Claim]:
+        """Return all claims associated with ``turn_id`` in step order."""
+
+        claims: list[_Claim] = []
+        for key in self._order:
+            entry = self._entries[key]
+            steps = sorted(entry.steps_by_turn.get(turn_id, set()))
+            if not steps:
+                continue
+            text = entry.texts_by_turn.get(turn_id)
+            if not text:
+                text = next(iter(entry.texts_by_turn.values()), "")
+            section = entry.sections_by_turn.get(turn_id)
+            if not section:
+                section = next(iter(entry.sections_by_turn.values()), "Key Points")
+            citations = set(entry.citations_by_turn.get(turn_id, set()))
+            tokens = set(entry.tokens_by_turn.get(turn_id, set()))
+            numbers = set(entry.numbers_by_turn.get(turn_id, set()))
+            has_negation = bool(entry.has_negation_by_turn.get(turn_id, False))
+            claim = _Claim(
+                text=text,
+                normalized=entry.normalized,
+                citations=citations,
+                section=section,
+                steps=steps,
+                has_negation=has_negation,
+                tokens=tokens,
+                numbers=numbers,
+                turn_ids={turn_id},
+            )
+            claims.append(claim)
+        claims.sort(key=lambda claim: min(claim.steps))
+        return claims
+
+    def snapshot_for_turn(self, turn_id: int) -> list[dict[str, Any]]:
+        """Return a serialisable ledger view for diagnostics."""
+
+        snapshot: list[dict[str, Any]] = []
+        for claim in self.claims_for_turn(turn_id):
+            snapshot.append(
+                {
+                    "text": claim.text,
+                    "normalized": claim.normalized,
+                    "citations": sorted(claim.citations),
+                    "section": claim.section,
+                    "steps": list(claim.steps),
+                }
+            )
+        return snapshot
 
 
 class DynamicPlanningError(RuntimeError):
@@ -271,6 +447,7 @@ class ConversationManager:
         self._connected = True
         self._connection_error: str | None = None
         self._listeners: list[Callable[[ConnectionState], None]] = []
+        self._ledger = _EvidenceLedger()
 
     def add_connection_listener(
         self, listener: Callable[[ConnectionState], None]
@@ -507,6 +684,8 @@ class ConversationManager:
             raise DynamicPlanningError("No plan items generated")
 
         total_steps = len(plan_items)
+        turn_id = len(self.turns) + 1
+        self._ledger.clear_turn(turn_id)
         shared_context = "\n\n".join(context_snippets or [])
         base_options = copy.deepcopy(extra_options) if extra_options else {}
         executed_plan: list[PlanItem] = [
@@ -601,8 +780,11 @@ class ConversationManager:
         for result in step_results:
             indexes = self._collect_citation_indexes(result.citations, citation_index_map)
             result.citation_indexes = indexes
+            self._ledger.record_step(turn_id, result)
 
-        consolidation = self._compose_final_answer(step_results)
+        consolidation = self._compose_final_answer(
+            step_results, ledger=self._ledger, turn_id=turn_id
+        )
         answer = consolidation.text
         summary = f"Executed {total_steps} dynamic step{'s' if total_steps != 1 else ''}."
         artifacts = ReasoningArtifacts(
@@ -626,6 +808,9 @@ class ConversationManager:
                 for result in step_results
             ],
         }
+        ledger_snapshot = self._ledger.snapshot_for_turn(turn_id)
+        if ledger_snapshot:
+            reasoning_payload["ledger"] = ledger_snapshot
         if consolidation.sections:
             reasoning_payload["final_sections"] = [
                 {
@@ -677,6 +862,8 @@ class ConversationManager:
                 "citations": aggregated,
             }
         }
+        if ledger_snapshot:
+            raw_response["dynamic_plan"]["ledger"] = ledger_snapshot
         turn = ConversationTurn(
             question=question,
             answer=answer,
@@ -688,6 +875,7 @@ class ConversationManager:
             model_name=getattr(self.client, "model", None),
             raw_response=raw_response,
             step_results=step_results,
+            ledger_claims=ledger_snapshot,
         )
         self.turns.append(turn)
         return turn
@@ -1173,9 +1361,9 @@ class ConversationManager:
         return f"Conflicting evidence: {head}, and {tail}."
 
     @staticmethod
-    def _compose_final_answer(
+    def _claims_from_step_results(
         step_results: Sequence[StepResult],
-    ) -> ConsolidationOutput:
+    ) -> tuple[list[str], dict[str, list[_Claim]], dict[str, list[_Claim]]]:
         sections_in_order: list[str] = []
         section_claims: dict[str, list[_Claim]] = {}
         seen_by_normalized: dict[str, _Claim] = {}
@@ -1186,7 +1374,9 @@ class ConversationManager:
             fallback = result.description.strip()
             base_text = ConversationManager._strip_citation_markers(raw_text).strip()
             if not base_text:
-                base_text = ConversationManager._strip_citation_markers(fallback).strip() or fallback
+                base_text = (
+                    ConversationManager._strip_citation_markers(fallback).strip() or fallback
+                )
             if not base_text:
                 continue
 
@@ -1218,6 +1408,7 @@ class ConversationManager:
                 claim.steps.append(result.index)
                 claim.tokens.update(tokens)
                 claim.numbers.update(numbers)
+                claim.turn_ids.add(0)
             else:
                 claim = _Claim(
                     text=polished_text,
@@ -1228,6 +1419,7 @@ class ConversationManager:
                     has_negation=has_negation,
                     tokens=set(tokens),
                     numbers=set(numbers),
+                    turn_ids={0},
                 )
                 seen_by_normalized[normalized] = claim
                 section_claims.setdefault(section, []).append(claim)
@@ -1236,6 +1428,42 @@ class ConversationManager:
 
             conflict_key = ConversationManager._conflict_key(normalized)
             conflict_groups.setdefault(conflict_key, []).append(claim)
+
+        return sections_in_order, section_claims, conflict_groups
+
+    @staticmethod
+    def _claims_from_ledger(
+        ledger: _EvidenceLedger, turn_id: int
+    ) -> tuple[list[str], dict[str, list[_Claim]], dict[str, list[_Claim]]]:
+        sections_in_order: list[str] = []
+        section_claims: dict[str, list[_Claim]] = {}
+        conflict_groups: dict[str, list[_Claim]] = {}
+
+        claims = ledger.claims_for_turn(turn_id)
+        for claim in claims:
+            if claim.section not in sections_in_order:
+                sections_in_order.append(claim.section)
+            section_claims.setdefault(claim.section, []).append(claim)
+            conflict_key = ConversationManager._conflict_key(claim.normalized)
+            conflict_groups.setdefault(conflict_key, []).append(claim)
+
+        return sections_in_order, section_claims, conflict_groups
+
+    @staticmethod
+    def _compose_final_answer(
+        step_results: Sequence[StepResult],
+        *,
+        ledger: _EvidenceLedger | None = None,
+        turn_id: int | None = None,
+    ) -> ConsolidationOutput:
+        if ledger is not None and turn_id is not None:
+            sections_in_order, section_claims, conflict_groups = (
+                ConversationManager._claims_from_ledger(ledger, turn_id)
+            )
+        else:
+            sections_in_order, section_claims, conflict_groups = (
+                ConversationManager._claims_from_step_results(step_results)
+            )
 
         sections: list[ConsolidatedSection] = []
         section_usage: dict[int, set[str]] = {}

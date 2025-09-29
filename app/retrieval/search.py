@@ -288,12 +288,12 @@ class SearchService:
         "with",
     }
 
-    def _search_with_fallback(self, query: str, *, limit: int) -> list[dict[str, Any]]:
-        """Query the ingest index while relaxing overly strict MATCH syntax."""
+    def _search_with_fallback(self, query: str, *, limit: int) -> Iterable[dict[str, Any]]:
+        """Yield ingest search hits while progressively relaxing the query."""
 
         normalized = (query or "").strip()
         if not normalized:
-            return []
+            return
 
         attempts: list[str] = [normalized]
         tokens = self._tokenize_query(normalized)
@@ -303,19 +303,40 @@ class SearchService:
             if len(tokens) > 1:
                 attempts.append(" ".join(wildcard_tokens))
 
-        seen: set[str] = set()
+        seen_queries: set[str] = set()
+        seen_results: set[tuple[Any, ...]] = set()
+        yielded = 0
+
+        def _result_identity(record: dict[str, Any]) -> tuple[Any, ...]:
+            chunk = record.get("chunk") if isinstance(record, dict) else None
+            chunk_id: Any = None
+            chunk_index: Any = None
+            if isinstance(chunk, dict):
+                chunk_id = chunk.get("id")
+                chunk_index = chunk.get("index")
+            document = record.get("document") if isinstance(record, dict) else None
+            document_id = document.get("id") if isinstance(document, dict) else None
+            path = record.get("path") if isinstance(record, dict) else None
+            return (chunk_id, document_id, chunk_index, path)
+
         for candidate in attempts:
             candidate = candidate.strip()
-            if not candidate or candidate in seen:
+            if not candidate or candidate in seen_queries:
                 continue
-            seen.add(candidate)
+            seen_queries.add(candidate)
             try:
                 results = self.ingest.search(candidate, limit=limit)
             except sqlite3.OperationalError:
                 continue
-            if results:
-                return results
-        return []
+            for record in results:
+                identity = _result_identity(record)
+                if identity in seen_results:
+                    continue
+                seen_results.add(identity)
+                yield record
+                yielded += 1
+                if yielded >= limit:
+                    return
 
     def _tokenize_query(self, query: str) -> list[str]:
         """Extract significant terms for relaxed fallback queries."""

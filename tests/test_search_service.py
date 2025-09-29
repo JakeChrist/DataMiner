@@ -186,6 +186,36 @@ def test_collect_context_records_includes_metadata(
     assert "context" in first and "revenue" in first["context"].lower()
     assert first["chunk"]["id"]
 
+
+def test_search_service_fallback_skips_unscoped_results(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    base = tmp_path / "fallback"
+    tracked_path = base / "tracked.txt"
+    tracked_path.parent.mkdir(parents=True, exist_ok=True)
+    tracked_path.write_text("Delta-only insight for the project.", encoding="utf-8")
+
+    external_path = base / "external.txt"
+    external_path.write_text("Alpha delta combined in external corpus.", encoding="utf-8")
+
+    project = project_repo.create("Fallback Project")
+    tracked_doc = document_repo.create(project["id"], "Tracked", source_path=tracked_path)
+
+    _store_ingest_document(ingest_repo, tracked_path, tracked_path.read_text(encoding="utf-8"))
+    _store_ingest_document(ingest_repo, external_path, external_path.read_text(encoding="utf-8"))
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    results = service.search_documents("alpha delta", project_id=project["id"], limit=3)
+
+    assert results
+    assert [item["document"]["id"] for item in results] == [tracked_doc["id"]]
+
+
 def test_document_hierarchy_service(
     tmp_path: Path,
     project_repo: ProjectRepository,

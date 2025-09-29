@@ -27,10 +27,12 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
     return float(sum(a * b for a, b in zip(left, right)))
 
 
-def _normalise_folder(folder: str | Path | None) -> str | None:
+def _normalise_folder(folder: str | Path | None) -> Path | None:
+    """Return a normalised absolute :class:`~pathlib.Path` for ``folder``."""
+
     if folder in (None, ""):
         return None
-    return str(Path(folder).resolve())
+    return Path(folder).expanduser().resolve()
 
 
 @dataclass(slots=True)
@@ -50,7 +52,7 @@ class Passage:
     metadata: Mapping[str, Any] | None = None
     _normalized_embedding: tuple[float, ...] = field(init=False, repr=False)
     _normalized_text: str = field(init=False, repr=False)
-    _normalized_folder: str | None = field(init=False, repr=False)
+    _normalized_folder: Path | None = field(init=False, repr=False)
     _language: str | None = field(init=False, repr=False)
     _tags: frozenset[int] = field(init=False, repr=False)
 
@@ -67,7 +69,7 @@ class Passage:
         return self._normalized_embedding
 
     @property
-    def normalized_folder(self) -> str | None:
+    def normalized_folder(self) -> Path | None:
         return self._normalized_folder
 
     @property
@@ -99,7 +101,7 @@ class RetrievalScope:
     end_time: datetime | None = None
     languages: Iterable[str] | None = None
     _tags: frozenset[int] = field(init=False, repr=False)
-    _folder: str | None = field(init=False, repr=False)
+    _folder: Path | None = field(init=False, repr=False)
     _languages: frozenset[str] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:  # noqa: D401 - documented on class
@@ -117,7 +119,9 @@ class RetrievalScope:
             if folder is None:
                 return False
             if self.recursive:
-                if not folder.startswith(self._folder):
+                try:
+                    folder.relative_to(self._folder)
+                except ValueError:
                     return False
             else:
                 if folder != self._folder:
@@ -180,7 +184,7 @@ class RetrievedPassage:
         if self.passage.tag_set:
             record["tags"] = sorted(self.passage.tag_set)
         if self.passage.normalized_folder is not None:
-            record["folder"] = self.passage.normalized_folder
+            record["folder"] = str(self.passage.normalized_folder)
         if self.passage.created_at is not None:
             record["created_at"] = self.passage.created_at
         return record

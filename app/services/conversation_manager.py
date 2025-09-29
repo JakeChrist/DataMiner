@@ -186,6 +186,46 @@ class StepResult:
     citation_indexes: list[int] = field(default_factory=list)
 
 
+@dataclass
+class ConsolidatedSection:
+    """Composition-ready section derived from dynamic plan steps."""
+
+    title: str
+    sentences: list[str]
+    citation_indexes: list[int]
+
+
+@dataclass
+class ConflictNote:
+    """Summary of conflicting claims surfaced during consolidation."""
+
+    summary: str
+    citation_indexes: list[int]
+    variants: list[dict[str, Any]]
+
+
+@dataclass
+class ConsolidationOutput:
+    """Container for the final composed answer and supporting metadata."""
+
+    text: str
+    sections: list[ConsolidatedSection]
+    conflicts: list[ConflictNote]
+    section_usage: dict[int, set[str]]
+
+
+@dataclass
+class _Claim:
+    """Internal representation of a unique claim extracted from step outputs."""
+
+    text: str
+    normalized: str
+    citations: set[int]
+    section: str
+    steps: list[int]
+    has_negation: bool
+
+
 class DynamicPlanningError(RuntimeError):
     """Raised when dynamic planning cannot be completed."""
 
@@ -496,7 +536,8 @@ class ConversationManager:
             indexes = self._collect_citation_indexes(result.citations, citation_index_map)
             result.citation_indexes = indexes
 
-        answer = self._compose_final_answer(step_results)
+        consolidation = self._compose_final_answer(step_results)
+        answer = consolidation.text
         summary = f"Executed {total_steps} dynamic step{'s' if total_steps != 1 else ''}."
         artifacts = ReasoningArtifacts(
             summary_bullets=[summary],
@@ -519,6 +560,51 @@ class ConversationManager:
                 for result in step_results
             ],
         }
+        if consolidation.sections:
+            reasoning_payload["final_sections"] = [
+                {
+                    "title": section.title,
+                    "sentences": list(section.sentences),
+                    "citations": section.citation_indexes,
+                }
+                for section in consolidation.sections
+            ]
+        if consolidation.conflicts:
+            reasoning_payload["conflicts"] = [
+                {
+                    "summary": note.summary,
+                    "citations": note.citation_indexes,
+                    "variants": note.variants,
+                }
+                for note in consolidation.conflicts
+            ]
+        if consolidation.section_usage:
+            for citation_index, section_names in consolidation.section_usage.items():
+                if citation_index <= 0 or citation_index > len(aggregated):
+                    continue
+                citation = aggregated[citation_index - 1]
+                existing_tags: list[str] = []
+                raw_tags = citation.get("tag_names") if isinstance(citation, dict) else None
+                if isinstance(raw_tags, list):
+                    existing_tags = [str(tag) for tag in raw_tags if str(tag).strip()]
+                merged = list(dict.fromkeys(existing_tags + sorted(section_names)))
+                if isinstance(citation, dict):
+                    citation["tag_names"] = merged
+        if consolidation.conflicts:
+            for note in consolidation.conflicts:
+                for citation_index in note.citation_indexes:
+                    if citation_index <= 0 or citation_index > len(aggregated):
+                        continue
+                    citation = aggregated[citation_index - 1]
+                    if isinstance(citation, dict):
+                        citation["conflict_summary"] = note.summary
+                        citation["conflicts"] = [
+                            {
+                                "text": variant["text"],
+                                "citations": variant["citations"],
+                            }
+                            for variant in note.variants
+                        ]
         raw_response = {
             "dynamic_plan": {
                 "steps": reasoning_payload["steps"],
@@ -862,9 +948,98 @@ class ConversationManager:
         return collapsed.lower()
 
     @staticmethod
-    def _compose_final_answer(step_results: Sequence[StepResult]) -> str:
-        paragraphs: list[tuple[str, set[int]]] = []
-        seen: dict[str, int] = {}
+    def _polish_sentence(text: str) -> str:
+        compact = " ".join((text or "").split())
+        if not compact:
+            return ""
+        if compact[0].islower():
+            compact = compact[0].upper() + compact[1:]
+        return compact
+
+    @staticmethod
+    def _categorize_claim(description: str, answer_text: str) -> str:
+        lookup = [
+            ("Context & Background", ("background", "context", "overview", "history", "landscape", "scan")),
+            ("Comparisons & Trends", ("compare", "comparison", "contrast", "versus", "trend", "change")),
+            (
+                "Evidence & Findings",
+                ("finding", "result", "evidence", "analysis", "insight", "detail", "data"),
+            ),
+            (
+                "Risks & Limitations",
+                ("risk", "concern", "issue", "challenge", "gap", "limitation", "problem"),
+            ),
+            (
+                "Recommendations & Next Steps",
+                ("recommend", "should", "plan", "propose", "next step", "action", "improve", "need"),
+            ),
+            (
+                "Practical Guidance",
+                ("tip", "guide", "how to", "process", "step", "implementation", "instruction"),
+            ),
+            (
+                "Synthesis & Conclusion",
+                ("synthes", "conclusion", "summary", "overall", "final", "wrap"),
+            ),
+        ]
+        source = f"{description}\n{answer_text}".lower()
+        for title, keywords in lookup:
+            if any(keyword in source for keyword in keywords):
+                return title
+        return "Key Points"
+
+    @staticmethod
+    def _format_sentence(text: str, citations: set[int]) -> str:
+        polished = ConversationManager._polish_sentence(text)
+        if not polished:
+            return ""
+        if polished[-1] not in ".!?":
+            polished = f"{polished}."
+        markers = "".join(f"[{index}]" for index in sorted(index for index in citations if index > 0))
+        if markers:
+            return f"{polished} {markers}".strip()
+        return polished
+
+    @staticmethod
+    def _conflict_key(normalized: str) -> str:
+        base = re.sub(
+            r"\b(?:not|no|never|without|lack|lacks|lacking|failed|fails|failing|isn't|aren't|wasn't|weren't|can't|cannot|won't|doesn't|didn't|don't|negative)\b",
+            "",
+            normalized,
+        )
+        return " ".join(base.split())
+
+    @staticmethod
+    def _has_negation(text: str) -> bool:
+        lowered = text.lower()
+        return bool(
+            re.search(
+                r"\b(?:not|no|never|without|lack|lacks|lacking|failed|fails|failing|isn't|aren't|wasn't|weren't|can't|cannot|won't|doesn't|didn't|don't|negative)\b",
+                lowered,
+            )
+        )
+
+    @staticmethod
+    def _build_conflict_summary_text(variants: Sequence[str]) -> str:
+        texts = [text.strip().rstrip(".") for text in variants if text and text.strip()]
+        if not texts:
+            return "Conflicting evidence from cited sources."
+        if len(texts) == 1:
+            return f"Conflicting evidence: {texts[0]}."
+        if len(texts) == 2:
+            return f"Conflicting evidence: {texts[0]} vs {texts[1]}."
+        head = ", ".join(texts[:-1])
+        tail = texts[-1]
+        return f"Conflicting evidence: {head}, and {tail}."
+
+    @staticmethod
+    def _compose_final_answer(
+        step_results: Sequence[StepResult],
+    ) -> ConsolidationOutput:
+        sections_in_order: list[str] = []
+        section_claims: dict[str, list[_Claim]] = {}
+        seen_by_normalized: dict[str, _Claim] = {}
+        conflict_groups: dict[str, list[_Claim]] = {}
 
         for result in step_results:
             raw_text = (result.answer or "").strip()
@@ -875,55 +1050,136 @@ class ConversationManager:
             if not base_text:
                 continue
 
-            clean_text = ConversationManager._remove_step_prefix(base_text)
+            clean_text = ConversationManager._remove_step_prefix(base_text).strip()
             if not clean_text:
-                clean_text = base_text
+                clean_text = base_text.strip()
+            polished_text = ConversationManager._polish_sentence(clean_text)
+            normalized = ConversationManager._normalize_answer_text(polished_text)
+            if not normalized:
+                continue
 
-            normalized = ConversationManager._normalize_answer_text(clean_text)
             citation_indexes: set[int] = set()
             for index in result.citation_indexes:
                 try:
-                    citation_indexes.add(int(index))
+                    value = int(index)
                 except (TypeError, ValueError):
                     continue
+                if value > 0:
+                    citation_indexes.add(value)
 
-            if normalized and normalized in seen:
-                paragraphs[seen[normalized]][1].update(citation_indexes)
+            section = ConversationManager._categorize_claim(result.description, polished_text)
+            has_negation = ConversationManager._has_negation(polished_text)
+
+            if normalized in seen_by_normalized:
+                claim = seen_by_normalized[normalized]
+                claim.citations.update(citation_indexes)
+                claim.steps.append(result.index)
+            else:
+                claim = _Claim(
+                    text=polished_text,
+                    normalized=normalized,
+                    citations=set(citation_indexes),
+                    section=section,
+                    steps=[result.index],
+                    has_negation=has_negation,
+                )
+                seen_by_normalized[normalized] = claim
+                section_claims.setdefault(section, []).append(claim)
+                if section not in sections_in_order:
+                    sections_in_order.append(section)
+
+            conflict_key = ConversationManager._conflict_key(normalized)
+            conflict_groups.setdefault(conflict_key, []).append(claim)
+
+        sections: list[ConsolidatedSection] = []
+        section_usage: dict[int, set[str]] = {}
+
+        for section_name in sections_in_order:
+            claims = section_claims.get(section_name, [])
+            if not claims:
+                continue
+            claims.sort(key=lambda claim: min(claim.steps))
+            sentences: list[str] = []
+            section_citations: set[int] = set()
+            for claim in claims:
+                sentence = ConversationManager._format_sentence(claim.text, claim.citations)
+                if not sentence:
+                    continue
+                sentences.append(sentence)
+                section_citations.update(index for index in claim.citations if index > 0)
+                for index in claim.citations:
+                    if index > 0:
+                        section_usage.setdefault(index, set()).add(section_name)
+            if sentences:
+                sections.append(
+                    ConsolidatedSection(
+                        title=section_name,
+                        sentences=sentences,
+                        citation_indexes=sorted(section_citations),
+                    )
+                )
+
+        conflict_notes: list[ConflictNote] = []
+        for group in conflict_groups.values():
+            unique_claims = {claim.normalized for claim in group}
+            negation_mix = {claim.has_negation for claim in group}
+            if len(group) < 2 or len(unique_claims) < 2 or len(negation_mix) < 2:
                 continue
 
-            paragraphs.append((clean_text, set(citation_indexes)))
-            if normalized:
-                seen[normalized] = len(paragraphs) - 1
+            variants: list[dict[str, Any]] = []
+            citation_union: set[int] = set()
+            for claim in group:
+                citations_sorted = sorted(index for index in claim.citations if index > 0)
+                if not citations_sorted:
+                    continue
+                variant_text = ConversationManager._polish_sentence(claim.text)
+                variants.append({"text": variant_text.rstrip(), "citations": citations_sorted})
+                citation_union.update(citations_sorted)
+            if len(variants) < 2 or not citation_union:
+                continue
 
-        merged_paragraphs: list[tuple[str, set[int]]] = []
-        for text, citation_set in paragraphs:
-            if (
-                merged_paragraphs
-                and len(merged_paragraphs[-1][0]) <= 80
-                and len(text) <= 80
-                and not merged_paragraphs[-1][0].rstrip().endswith((".", "!", "?"))
-                and not text.rstrip().endswith((".", "!", "?"))
-                and "\n" not in merged_paragraphs[-1][0]
-                and "\n" not in text
-            ):
-                previous_text, previous_citations = merged_paragraphs[-1]
-                combined_text = f"{previous_text} {text}".strip()
-                merged_paragraphs[-1] = (
-                    combined_text,
-                    previous_citations | set(citation_set),
+            summary = ConversationManager._build_conflict_summary_text(
+                [variant["text"] for variant in variants]
+            )
+            conflict_notes.append(
+                ConflictNote(
+                    summary=summary,
+                    citation_indexes=sorted(citation_union),
+                    variants=variants,
                 )
-            else:
-                merged_paragraphs.append((text, set(citation_set)))
+            )
 
-        formatted: list[str] = []
-        for text, citation_set in merged_paragraphs:
-            markers = "".join(f"[{index}]" for index in sorted(citation_set))
-            text = text.strip()
-            if markers:
-                text = f"{text} {markers}".strip()
-            formatted.append(text)
+        sections_text: list[str] = []
+        for section in sections:
+            body = " ".join(section.sentences).strip()
+            if body:
+                sections_text.append(f"{section.title}: {body}")
 
-        return "\n\n".join(formatted)
+        conflict_text: list[str] = []
+        for note in conflict_notes:
+            pieces: list[str] = []
+            for variant in note.variants:
+                text = variant["text"].strip()
+                markers = "".join(f"[{index}]" for index in variant["citations"])
+                cleaned = text.rstrip(".")
+                if markers:
+                    pieces.append(f"{cleaned} {markers}".strip())
+                else:
+                    pieces.append(cleaned)
+            statement = "Evidence conflict: " + " vs ".join(pieces)
+            if not statement.endswith("."):
+                statement += "."
+            conflict_text.append(statement)
+
+        parts = [part for part in sections_text + conflict_text if part]
+        final_text = "\n\n".join(parts).strip()
+
+        return ConsolidationOutput(
+            text=final_text,
+            sections=sections,
+            conflicts=conflict_notes,
+            section_usage=section_usage,
+        )
 
     @staticmethod
     def _fallback_citations_from_contexts(
@@ -1204,6 +1460,9 @@ __all__ = [
     "ConnectionState",
     "ConversationManager",
     "ConversationTurn",
+    "ConsolidatedSection",
+    "ConflictNote",
+    "ConsolidationOutput",
     "DynamicPlanningError",
     "PlanItem",
     "ReasoningArtifacts",

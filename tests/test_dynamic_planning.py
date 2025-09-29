@@ -68,7 +68,12 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert len(client.requests) == 4
     assert len(turn.step_results) == 4
     assert [item.status for item in turn.plan] == ["done"] * 4
-    assert turn.plan[0].description.startswith("Scan corpus for background")
+    assert turn.plan[0].description.startswith(
+        "Input: Corpus context → Action: Identify background references on"
+    )
+    assert turn.plan[-1].description.startswith(
+        ("Input: Findings from steps", "Input: Findings from step")
+    )
     assert turn.answer == "Context & Background: Finding. [1][2][3][4]"
     assert len(turn.citations) == 4
     assert turn.citations[0].get("steps") == [1]

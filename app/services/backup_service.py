@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
 import shutil
 import tempfile
 import zipfile
@@ -11,17 +12,23 @@ from pathlib import Path
 
 from .project_service import ProjectService
 from ..storage.database import SCHEMA_VERSION
+from ..logging import log_call
 
 
 MANIFEST_NAME = "manifest.json"
 
 
+logger = logging.getLogger(__name__)
+
+
 class BackupService:
     """Create and restore archive snapshots of application data."""
 
+    @log_call(logger=logger)
     def __init__(self, project_service: ProjectService) -> None:
         self._projects = project_service
 
+    @log_call(logger=logger, include_result=True)
     def create_backup(self, destination: str | Path) -> Path:
         destination_path = Path(destination)
         if destination_path.is_dir():
@@ -44,6 +51,15 @@ class BackupService:
             "storage_locations": storage_locations,
         }
 
+        logger.info(
+            "Creating backup",
+            extra={
+                "destination": str(destination_path),
+                "project_count": len(storage_locations),
+                "active_project": manifest["active_project"],
+            },
+        )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             db_export = tmp_path / "database.db"
@@ -62,12 +78,19 @@ class BackupService:
                             arcname = Path("derived") / project_id / path.relative_to(project_path)
                             archive.write(path, arcname)
                 archive.write(manifest_path, MANIFEST_NAME)
+        logger.info(
+            "Backup created",
+            extra={"destination": str(destination_path), "bytes": destination_path.stat().st_size},
+        )
         return destination_path
 
+    @log_call(logger=logger)
     def restore_backup(self, archive_path: str | Path) -> None:
         archive = Path(archive_path)
         if not archive.exists():
             raise FileNotFoundError(archive)
+
+        logger.info("Restoring backup", extra={"archive": str(archive)})
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -114,6 +137,7 @@ class BackupService:
                     target_root.mkdir(parents=True, exist_ok=True)
 
         self._projects.reload()
+        logger.info("Backup restore complete")
 
 
 __all__ = ["BackupService", "MANIFEST_NAME"]

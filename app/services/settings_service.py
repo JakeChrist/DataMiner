@@ -11,6 +11,7 @@ from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from ..config import ConfigManager
+from ..logging import log_call
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ MIN_FONT_SCALE = 0.5
 MAX_FONT_SCALE = 2.5
 
 
+@log_call(logger=logger, include_result=True)
 def _clamp(value: float, *, low: float, high: float) -> float:
     return float(min(high, max(low, value)))
 
@@ -46,6 +48,7 @@ class SettingsService(QObject):
     font_scale_changed = pyqtSignal(float)
     density_changed = pyqtSignal(str)
 
+    @log_call(logger=logger)
     def __init__(self, config_manager: ConfigManager | None = None) -> None:
         super().__init__()
         self._config = config_manager or ConfigManager()
@@ -55,6 +58,7 @@ class SettingsService(QObject):
 
     # ------------------------------------------------------------------
     # Persistence helpers
+    @log_call(logger=logger)
     def reload(self) -> None:
         """Reload settings from disk."""
 
@@ -97,6 +101,7 @@ class SettingsService(QObject):
         )
         self._base_font_point_size = None
 
+    @log_call(logger=logger)
     def save(self) -> None:
         """Persist the current settings to disk."""
 
@@ -147,6 +152,7 @@ class SettingsService(QObject):
 
     # ------------------------------------------------------------------
     # Mutators
+    @log_call(logger=logger)
     def set_theme(self, theme: str) -> None:
         normalized = "dark" if str(theme).lower() == "dark" else "light"
         if normalized == self._settings.theme:
@@ -156,9 +162,11 @@ class SettingsService(QObject):
         logger.info("Theme changed", extra={"theme": normalized})
         self.theme_changed.emit(normalized)
 
+    @log_call(logger=logger)
     def toggle_theme(self) -> None:
         self.set_theme("dark" if self._settings.theme == "light" else "light")
 
+    @log_call(logger=logger)
     def set_font_scale(self, scale: float) -> None:
         try:
             value = float(scale)
@@ -172,6 +180,7 @@ class SettingsService(QObject):
         logger.info("Font scale changed", extra={"font_scale": value})
         self.font_scale_changed.emit(value)
 
+    @log_call(logger=logger)
     def set_density(self, density: str) -> None:
         normalized = str(density).lower()
         if normalized not in {"compact", "comfortable"}:
@@ -183,6 +192,7 @@ class SettingsService(QObject):
         logger.info("Density changed", extra={"density": normalized})
         self.density_changed.emit(normalized)
 
+    @log_call(logger=logger)
     def set_splitter_sizes(self, sizes: Iterable[int]) -> None:
         values = [int(max(80, value)) for value in sizes]
         if len(values) != 3:
@@ -192,6 +202,7 @@ class SettingsService(QObject):
         self._settings.splitter_sizes = tuple(values)
         self.save()
 
+    @log_call(logger=logger)
     def set_show_corpus_panel(self, visible: bool) -> None:
         value = bool(visible)
         if value == self._settings.show_corpus_panel:
@@ -199,6 +210,7 @@ class SettingsService(QObject):
         self._settings.show_corpus_panel = value
         self.save()
 
+    @log_call(logger=logger)
     def set_show_evidence_panel(self, visible: bool) -> None:
         value = bool(visible)
         if value == self._settings.show_evidence_panel:

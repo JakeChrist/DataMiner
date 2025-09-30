@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
+import os
+import platform
 import sys
 import threading
+import time
 import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .config import get_user_config_dir
 
@@ -59,7 +64,22 @@ def setup_logging(
     logger.addHandler(console_handler)
 
     setattr(logger, "log_path", log_path)
-    logger.debug("Logging initialised. Writing to %s", log_path)
+    logger.info(
+        "Logging initialised",
+        extra={
+            "log_path": str(log_path),
+            "level": logging.getLevelName(level),
+        },
+    )
+    logger.debug(
+        "Runtime environment",
+        extra={
+            "python": platform.python_version(),
+            "platform": platform.platform(),
+            "executable": sys.executable,
+            "cwd": os.getcwd(),
+        },
+    )
     return logger
 
 
@@ -179,4 +199,117 @@ def _show_log_dialog(
         QTimer.singleShot(0, _exec_dialog)
 
 
-__all__ = ["setup_logging", "install_exception_hook", "get_log_file_path"]
+def _safe_repr(value: Any, *, max_length: int = 2000) -> str:
+    """Return a truncated ``repr`` suitable for logging."""
+
+    try:
+        result = repr(value)
+    except Exception:
+        result = object.__repr__(value)
+    if len(result) > max_length:
+        return result[: max_length - 1] + "…"
+    return result
+
+
+def _format_arguments(signature: inspect.Signature, *args: Any, **kwargs: Any) -> str:
+    try:
+        bound = signature.bind_partial(*args, **kwargs)
+    except Exception:
+        return "unavailable"
+    arguments = []
+    for name, value in bound.arguments.items():
+        if name in {"self", "cls"}:
+            continue
+        arguments.append(f"{name}={_safe_repr(value)}")
+    return ", ".join(arguments)
+
+
+def _resolve_logger(target: logging.Logger | str | None, module: str) -> logging.Logger:
+    if isinstance(target, logging.Logger):
+        return target
+    if isinstance(target, str):
+        return logging.getLogger(target)
+    return logging.getLogger(module)
+
+
+def log_call(
+    _func: Optional[Any] = None,
+    *,
+    logger: logging.Logger | str | None = None,
+    level: int = logging.DEBUG,
+    include_args: bool = True,
+    include_result: bool = False,
+    exc_level: int = logging.ERROR,
+) -> Any:
+    """Decorator that logs entry, exit, and failures for ``_func``.
+
+    Parameters mirror :mod:`logging` with sensible defaults and can be used both
+    with and without arguments::
+
+        @log_call
+        def some_function(...):
+            ...
+
+        @log_call(level=logging.INFO, include_result=True)
+        def another(...):
+            ...
+    """
+
+    def decorator(func: Any) -> Any:
+        signature = inspect.signature(func)
+        qualname = getattr(func, "__qualname__", getattr(func, "__name__", "<call>"))
+        module = getattr(func, "__module__", "")
+        log_identifier = f"{module}.{qualname}" if module else qualname
+
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            resolved_logger = _resolve_logger(logger, module)
+            if include_args:
+                arguments = _format_arguments(signature, *args, **kwargs)
+                resolved_logger.log(level, "Calling %s(%s)", log_identifier, arguments)
+            else:
+                resolved_logger.log(level, "Calling %s", log_identifier)
+            start = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+            except Exception:
+                elapsed = time.perf_counter() - start
+                resolved_logger.log(
+                    exc_level,
+                    "Error in %s after %.3fs",
+                    log_identifier,
+                    elapsed,
+                    exc_info=True,
+                )
+                raise
+            elapsed = time.perf_counter() - start
+            if include_result:
+                resolved_logger.log(
+                    level,
+                    "%s returned %s (%.3fs)",
+                    log_identifier,
+                    _safe_repr(result),
+                    elapsed,
+                )
+            else:
+                resolved_logger.log(
+                    level,
+                    "%s completed in %.3fs",
+                    log_identifier,
+                    elapsed,
+                )
+            return result
+
+        return wrapper
+
+    if callable(_func):
+        return decorator(_func)
+    return decorator
+
+
+__all__ = [
+    "setup_logging",
+    "install_exception_hook",
+    "get_log_file_path",
+    "log_call",
+]

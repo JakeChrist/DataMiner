@@ -27,6 +27,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("DataMiner")
 
+    logger.info("Initialising core services")
     settings_service = SettingsService()
     progress_service = ProgressService()
     lmstudio_client = LMStudioClient()
@@ -35,6 +36,21 @@ def main() -> None:
     document_hierarchy = DocumentHierarchyService(project_service.documents)
     export_service = ExportService()
     backup_service = BackupService(project_service)
+    logger.debug(
+        "Service graph ready",
+        extra={
+            "services": [
+                "SettingsService",
+                "ProgressService",
+                "LMStudioClient",
+                "ProjectService",
+                "IngestService",
+                "DocumentHierarchyService",
+                "ExportService",
+                "BackupService",
+            ]
+        },
+    )
 
     window = MainWindow(
         settings_service=settings_service,
@@ -47,13 +63,17 @@ def main() -> None:
         backup_service=backup_service,
     )
     window.show()
+    logger.info("Main window shown")
 
     logger.info("Application started")
     try:
         exit_code = app.exec()
+        logger.info("Application event loop exited", extra={"exit_code": exit_code})
     finally:
+        logger.info("Commencing shutdown sequence")
         ingest_service.shutdown(wait=False)
         project_service.shutdown()
+        logger.info("Shutdown complete")
     sys.exit(exit_code)
 
 

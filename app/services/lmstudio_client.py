@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import time
 from collections.abc import Iterable, Sequence
@@ -10,6 +11,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 from urllib import error, request
+
+from ..logging import log_call
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
@@ -59,6 +65,7 @@ class AnswerLength(Enum):
 class LMStudioClient:
     """Simple HTTP client for LMStudio's OpenAI-compatible API."""
 
+    @log_call(logger=logger)
     def __init__(
         self,
         *,
@@ -80,6 +87,7 @@ class LMStudioClient:
     def model(self) -> str:
         return self._model
 
+    @log_call(logger=logger)
     def configure(
         self,
         *,
@@ -94,6 +102,7 @@ class LMStudioClient:
         if model is not None:
             self._model = model
 
+    @log_call(logger=logger, include_result=True)
     def health_check(self) -> bool:
         """Return ``True`` if the LMStudio server responds to a health probe."""
 
@@ -103,6 +112,7 @@ class LMStudioClient:
             return False
         return True
 
+    @log_call(logger=logger, include_result=True)
     def chat(
         self,
         messages: Sequence[dict[str, Any]],
@@ -120,9 +130,18 @@ class LMStudioClient:
         payload.setdefault("stream", False)
         if extra_options:
             payload.update(extra_options)
+        logger.info(
+            "Dispatching LMStudio chat request",
+            extra={
+                "message_count": len(payload["messages"]),
+                "preset": preset.value,
+                "base_url": self._base_url,
+            },
+        )
         data = self._request_json("POST", CHAT_COMPLETIONS_PATH, payload)
         return self._parse_chat_response(data)
 
+    @log_call(logger=logger, include_result=True)
     def _request(
         self,
         method: str,
@@ -139,6 +158,14 @@ class LMStudioClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
+                logger.debug(
+                    "LMStudio request attempt",
+                    extra={
+                        "method": method,
+                        "url": url,
+                        "attempt": attempt + 1,
+                    },
+                )
                 with request.urlopen(request_obj) as response:
                     status = response.getcode()
                     body = response.read()
@@ -162,13 +189,28 @@ class LMStudioClient:
             except TimeoutError:
                 last_error = LMStudioConnectionError("LMStudio request timed out")
             if attempt < self.max_retries:
+                logger.warning(
+                    "LMStudio request failed, retrying",
+                    extra={
+                        "method": method,
+                        "url": url,
+                        "attempt": attempt + 1,
+                        "error": str(last_error) if last_error else None,
+                    },
+                )
                 time.sleep(self.retry_backoff * (2**attempt))
+        if last_error is None:
+            logger.debug(
+                "LMStudio request completed",
+                extra={"method": method, "url": url},
+            )
         if isinstance(last_error, LMStudioError):
             raise last_error
         if last_error is not None:
             raise LMStudioError(str(last_error))
         raise LMStudioError("Unexpected LMStudio request failure")
 
+    @log_call(logger=logger, include_result=True)
     def _request_json(
         self, method: str, path: str, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -181,6 +223,7 @@ class LMStudioClient:
             raise LMStudioResponseError("Invalid JSON from LMStudio") from exc
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _should_retry(status: int | None) -> bool:
         if status is None:
             return True
@@ -189,6 +232,7 @@ class LMStudioClient:
         return False
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _parse_chat_response(data: dict[str, Any]) -> ChatMessage:
         choices = data.get("choices")
         if not isinstance(choices, Iterable):

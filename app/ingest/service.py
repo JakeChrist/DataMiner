@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import queue
 import threading
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,6 +19,11 @@ from app.storage import (
     DocumentRepository,
     IngestDocumentRepository,
 )
+
+from ..logging import log_call
+
+
+logger = logging.getLogger(__name__)
 
 
 TaskCallback = Callable[[int, dict[str, Any]], None]
@@ -59,6 +65,7 @@ class IngestJob:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
+    @log_call(logger=logger)
     def ensure_defaults(self) -> None:
         """Populate default bookkeeping keys for newly restored jobs."""
 
@@ -85,6 +92,7 @@ class IngestJob:
 class IngestService:
     """Coordinate ingest jobs using a background worker thread."""
 
+    @log_call(logger=logger)
     def __init__(self, db: DatabaseManager, *, worker_idle_sleep: float = 0.1) -> None:
         self.db = db
         self.repo = BackgroundTaskLogRepository(db)
@@ -103,19 +111,32 @@ class IngestService:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    @log_call(logger=logger, include_result=True)
     def subscribe(self, callback: TaskCallback) -> Callable[[], None]:
         """Register ``callback`` for task updates and return an unsubscribe handle."""
 
         with self._jobs_lock:
             self._subscribers.append(callback)
+            subscriber_count = len(self._subscribers)
+
+        logger.debug(
+            "Registered ingest subscriber",
+            extra={"subscriber_count": subscriber_count},
+        )
 
         def unsubscribe() -> None:
             with self._jobs_lock:
                 if callback in self._subscribers:
                     self._subscribers.remove(callback)
+                count = len(self._subscribers)
+            logger.debug(
+                "Unregistered ingest subscriber",
+                extra={"subscriber_count": count},
+            )
 
         return unsubscribe
 
+    @log_call(logger=logger, include_result=True)
     def queue_folder_crawl(
         self,
         project_id: int | None,
@@ -133,8 +154,14 @@ class IngestService:
             "include": list(include or []),
             "exclude": list(exclude or []),
         }
-        return self._create_job("folder_crawl", params, f"Folder crawl for {root_path}")
+        job_id = self._create_job("folder_crawl", params, f"Folder crawl for {root_path}")
+        logger.info(
+            "Queued folder crawl",
+            extra={"job_id": job_id, "project_id": project_id, "root": str(root_path)},
+        )
+        return job_id
 
+    @log_call(logger=logger, include_result=True)
     def queue_file_add(
         self,
         project_id: int | None,
@@ -158,8 +185,18 @@ class IngestService:
             "exclude": list(exclude or []),
             "root": base_dir,
         }
-        return self._create_job("single_file", params, "Single file ingest")
+        job_id = self._create_job("single_file", params, "Single file ingest")
+        logger.info(
+            "Queued file ingest",
+            extra={
+                "job_id": job_id,
+                "project_id": project_id,
+                "file_count": len(normalized),
+            },
+        )
+        return job_id
 
+    @log_call(logger=logger, include_result=True)
     def queue_rescan(
         self,
         project_id: int | None,
@@ -181,8 +218,14 @@ class IngestService:
             "exclude": list(exclude or []),
             "known_files": known_files or {},
         }
-        return self._create_job("rescan", params, f"Rescan for {root_path}")
+        job_id = self._create_job("rescan", params, f"Rescan for {root_path}")
+        logger.info(
+            "Queued rescan",
+            extra={"job_id": job_id, "project_id": project_id, "root": str(root_path)},
+        )
+        return job_id
 
+    @log_call(logger=logger, include_result=True)
     def queue_remove(
         self,
         project_id: int | None,
@@ -200,13 +243,26 @@ class IngestService:
             "files": normalized,
             "known_files": known_files or {},
         }
-        return self._create_job("remove", params, "Remove files from ingest index")
+        job_id = self._create_job("remove", params, "Remove files from ingest index")
+        logger.info(
+            "Queued removal",
+            extra={
+                "job_id": job_id,
+                "project_id": project_id,
+                "root": str(root_path),
+                "file_count": len(normalized),
+            },
+        )
+        return job_id
 
+    @log_call(logger=logger)
     def pause_job(self, job_id: int) -> None:
         job = self._jobs.get(job_id)
         if job is not None:
             job.pause_event.set()
+            logger.info("Pause requested", extra={"job_id": job_id})
 
+    @log_call(logger=logger)
     def resume_job(self, job_id: int) -> None:
         job = self._jobs.get(job_id)
         if job is None:
@@ -217,12 +273,16 @@ class IngestService:
                 job.status = TaskStatus.QUEUED
                 self._persist(job, status=TaskStatus.QUEUED)
                 self._queue.put(job.job_id)
+        logger.info("Resume requested", extra={"job_id": job_id})
 
+    @log_call(logger=logger)
     def cancel_job(self, job_id: int) -> None:
         job = self._jobs.get(job_id)
         if job is not None:
             job.cancel_event.set()
+            logger.info("Cancel requested", extra={"job_id": job_id})
 
+    @log_call(logger=logger, include_result=True)
     def wait_for_completion(self, job_id: int, timeout: float | None = None) -> bool:
         """Block until ``job_id`` reaches a terminal state or ``timeout`` expires."""
 
@@ -242,6 +302,7 @@ class IngestService:
                 return False
             time.sleep(0.05)
 
+    @log_call(logger=logger)
     def shutdown(self, *, wait: bool = True) -> None:
         """Request the worker to stop and optionally wait for completion."""
 
@@ -249,10 +310,12 @@ class IngestService:
         self._queue.put(None)
         if wait:
             self._worker.join()
+        logger.info("Ingest service shutdown", extra={"waited": wait})
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @log_call(logger=logger, include_result=True)
     def _create_job(self, job_type: str, params: dict[str, Any], message: str) -> int:
         payload = {
             "job": {"type": job_type, "params": params},
@@ -284,9 +347,15 @@ class IngestService:
             self._jobs[job.job_id] = job
         self._queue.put(job.job_id)
         self._emit(job.job_id)
+        logger.info(
+            "Created ingest job",
+            extra={"job_id": job.job_id, "job_type": job_type, "message": message},
+        )
         return job.job_id
 
+    @log_call(logger=logger)
     def _restore_incomplete_jobs(self) -> None:
+        restored = 0
         for record in self.repo.list_incomplete():
             job = self._record_to_job(record)
             with self._jobs_lock:
@@ -299,8 +368,13 @@ class IngestService:
                     job.status = TaskStatus.QUEUED
                     self._persist(job, status=TaskStatus.QUEUED)
                 self._queue.put(job.job_id)
+            restored += 1
+        if restored:
+            logger.info("Restored ingest jobs", extra={"count": restored})
 
+    @log_call(logger=logger)
     def _worker_loop(self) -> None:
+        logger.info("Ingest worker loop started")
         while not self._stop_event.is_set():
             try:
                 job_id = self._queue.get(timeout=self._worker_idle_sleep)
@@ -347,14 +421,18 @@ class IngestService:
                 break
             else:
                 self._queue.task_done()
+        logger.info("Ingest worker loop stopped")
 
+    @log_call(logger=logger)
     def _start_job(self, job: IngestJob) -> None:
         job.ensure_defaults()
         job.status = TaskStatus.RUNNING
         if not job.state.get("known_files_snapshot"):
             job.state["known_files_snapshot"] = dict(job.state.get("known_files", {}))
         self._persist(job, status=TaskStatus.RUNNING)
+        logger.info("Job started", extra={"job_id": job.job_id, "job_type": job.job_type})
 
+    @log_call(logger=logger)
     def _process_job(self, job: IngestJob) -> None:
         files = job.state.get("pending_files")
         if files is None:
@@ -417,6 +495,7 @@ class IngestService:
         job.state["processed_files"] = processed_files
         job.state["pending_files"] = files
 
+    @log_call(logger=logger, include_result=True)
     def _handle_path(self, job: IngestJob, path: Path) -> dict[str, Any]:
         if job.job_type == "remove":
             normalized = self._normalize_path(path)
@@ -488,6 +567,7 @@ class IngestService:
 
         return {"status": "success", "metadata": metadata}
 
+    @log_call(logger=logger, include_result=True)
     def _discover_files(self, job: IngestJob) -> list[str]:
         if job.job_type == "single_file":
             files = [Path(path) for path in job.params.get("files", [])]
@@ -519,6 +599,7 @@ class IngestService:
                 result.append(self._normalize_path(file_path))
         return sorted(dict.fromkeys(result))
 
+    @log_call(logger=logger, include_result=True)
     def _matches_filters(
         self,
         path: Path,
@@ -562,11 +643,14 @@ class IngestService:
             return False
         return True
 
+    @log_call(logger=logger)
     def _handle_cancel(self, job: IngestJob) -> None:
         self._rollback_job(job)
         job.status = TaskStatus.CANCELLED
         self._persist(job, status=TaskStatus.CANCELLED, completed=True)
+        logger.info("Job cancelled", extra={"job_id": job.job_id})
 
+    @log_call(logger=logger)
     def _rollback_job(self, job: IngestJob) -> None:
         snapshot = job.state.get("known_files_snapshot", {})
         job.state["known_files"] = dict(snapshot)
@@ -577,12 +661,19 @@ class IngestService:
         job.progress["processed"] = job.progress.get("skipped", 0) + job.progress.get("failed", 0)
         job.summary["known_files"] = dict(snapshot)
         job.state["processed_files"] = []
+        logger.warning(
+            "Job rolled back",
+            extra={"job_id": job.job_id, "rolled_back": job.summary["rolled_back"]},
+        )
 
+    @log_call(logger=logger)
     def _fail_job(self, job: IngestJob, exc: Exception) -> None:
         job.status = TaskStatus.FAILED
         job.errors.append(str(exc))
         self._persist(job, status=TaskStatus.FAILED, message=str(exc), completed=True)
+        logger.error("Job failed", extra={"job_id": job.job_id, "error": str(exc)})
 
+    @log_call(logger=logger)
     def _complete_job(self, job: IngestJob) -> None:
         job.status = TaskStatus.COMPLETED
         job.summary.setdefault("success_count", job.progress.get("succeeded", 0))
@@ -598,7 +689,17 @@ class IngestService:
         job.state["processed_files"] = []
         self._sync_project_documents(job)
         self._persist(job, status=TaskStatus.COMPLETED, completed=True)
+        logger.info(
+            "Job completed",
+            extra={
+                "job_id": job.job_id,
+                "succeeded": job.progress.get("succeeded"),
+                "failed": job.progress.get("failed"),
+                "skipped": job.progress.get("skipped"),
+            },
+        )
 
+    @log_call(logger=logger)
     def _check_pause_cancel(self, job: IngestJob) -> None:
         if job.cancel_event.is_set():
             self._persist(job)
@@ -608,6 +709,7 @@ class IngestService:
             self._persist(job, status=TaskStatus.PAUSED)
             raise _JobPaused
 
+    @log_call(logger=logger)
     def _persist(
         self,
         job: IngestJob,
@@ -626,7 +728,16 @@ class IngestService:
             completed_at=completed_at,
         )
         self._emit(job.job_id)
+        logger.debug(
+            "Persisted job state",
+            extra={
+                "job_id": job.job_id,
+                "status": status or job.status,
+                "completed": completed,
+            },
+        )
 
+    @log_call(logger=logger, include_result=True)
     def _serialize(self, job: IngestJob) -> dict[str, Any]:
         return {
             "job": {"type": job.job_type, "params": job.params},
@@ -636,6 +747,7 @@ class IngestService:
             "state": self._serialize_state(job.state),
         }
 
+    @log_call(logger=logger)
     def _sync_project_documents(self, job: IngestJob) -> None:
         project_id = job.params.get("project_id")
         if not isinstance(project_id, int):
@@ -717,6 +829,7 @@ class IngestService:
                         continue
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:
         serialized: dict[str, Any] = {}
         for key, value in state.items():
@@ -726,6 +839,7 @@ class IngestService:
                 serialized[key] = value
         return serialized
 
+    @log_call(logger=logger, include_result=True)
     def _record_to_job(self, record: dict[str, Any]) -> IngestJob:
         extra = record.get("extra_data") or {}
         job_data = extra.get("job", {})
@@ -748,6 +862,7 @@ class IngestService:
             job.pause_event.set()
         return job
 
+    @log_call(logger=logger)
     def _emit(self, job_id: int) -> None:
         job = self._jobs.get(job_id)
         if job is None:
@@ -759,7 +874,12 @@ class IngestService:
                 callback(job_id, payload)
             except Exception:  # pragma: no cover - defensive
                 continue
+        logger.debug(
+            "Dispatched ingest event",
+            extra={"job_id": job_id, "status": payload["status"]},
+        )
 
+    @log_call(logger=logger, include_result=True)
     def _load_known_files(self, root: str) -> dict[str, Any]:
         root_path = str(Path(root).resolve())
         latest_files: dict[str, Any] = {}
@@ -788,9 +908,14 @@ class IngestService:
                     latest_files = dict(files)
                 break
 
+        logger.debug(
+            "Loaded known files",
+            extra={"root": root_path, "count": len(latest_files)},
+        )
         return latest_files
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _parse_timestamp(value: str) -> datetime | None:
         try:
             return datetime.fromisoformat(value)
@@ -804,10 +929,12 @@ class IngestService:
                 return None
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _normalize_path(path: Path) -> str:
         return str(path.resolve())
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _hash_file(path: Path) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as handle:
@@ -816,6 +943,7 @@ class IngestService:
         return digest.hexdigest()
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _utcnow() -> str:
         from datetime import datetime, timezone
 

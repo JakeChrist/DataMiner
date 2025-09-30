@@ -12,6 +12,7 @@ from typing import Any
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from ..config import ConfigManager, get_user_config_dir
+from ..logging import log_call
 from ..storage import (
     BackgroundTaskLogRepository,
     ChatRepository,
@@ -44,6 +45,7 @@ class ProjectService(QObject):
     projects_changed = pyqtSignal(object)
     active_project_changed = pyqtSignal(object)
 
+    @log_call(logger=logger)
     def __init__(
         self,
         *,
@@ -71,6 +73,7 @@ class ProjectService(QObject):
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
+    @log_call(logger=logger)
     def shutdown(self) -> None:
         """Close resources held by the service."""
 
@@ -103,6 +106,7 @@ class ProjectService(QObject):
         return record
 
     # ------------------------------------------------------------------
+    @log_call(logger=logger, include_result=True)
     def list_projects(self) -> list[ProjectRecord]:
         records: list[ProjectRecord] = []
         for entry in self.projects.list():
@@ -117,6 +121,7 @@ class ProjectService(QObject):
             )
         return records
 
+    @log_call(logger=logger, include_result=True)
     def get_project(self, project_id: int) -> ProjectRecord | None:
         entry = self.projects.get(project_id)
         if not entry:
@@ -127,6 +132,7 @@ class ProjectService(QObject):
             description=entry.get("description"),
         )
 
+    @log_call(logger=logger, include_result=True)
     def create_project(
         self, name: str, *, description: str | None = None, activate: bool = True
     ) -> ProjectRecord:
@@ -141,8 +147,13 @@ class ProjectService(QObject):
             self._emit_projects_changed()
             if activate:
                 self.set_active_project(project.id)
+            logger.info(
+                "Project created",
+                extra={"project_id": project.id, "name": project.name},
+            )
             return project
 
+    @log_call(logger=logger, include_result=True)
     def rename_project(
         self, project_id: int, *, name: str | None = None, description: str | None = None
     ) -> ProjectRecord:
@@ -168,8 +179,13 @@ class ProjectService(QObject):
             self._emit_projects_changed()
             if project_id == self._active_project_id:
                 self._emit_active_project_changed(record)
+            logger.info(
+                "Project updated",
+                extra={"project_id": project_id, "name": record.name},
+            )
             return record
 
+    @log_call(logger=logger)
     def delete_project(self, project_id: int) -> None:
         with self._lock:
             if project_id == self._active_project_id:
@@ -180,7 +196,9 @@ class ProjectService(QObject):
                 shutil.rmtree(storage, ignore_errors=True)
             self._remove_project_settings(project_id)
             self._emit_projects_changed()
+            logger.info("Project deleted", extra={"project_id": project_id})
 
+    @log_call(logger=logger)
     def set_active_project(self, project_id: int) -> None:
         project = self.get_project(project_id)
         if project is None:
@@ -190,7 +208,12 @@ class ProjectService(QObject):
             self._ensure_project_storage(project_id)
             self._store_active_project(project_id)
             self._emit_active_project_changed(project)
+            logger.info(
+                "Active project set",
+                extra={"project_id": project_id, "name": project.name},
+            )
 
+    @log_call(logger=logger)
     def reload(self) -> None:
         """Reload persisted state after an external change such as restore."""
 
@@ -207,9 +230,11 @@ class ProjectService(QObject):
             self._load_active_project()
             self._emit_projects_changed()
             self._emit_active_project_changed(self.active_project())
+            logger.info("Project service reloaded")
 
     # ------------------------------------------------------------------
     # Storage helpers
+    @log_call(logger=logger, include_result=True)
     def get_project_storage(self, project_id: int) -> Path:
         storage = self._project_storage_dir(project_id)
         if storage is None:
@@ -219,11 +244,13 @@ class ProjectService(QObject):
         storage.mkdir(parents=True, exist_ok=True)
         return storage
 
+    @log_call(logger=logger, include_result=True)
     def get_project_storage_location(self, project_id: int) -> Path | None:
         """Return the configured storage path for ``project_id`` without creating it."""
 
         return self._project_storage_dir(project_id)
 
+    @log_call(logger=logger)
     def set_project_storage_location(self, project_id: int, path: str | Path) -> None:
         """Persist ``path`` as the storage location for ``project_id``."""
 
@@ -231,6 +258,7 @@ class ProjectService(QObject):
         with self._lock:
             self._store_project_storage_path(project_id, resolved)
 
+    @log_call(logger=logger, include_result=True)
     def project_storage_directories(self) -> dict[int, Path]:
         """Return a mapping of project IDs to existing storage directories."""
 
@@ -242,6 +270,7 @@ class ProjectService(QObject):
             directories[record.id] = storage
         return directories
 
+    @log_call(logger=logger)
     def purge_project_data(self, project_id: int) -> None:
         """Remove derived data for ``project_id`` without deleting source files."""
 
@@ -254,9 +283,11 @@ class ProjectService(QObject):
             if storage and storage.exists():
                 shutil.rmtree(storage, ignore_errors=True)
             self._ensure_project_storage(project_id)
+            logger.info("Purged project data", extra={"project_id": project_id})
 
     # ------------------------------------------------------------------
     # Conversation setting helpers
+    @log_call(logger=logger, include_result=True)
     def load_conversation_settings(self, project_id: int) -> dict[str, Any]:
         data = self._config.load()
         projects = data.get("projects") if isinstance(data, dict) else {}
@@ -268,6 +299,7 @@ class ProjectService(QObject):
         record = settings.get(str(project_id), {})
         return record if isinstance(record, dict) else {}
 
+    @log_call(logger=logger)
     def save_conversation_settings(self, project_id: int, settings: dict[str, Any]) -> None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -285,6 +317,7 @@ class ProjectService(QObject):
 
     # ------------------------------------------------------------------
     # Corpus root helpers
+    @log_call(logger=logger, include_result=True)
     def list_corpus_roots(self, project_id: int) -> list[str]:
         """Return a list of indexed corpus root folders for ``project_id``."""
 
@@ -307,6 +340,7 @@ class ProjectService(QObject):
             normalized.append(str(Path(entry).resolve()))
         return normalized
 
+    @log_call(logger=logger)
     def add_corpus_root(self, project_id: int, path: str | Path) -> None:
         """Persist ``path`` as an indexed corpus root for ``project_id``."""
 
@@ -337,7 +371,13 @@ class ProjectService(QObject):
                 logger.exception(
                     "Failed to refresh database snapshot for project %s", project_id
                 )
+            else:
+                logger.info(
+                    "Corpus root added",
+                    extra={"project_id": project_id, "path": normalized},
+                )
 
+    @log_call(logger=logger)
     def remove_corpus_root(self, project_id: int, path: str | Path) -> None:
         """Remove ``path`` from the stored corpus roots for ``project_id``."""
 
@@ -373,7 +413,12 @@ class ProjectService(QObject):
                     shutil.rmtree(stored_path, ignore_errors=True)
                 self._clear_project_storage_path(project_id)
             self._ensure_project_storage(project_id)
+            logger.info(
+                "Corpus root removed",
+                extra={"project_id": project_id, "path": normalized},
+            )
 
+    @log_call(logger=logger)
     def clear_corpus_roots(self, project_id: int) -> None:
         """Remove all stored corpus roots for ``project_id``."""
 
@@ -394,16 +439,23 @@ class ProjectService(QObject):
                 if stored_path is not None and stored_path.exists():
                     shutil.rmtree(stored_path, ignore_errors=True)
                 self._clear_project_storage_path(project_id)
+                logger.info("Cleared corpus roots", extra={"project_id": project_id})
 
     # ------------------------------------------------------------------
     # Internal helpers
+    @log_call(logger=logger)
     def _ensure_default_project(self) -> None:
         if self.projects.list():
             return
         created = self.projects.create(DEFAULT_PROJECT_NAME)
         self._ensure_project_storage(int(created["id"]))
         self._store_active_project(int(created["id"]))
+        logger.info(
+            "Default project created",
+            extra={"project_id": int(created["id"]), "name": DEFAULT_PROJECT_NAME},
+        )
 
+    @log_call(logger=logger)
     def _load_active_project(self) -> None:
         stored = self._load_active_project_id()
         available = {record.id for record in self.list_projects()}
@@ -414,7 +466,12 @@ class ProjectService(QObject):
         else:
             raise RuntimeError("No projects available")
         self._ensure_project_storage(self._active_project_id)
+        logger.debug(
+            "Active project loaded",
+            extra={"project_id": self._active_project_id},
+        )
 
+    @log_call(logger=logger, include_result=True)
     def _load_active_project_id(self) -> int | None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -428,6 +485,7 @@ class ProjectService(QObject):
         except (TypeError, ValueError):
             return None
 
+    @log_call(logger=logger)
     def _store_active_project(self, project_id: int) -> None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -438,7 +496,9 @@ class ProjectService(QObject):
             data["projects"] = projects
         projects["active_id"] = project_id
         self._config.save(data)
+        logger.debug("Stored active project", extra={"project_id": project_id})
 
+    @log_call(logger=logger)
     def _remove_project_settings(self, project_id: int) -> None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -461,7 +521,9 @@ class ProjectService(QObject):
             modified = True
         if modified:
             self._config.save(data)
+            logger.debug("Removed project settings", extra={"project_id": project_id})
 
+    @log_call(logger=logger, include_result=True)
     def export_project_database_snapshot(
         self, project_id: int, *, filename: str = "dataminer.db"
     ) -> Path | None:
@@ -474,6 +536,7 @@ class ProjectService(QObject):
             destination = storage / filename
             return self._db.export_database(destination)
 
+    @log_call(logger=logger, include_result=True)
     def _load_project_storage_path(self, project_id: int) -> Path | None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -489,6 +552,7 @@ class ProjectService(QObject):
             return Path(stored)
         return None
 
+    @log_call(logger=logger)
     def _store_project_storage_path(self, project_id: int, path: Path) -> None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -506,7 +570,12 @@ class ProjectService(QObject):
             return
         storage_locations[str(project_id)] = serialized
         self._config.save(data)
+        logger.debug(
+            "Stored project storage path",
+            extra={"project_id": project_id, "path": serialized},
+        )
 
+    @log_call(logger=logger)
     def _clear_project_storage_path(self, project_id: int) -> None:
         data = self._config.load()
         if not isinstance(data, dict):
@@ -521,13 +590,16 @@ class ProjectService(QObject):
             if not storage_locations:
                 projects.pop("storage_locations", None)
             self._config.save(data)
+            logger.debug("Cleared stored project path", extra={"project_id": project_id})
 
+    @log_call(logger=logger, include_result=True)
     def _primary_corpus_root(self, project_id: int) -> Path | None:
         roots = self.list_corpus_roots(project_id)
         if not roots:
             return None
         return Path(roots[0])
 
+    @log_call(logger=logger, include_result=True)
     def _project_storage_dir(self, project_id: int) -> Path | None:
         stored = self._load_project_storage_path(project_id)
         if stored is not None:
@@ -541,16 +613,26 @@ class ProjectService(QObject):
             storage.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(legacy), str(storage))
         self._store_project_storage_path(project_id, storage)
+        logger.debug(
+            "Derived project storage",
+            extra={"project_id": project_id, "path": str(storage)},
+        )
         return storage
 
+    @log_call(logger=logger, include_result=True)
     def _ensure_project_storage(self, project_id: int) -> Path | None:
         storage = self._project_storage_dir(project_id)
         if storage is None:
             return None
         storage.mkdir(parents=True, exist_ok=True)
+        logger.debug(
+            "Ensured project storage",
+            extra={"project_id": project_id, "path": str(storage)},
+        )
         return storage
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _path_within(path: Path, parent: Path) -> bool:
         try:
             return path.resolve().is_relative_to(parent.resolve())
@@ -572,11 +654,13 @@ class ProjectService(QObject):
                 except ValueError:
                     return False
 
+    @log_call(logger=logger)
     def _emit_projects_changed(self) -> None:
         projects = self.list_projects()
         logger.info("Projects changed", extra={"project_count": len(projects)})
         self.projects_changed.emit(projects)
 
+    @log_call(logger=logger)
     def _emit_active_project_changed(self, project: ProjectRecord) -> None:
         logger.info(
             "Active project changed",

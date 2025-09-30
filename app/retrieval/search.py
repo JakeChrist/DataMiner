@@ -237,13 +237,15 @@ class SearchService:
 
     @staticmethod
     def _normalize_path(path: str | Path) -> str:
-        return str(Path(path))
+        """Return a canonical absolute string representation for ``path``."""
+
+        return str(Path(path).expanduser().resolve())
 
     @staticmethod
     def _normalize_folder(folder: str | Path | None) -> str | None:
         if folder in (None, ""):
             return None
-        return str(Path(folder))
+        return str(Path(folder).expanduser().resolve())
 
     # ------------------------------------------------------------------
     _TOKEN_PATTERN = re.compile(r"[\w-]+", re.UNICODE)

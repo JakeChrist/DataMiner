@@ -1535,10 +1535,14 @@ class MainWindow(QMainWindow):
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
         step_context_provider = self._build_step_context_provider(question)
-        extra_options = self._build_extra_request_options(question)
+        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
+        extra_options = self._build_extra_request_options(
+            question, retrieval_documents=retrieval_documents or None
+        )
         try:
             turn = self._conversation_manager.ask(
                 question,
+                context_snippets=context_snippets or None,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 preset=self.conversation_settings.answer_length,

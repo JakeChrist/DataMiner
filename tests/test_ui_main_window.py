@@ -18,10 +18,15 @@ from PyQt6.QtWidgets import QApplication, QSplitter, QPushButton
 
 from app.config import ConfigManager
 from app.ingest.parsers import SUPPORTED_PATTERNS
-from app.services.conversation_manager import ReasoningVerbosity
+from app.services.conversation_manager import (
+    ConnectionState,
+    ConversationTurn,
+    ReasoningVerbosity,
+)
 from app.services.progress_service import ProgressService
 from app.services.settings_service import SettingsService
 from app.services.project_service import ProjectService
+from app.services.document_hierarchy import DocumentHierarchyService
 from app.services.export_service import ExportService
 from app.services.backup_service import BackupService
 from app.ui.main_window import MainWindow
@@ -339,6 +344,103 @@ def test_evidence_scope_requery_and_preview(qt_app, tmp_path, monkeypatch, proje
     assert client.calls >= previous_calls + 1
 
     window.close()
+
+
+def test_question_includes_retrieval_context(
+    qt_app, tmp_path, monkeypatch, project_service
+) -> None:
+    context_path = tmp_path / "docs" / "context.txt"
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    context_text = "Solar adoption is accelerating across regions."
+    context_path.write_text(context_text, encoding="utf-8")
+
+    class RecordingConversationManager:
+        def __init__(self, _client) -> None:
+            self.turns: list[ConversationTurn] = []
+            self.last_call: dict[str, object] | None = None
+            self._state = ConnectionState(True, None)
+
+        def add_connection_listener(self, _listener):
+            return lambda: None
+
+        @property
+        def connection_state(self) -> ConnectionState:
+            return self._state
+
+        def ask(self, question: str, **kwargs) -> ConversationTurn:  # type: ignore[override]
+            self.last_call = {"question": question, **kwargs}
+            turn = ConversationTurn(question=question, answer="Stub answer")
+            self.turns.append(turn)
+            return turn
+
+    class StubSearchService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def collect_context_records(self, *_args, **_kwargs) -> list[dict[str, object]]:
+            return [
+                {
+                    "document": {
+                        "id": 1,
+                        "title": "Context Doc",
+                        "source_path": str(context_path),
+                    },
+                    "chunk": {"id": 11, "index": 0, "text": context_text},
+                    "context": context_text,
+                    "score": 0.12,
+                    "ingest_document": {"id": 5, "version": 1},
+                }
+            ]
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr("app.ui.main_window.ConversationManager", RecordingConversationManager)
+    monkeypatch.setattr("app.ui.main_window.SearchService", StubSearchService)
+
+    settings_service = build_settings_service(tmp_path, monkeypatch)
+    progress_service = ProgressService()
+    client = DummyLMStudioClient()
+    export_service = ExportService()
+    backup_service = BackupService(project_service)
+
+    class StubIngestService:
+        def subscribe(self, _callback):
+            return lambda: None
+
+        def shutdown(self, *, wait: bool = True) -> None:  # pragma: no cover - compatibility
+            pass
+
+    ingest_service = StubIngestService()
+    document_hierarchy = DocumentHierarchyService(project_service.documents)
+
+    window = MainWindow(
+        settings_service=settings_service,
+        progress_service=progress_service,
+        lmstudio_client=client,
+        project_service=project_service,
+        ingest_service=ingest_service,
+        document_hierarchy=document_hierarchy,
+        export_service=export_service,
+        backup_service=backup_service,
+        enable_health_monitor=False,
+    )
+
+    try:
+        window.question_input.set_text("Summarize solar adoption trends")
+        window.question_input.ask_button.click()
+        qt_app.processEvents()
+
+        manager = window._conversation_manager  # type: ignore[attr-defined]
+        assert isinstance(manager, RecordingConversationManager)
+        assert manager.last_call is not None
+        context_snippets = manager.last_call.get("context_snippets")
+        assert isinstance(context_snippets, list) and context_snippets
+        assert any("Solar adoption" in snippet for snippet in context_snippets)
+        extra_options = manager.last_call.get("extra_options")
+        assert isinstance(extra_options, dict)
+        documents = extra_options.get("retrieval", {}).get("documents", [])  # type: ignore[assignment]
+        assert documents and documents[0]["text"] == context_text
+    finally:
+        window.close()
 
 
 def test_evidence_open_in_system_app(qt_app, tmp_path, monkeypatch, project_service):

@@ -57,10 +57,7 @@ class SearchService:
             path = record.get("path") or doc_payload.get("path")
             if not path:
                 continue
-            normalized_path = self._normalize_path(path)
-            document = documents_by_path.get(normalized_path)
-            if document is None and normalized_path:
-                document = documents_by_path.get(normalized_path.casefold())
+            document = documents_by_path.get(self._normalize_path(path))
             if document is None:
                 continue
             doc_id = int(document.get("id"))
@@ -116,10 +113,7 @@ class SearchService:
             path = record.get("path") or doc_payload.get("path")
             if not path:
                 continue
-            normalized_path = self._normalize_path(path)
-            document = documents_by_path.get(normalized_path)
-            if document is None and normalized_path:
-                document = documents_by_path.get(normalized_path.casefold())
+            document = documents_by_path.get(self._normalize_path(path))
             if document is None:
                 continue
             identifiers = self._document_identifiers(document)
@@ -223,12 +217,7 @@ class SearchService:
             if not source_path:
                 continue
             normalized = self._normalize_path(source_path)
-            if not normalized:
-                continue
             index[normalized] = document
-            folded = normalized.casefold()
-            if folded not in index:
-                index[folded] = document
         return index
 
     @staticmethod
@@ -240,9 +229,7 @@ class SearchService:
         source_path = document.get("source_path")
         if source_path:
             identifiers.add(str(source_path))
-            normalized = SearchService._normalize_path(source_path)
-            identifiers.add(normalized)
-            identifiers.add(normalized.casefold())
+            identifiers.add(SearchService._normalize_path(source_path))
         title = document.get("title")
         if isinstance(title, str) and title:
             identifiers.add(title)
@@ -250,11 +237,7 @@ class SearchService:
 
     @staticmethod
     def _normalize_path(path: str | Path) -> str:
-        try:
-            resolved = Path(path).expanduser().resolve()
-        except (TypeError, ValueError, OSError):
-            return str(path)
-        return str(resolved)
+        return str(Path(path))
 
     @staticmethod
     def _normalize_folder(folder: str | Path | None) -> str | None:

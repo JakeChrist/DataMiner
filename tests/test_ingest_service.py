@@ -11,17 +11,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pytest
-from datetime import datetime
 
 from app.ingest.service import IngestService, TaskStatus
 from app.storage import (
-    DatabaseError,
     DatabaseManager,
     DocumentRepository,
     IngestDocumentRepository,
     ProjectRepository,
 )
-from app.ingest.parsers import ParsedDocument
 
 
 @pytest.fixture()
@@ -185,40 +182,6 @@ def test_rescan_detects_changes_and_removals(tmp_path: Path, db_manager: Databas
     service.shutdown()
 
 
-def test_folder_crawl_handles_unreadable_files(
-    tmp_path: Path, db_manager: DatabaseManager, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "restricted"
-    root.mkdir()
-    unreadable = root / "secret.txt"
-    unreadable.write_text("top secret", encoding="utf-8")
-
-    def fake_hash(_path: Path) -> str:
-        raise OSError("denied")
-
-    monkeypatch.setattr(
-        IngestService,
-        "_hash_file",
-        staticmethod(fake_hash),
-    )
-
-    service = IngestService(db_manager, worker_idle_sleep=0.01)
-    job_id = service.queue_folder_crawl(None, root, include=["*.txt"])
-    assert service.wait_for_completion(job_id, timeout=5.0)
-
-    record = service.repo.get(job_id)
-    assert record is not None
-    assert record["status"] == TaskStatus.COMPLETED
-    summary = record["extra_data"]["summary"]
-    assert summary["success_count"] == 0
-    assert summary["failure_count"] == 1
-    assert summary["known_files"] == {}
-    errors = record["extra_data"].get("errors", [])
-    assert any("Unable to read" in str(error) for error in errors)
-
-    service.shutdown()
-
-
 def test_pause_and_resume_persists_progress(tmp_path: Path, db_manager: DatabaseManager) -> None:
     root = tmp_path / "pause"
     root.mkdir()
@@ -365,130 +328,4 @@ def test_resume_after_restart(tmp_path: Path, db_manager: DatabaseManager) -> No
     assert final_record["extra_data"]["summary"]["success_count"] == 4
 
     service_two.shutdown()
-
-
-def test_project_document_sync_retries_when_locked(
-    tmp_path: Path, db_manager: DatabaseManager
-) -> None:
-    project = ProjectRepository(db_manager).create("Retry Project")
-    sample = tmp_path / "doc.txt"
-    sample.write_text("content", encoding="utf-8")
-
-    service = IngestService(db_manager, worker_idle_sleep=0.01)
-    try:
-        original_create = service.project_documents.create
-        attempts = {"count": 0}
-
-        def flaky_create(*args, **kwargs):
-            if attempts["count"] == 0:
-                attempts["count"] += 1
-                raise DatabaseError("database is locked")
-            return original_create(*args, **kwargs)
-
-        service.project_documents.create = flaky_create  # type: ignore[assignment]
-
-        job_id = service.queue_file_add(project["id"], [sample])
-        assert service.wait_for_completion(job_id, timeout=5.0)
-        record = service.repo.get(job_id)
-        assert record is not None
-        assert record["status"] == TaskStatus.COMPLETED
-
-        repo = DocumentRepository(db_manager)
-        documents = repo.list_for_project(project["id"])
-        assert any(doc.get("source_path") == str(sample.resolve()) for doc in documents)
-    finally:
-        service.shutdown()
-
-
-def test_project_document_sync_failure_marks_job_failed(
-    tmp_path: Path, db_manager: DatabaseManager
-) -> None:
-    project = ProjectRepository(db_manager).create("Failure Project")
-    sample = tmp_path / "doc.txt"
-    sample.write_text("content", encoding="utf-8")
-
-    service = IngestService(db_manager, worker_idle_sleep=0.01)
-    try:
-        def always_locked(*args, **kwargs):
-            raise DatabaseError("database is locked")
-
-        service.project_documents.create = always_locked  # type: ignore[assignment]
-
-        job_id = service.queue_file_add(project["id"], [sample])
-        assert service.wait_for_completion(job_id, timeout=5.0)
-        record = service.repo.get(job_id)
-        assert record is not None
-        assert record["status"] == TaskStatus.FAILED
-        errors = record["extra_data"].get("errors", [])
-        assert any("project documents" in str(error).lower() for error in errors)
-    finally:
-        service.shutdown()
-
-
-def test_project_document_sync_accepts_string_project_id(
-    tmp_path: Path, db_manager: DatabaseManager
-) -> None:
-    project = ProjectRepository(db_manager).create("String Project")
-    sample = tmp_path / "doc.txt"
-    sample.write_text("content", encoding="utf-8")
-
-    service = IngestService(db_manager, worker_idle_sleep=0.01)
-    try:
-        project_id = project["id"]
-        job_id = service.queue_file_add(str(project_id), [sample])  # type: ignore[arg-type]
-        assert service.wait_for_completion(job_id, timeout=5.0)
-        record = service.repo.get(job_id)
-        assert record is not None
-        assert record["status"] == TaskStatus.COMPLETED
-        documents = DocumentRepository(db_manager).list_for_project(int(project_id))
-        assert any(doc.get("source_path") == str(sample.resolve()) for doc in documents)
-    finally:
-        service.shutdown()
-
-
-def test_ingest_sanitizes_non_json_metadata(
-    tmp_path: Path, db_manager: DatabaseManager, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    project = ProjectRepository(db_manager).create("Metadata Project")
-    sample = tmp_path / "binary.bin"
-    sample.write_bytes(b"\x00\xff\x10")
-
-    def fake_parse(path: Path) -> ParsedDocument:
-        return ParsedDocument(
-            text="payload",
-            metadata={
-                "created": datetime(2024, 1, 2, 3, 4, 5),
-                "path": Path(path),
-                "raw": b"\x00\xff",
-                "values": {3, 1, 2},
-            },
-        )
-
-    monkeypatch.setattr("app.ingest.service.parse_file", fake_parse)
-
-    service = IngestService(db_manager, worker_idle_sleep=0.01)
-    try:
-        job_id = service.queue_file_add(project["id"], [sample])
-        assert service.wait_for_completion(job_id, timeout=5.0)
-        record = service.repo.get(job_id)
-        assert record is not None
-        summary = record["extra_data"]["summary"]
-        known_files = summary["known_files"]
-        entry = known_files[str(sample.resolve())]
-        parser_meta = entry["parser_metadata"]
-        assert parser_meta["path"] == str(sample.resolve())
-        assert parser_meta["created"].endswith("+00:00")
-        assert parser_meta["raw"].startswith("base64:")
-        assert parser_meta["values"] == [1, 2, 3]
-
-        documents = DocumentRepository(db_manager).list_for_project(project["id"])
-        assert documents
-        file_meta = documents[0]["metadata"]["file"]
-        doc_parser = file_meta["parser_metadata"]
-        assert doc_parser["path"] == str(sample.resolve())
-        assert doc_parser["created"].endswith("+00:00")
-        assert doc_parser["raw"].startswith("base64:")
-        assert doc_parser["values"] == [1, 2, 3]
-    finally:
-        service.shutdown()
 

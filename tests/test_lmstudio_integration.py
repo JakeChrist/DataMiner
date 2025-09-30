@@ -117,30 +117,6 @@ def test_lmstudio_client_parses_structured_content() -> None:
     assert message.citations == [{"source": "doc", "snippet": "text"}]
 
 
-def test_lmstudio_client_ignores_reasoning_chunks() -> None:
-    data = {
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "reasoning", "text": "Thinking..."},
-                        {"type": "output_text", "text": "Final answer."},
-                    ],
-                    "metadata": {
-                        "reasoning": {"steps": ["Thinking..."]},
-                    },
-                }
-            }
-        ]
-    }
-
-    message = LMStudioClient._parse_chat_response(data)
-
-    assert message.content == "Final answer."
-    assert message.reasoning == {"steps": ["Thinking..."]}
-
-
 def test_lmstudio_client_handles_nested_citation_container() -> None:
     data = {
         "choices": [

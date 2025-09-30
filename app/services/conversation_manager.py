@@ -1471,7 +1471,6 @@ class ConversationManager:
             response_mode,
             extra_options,
         )
-        fallback_documents = self._extract_retrieval_documents(request_options)
         try:
             response = self.client.chat(
                 messages,
@@ -1483,17 +1482,6 @@ class ConversationManager:
             raise
 
         self._update_connection(True, None)
-        if not response.citations and fallback_documents:
-            inferred = self._fallback_citations_from_contexts(
-                [StepContextBatch(snippets=[], documents=list(fallback_documents))]
-            )
-            if inferred:
-                response = ChatMessage(
-                    content=response.content,
-                    citations=inferred,
-                    reasoning=response.reasoning,
-                    raw_response=response.raw_response,
-                )
         turn = self._register_turn(question, response, response_mode, preset)
         return turn
 
@@ -2331,22 +2319,6 @@ class ConversationManager:
             if normalized_question and (query is None or not str(query).strip()):
                 retrieval["query"] = normalized_question
         return options
-
-    @staticmethod
-    def _extract_retrieval_documents(options: dict[str, Any]) -> list[dict[str, Any]]:
-        retrieval = options.get("retrieval") if isinstance(options, dict) else None
-        if not isinstance(retrieval, dict):
-            return []
-        documents = retrieval.get("documents")
-        if isinstance(documents, dict):
-            return [dict(documents)]
-        if isinstance(documents, Iterable) and not isinstance(documents, (str, bytes)):
-            normalized: list[dict[str, Any]] = []
-            for document in documents:
-                if isinstance(document, dict):
-                    normalized.append(dict(document))
-            return normalized
-        return []
 
     def _merge_step_options(
         self,

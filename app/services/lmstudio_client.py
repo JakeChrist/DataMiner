@@ -222,24 +222,10 @@ class LMStudioClient:
             for item in content:
                 if isinstance(item, str):
                     parts.append(item)
-                    continue
-                if not isinstance(item, dict):
-                    continue
-
-                type_value = item.get("type")
-                if isinstance(type_value, str) and "reasoning" in type_value.lower():
-                    continue
-                if item.get("is_reasoning") is True:
-                    continue
-
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-                    continue
-
-                content_text = item.get("content")
-                if isinstance(content_text, str):
-                    parts.append(content_text)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
             if parts:
                 return "".join(parts)
         raise LMStudioResponseError("LMStudio message missing content")

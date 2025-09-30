@@ -3,33 +3,24 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import queue
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from numbers import Integral
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, TypeVar
+from typing import Any, Callable, Iterable, Optional
 
 from app.ingest.parsers import ParserError, parse_file
 from app.storage import (
     BackgroundTaskLogRepository,
-    DatabaseError,
     DatabaseManager,
     DocumentRepository,
     IngestDocumentRepository,
 )
-from app.storage.json_utils import make_json_safe
 
 
 TaskCallback = Callable[[int, dict[str, Any]], None]
-T = TypeVar("T")
-
-
-LOGGER = logging.getLogger(__name__)
 
 
 class TaskStatus:
@@ -135,7 +126,6 @@ class IngestService:
     ) -> int:
         """Discover and ingest all files underneath ``root``."""
 
-        project_id = self._coerce_project_id(project_id)
         root_path = Path(root).resolve()
         params = {
             "project_id": project_id,
@@ -155,7 +145,6 @@ class IngestService:
     ) -> int:
         """Queue a job that ingests one or multiple explicit files."""
 
-        project_id = self._coerce_project_id(project_id)
         if isinstance(files, (str, Path)):
             file_list = [files]
         else:
@@ -182,7 +171,6 @@ class IngestService:
     ) -> int:
         """Re-ingest files that have changed since the previous crawl."""
 
-        project_id = self._coerce_project_id(project_id)
         root_path = Path(root).resolve()
         if known_files is None:
             known_files = self._load_known_files(str(root_path))
@@ -203,7 +191,6 @@ class IngestService:
     ) -> int:
         """Remove tracked files from the ingest index."""
 
-        project_id = self._coerce_project_id(project_id)
         root_path = Path(root).resolve()
         normalized = [str(Path(path).resolve()) for path in files]
         known_files = self._load_known_files(str(root_path))
@@ -241,27 +228,16 @@ class IngestService:
 
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
+            job = self._jobs.get(job_id)
+            if job and job.status in TaskStatus.FINAL:
+                return True
             record = self.repo.get(job_id)
-            if record is not None and record["status"] in TaskStatus.FINAL:
-                job = self._jobs.get(job_id)
+            if record is None:
+                return False
+            if record["status"] in TaskStatus.FINAL:
                 if job is not None:
                     job.status = record["status"]
                 return True
-
-            job = self._jobs.get(job_id)
-            if job and job.status in TaskStatus.FINAL:
-                # The worker has finished but the persistence thread may not have
-                # written the final status to the database yet. Wait briefly for
-                # the record to reach a terminal state so callers observe
-                # consistent results.
-                if deadline is not None and time.monotonic() >= deadline:
-                    return False
-                time.sleep(0.05)
-                continue
-
-            if record is None and job is None:
-                return False
-
             if deadline is not None and time.monotonic() >= deadline:
                 return False
             time.sleep(0.05)
@@ -404,28 +380,11 @@ class IngestService:
                 job.progress["succeeded"] += 1
                 metadata = result["metadata"]
                 processed_files.append(metadata)
-                summary_entry: dict[str, Any] = {
+                known_files[metadata["path"]] = {
                     "checksum": metadata["checksum"],
                     "mtime": metadata["mtime"],
                     "size": metadata["size"],
                 }
-                if "ctime" in metadata:
-                    summary_entry["ctime"] = metadata["ctime"]
-                if "document_id" in metadata:
-                    summary_entry["document_id"] = metadata["document_id"]
-                if "version" in metadata:
-                    summary_entry["version"] = metadata["version"]
-                if "preview" in metadata:
-                    summary_entry["preview"] = metadata["preview"]
-                if "needs_ocr" in metadata:
-                    summary_entry["needs_ocr"] = metadata["needs_ocr"]
-                if "ocr_message" in metadata:
-                    summary_entry["ocr_message"] = metadata["ocr_message"]
-                parser_meta = metadata.get("parser_metadata")
-                if parser_meta:
-                    summary_entry["parser_metadata"] = parser_meta
-                summary_entry = make_json_safe(summary_entry)
-                known_files[metadata["path"]] = summary_entry
                 if metadata.get("needs_ocr"):
                     job.summary.setdefault("needs_ocr", []).append(
                         {
@@ -472,33 +431,13 @@ class IngestService:
                 "error": f"Missing file: {path}",
             }
 
-        normalized_path = self._normalize_path(path)
-
-        try:
-            stat = path.stat()
-        except OSError as exc:
-            return {
-                "status": "failed",
-                "metadata": {"path": normalized_path},
-                "error": f"Unable to access file metadata: {exc}",
-            }
-
+        stat = path.stat()
         metadata = {
-            "path": normalized_path,
+            "path": self._normalize_path(path),
             "mtime": stat.st_mtime,
-            "ctime": stat.st_ctime,
             "size": stat.st_size,
+            "checksum": self._hash_file(path),
         }
-
-        try:
-            metadata["checksum"] = self._hash_file(path)
-        except OSError as exc:
-            metadata["hash_error"] = str(exc)
-            return {
-                "status": "failed",
-                "metadata": metadata,
-                "error": f"Unable to read file contents: {exc}",
-            }
 
         if job.job_type == "rescan":
             previous = job.state.get("known_files_snapshot", {}).get(metadata["path"])
@@ -530,36 +469,22 @@ class IngestService:
                 "checksum": metadata["checksum"],
             }
         }
-        try:
-            record = self.documents.store_version(
-                path=metadata["path"],
-                checksum=metadata["checksum"],
-                size=stat.st_size,
-                mtime=stat.st_mtime,
-                ctime=stat.st_ctime,
-                parsed=parsed,
-                base_metadata=base_metadata,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            metadata["storage_error"] = str(exc)
-            return {
-                "status": "failed",
-                "metadata": metadata,
-                "error": str(exc),
-            }
+        record = self.documents.store_version(
+            path=metadata["path"],
+            checksum=metadata["checksum"],
+            size=stat.st_size,
+            mtime=stat.st_mtime,
+            ctime=stat.st_ctime,
+            parsed=parsed,
+            base_metadata=base_metadata,
+        )
         metadata["document_id"] = record.get("id")
         metadata["version"] = record.get("version")
         metadata["preview"] = record.get("preview")
         metadata["needs_ocr"] = record.get("needs_ocr", False)
         if record.get("ocr_message"):
             metadata["ocr_message"] = record["ocr_message"]
-        parser_metadata = make_json_safe(parsed.metadata)
-        if parser_metadata not in (None, {}):
-            metadata["parser_metadata"] = parser_metadata
-
-        metadata = make_json_safe(metadata)
-        if not isinstance(metadata, dict):
-            metadata = {"path": normalized_path}
+        metadata["parser_metadata"] = parsed.metadata
 
         return {"status": "success", "metadata": metadata}
 
@@ -614,13 +539,22 @@ class IngestService:
         exclude_patterns = list(exclude)
 
         def _matches(pattern: str) -> bool:
-            if fnmatch(relative, pattern):
-                return True
             normalized_relative = relative.replace("\\", "/")
             normalized_pattern = pattern.replace("\\", "/")
-            if fnmatch(normalized_relative, normalized_pattern):
-                return True
-            return fnmatch(path.name, pattern)
+            candidates = [
+                relative,
+                relative.lower(),
+                normalized_relative,
+                normalized_relative.lower(),
+                path.name,
+                path.name.lower(),
+            ]
+            patterns = [pattern, pattern.lower(), normalized_pattern, normalized_pattern.lower()]
+            for candidate in candidates:
+                for current in patterns:
+                    if fnmatch(candidate, current):
+                        return True
+            return False
 
         if include_patterns and not any(_matches(pattern) for pattern in include_patterns):
             return False
@@ -703,8 +637,8 @@ class IngestService:
         }
 
     def _sync_project_documents(self, job: IngestJob) -> None:
-        project_id = self._coerce_project_id(job.params.get("project_id"))
-        if project_id is None:
+        project_id = job.params.get("project_id")
+        if not isinstance(project_id, int):
             return
 
         repo = self.project_documents
@@ -716,68 +650,39 @@ class IngestService:
             ).fetchone()
             if project_exists is None:
                 return
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Unable to sync project documents: %s", exc)
-            job.errors.append("Failed to sync project documents")
-            raise RuntimeError("Failed to sync project documents") from exc
-
-        def _load_existing() -> dict[str, dict[str, Any]]:
-            mapping: dict[str, dict[str, Any]] = {}
-            for doc in repo.list_for_project(project_id):
-                source_path = doc.get("source_path")
-                if not source_path:
-                    continue
-                mapping[str(Path(source_path).resolve())] = doc
-            return mapping
-
-        try:
-            existing_docs = self._execute_with_retry(_load_existing)
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Unable to load existing project documents: %s", exc)
-            job.errors.append("Failed to sync project documents")
-            raise RuntimeError("Failed to sync project documents") from exc
+            existing_docs = {
+                str(Path(doc["source_path"]).resolve()): doc
+                for doc in repo.list_for_project(project_id)
+                if doc.get("source_path")
+            }
+        except Exception:  # pragma: no cover - defensive
+            return
 
         known_files_param = job.summary.get("known_files", {})
         if not isinstance(known_files_param, dict):
             known_files_param = {}
 
-        sync_failed = False
-
+        normalized_known: dict[str, dict[str, Any]] = {}
         for path, metadata in known_files_param.items():
             if not isinstance(path, str):
                 continue
             normalized_path = str(Path(path).resolve())
             data = dict(metadata) if isinstance(metadata, dict) else {}
+            normalized_known[normalized_path] = data
             document = existing_docs.get(normalized_path)
             payload = {"file": data}
             if document is None:
                 title = Path(normalized_path).stem or Path(normalized_path).name
-
-                def _create() -> dict[str, Any]:
-                    return repo.create(
+                try:
+                    repo.create(
                         project_id,
                         title,
                         source_type="file",
                         source_path=normalized_path,
                         metadata=payload,
                     )
-
-                try:
-                    created = self._execute_with_retry(_create)
-                except Exception as exc:  # pragma: no cover - defensive
-                    LOGGER.warning(
-                        "Unable to create project document for %s: %s",
-                        normalized_path,
-                        exc,
-                    )
-                    job.errors.append(
-                        f"Failed to register document metadata for {normalized_path}"
-                    )
-                    sync_failed = True
+                except Exception:  # pragma: no cover - defensive
                     continue
-                if created and created.get("source_path"):
-                    key = str(Path(created["source_path"]).resolve())
-                    existing_docs[key] = created
             else:
                 updates: dict[str, Any] = {}
                 if document.get("source_path") != normalized_path:
@@ -786,119 +691,30 @@ class IngestService:
                 if current_meta.get("file") != data:
                     updates["metadata"] = payload
                 if updates:
-                    def _update() -> dict[str, Any] | None:
-                        return repo.update(document["id"], **updates)
-
                     try:
-                        updated = self._execute_with_retry(_update)
-                    except Exception as exc:  # pragma: no cover - defensive
-                        LOGGER.warning(
-                            "Unable to update project document for %s: %s",
-                            normalized_path,
-                            exc,
-                        )
-                        job.errors.append(
-                            f"Failed to update document metadata for {normalized_path}"
-                        )
-                        sync_failed = True
+                        repo.update(document["id"], **updates)
+                    except Exception:  # pragma: no cover - defensive
                         continue
-                    if updated and updated.get("source_path"):
-                        key = str(Path(updated["source_path"]).resolve())
-                        existing_docs[key] = updated
 
-        removed_paths: list[str] = []
+        removed_paths: set[str] = set()
         removed = job.summary.get("removed")
         if isinstance(removed, (list, tuple, set)):
-            removed_paths = [
-                str(Path(entry).resolve()) for entry in removed if isinstance(entry, str)
-            ]
+            for entry in removed:
+                if not isinstance(entry, str):
+                    continue
+                removed_paths.add(str(Path(entry).resolve()))
 
         if removed_paths:
-            try:
-                documents = self._execute_with_retry(lambda: repo.list_for_project(project_id))
-            except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning(
-                    "Unable to load project documents for removal sync: %s",
-                    exc,
-                )
-                job.errors.append("Failed to sync project documents")
-                raise RuntimeError("Failed to sync project documents") from exc
-
-            for document in documents:
+            for document in repo.list_for_project(project_id):
                 source_path = document.get("source_path")
                 if not source_path:
                     continue
                 normalized = str(Path(source_path).resolve())
-                if normalized not in removed_paths:
-                    continue
-                def _delete(doc_id: int = document["id"]) -> None:
-                    repo.delete(doc_id)
-
-                try:
-                    self._execute_with_retry(_delete)
-                except Exception as exc:  # pragma: no cover - defensive
-                    LOGGER.warning(
-                        "Unable to delete project document for %s: %s",
-                        normalized,
-                        exc,
-                    )
-                    job.errors.append(
-                        f"Failed to remove stale document metadata for {normalized}"
-                    )
-                    sync_failed = True
-
-        if sync_failed:
-            raise RuntimeError("Failed to sync project documents")
-
-    @staticmethod
-    def _coerce_project_id(value: Any) -> int | None:
-        """Return ``value`` converted to an ``int`` when possible."""
-
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, Integral):
-            return int(value)
-        if isinstance(value, float):
-            if value.is_integer():
-                return int(value)
-            return None
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if not cleaned:
-                return None
-            try:
-                return int(cleaned)
-            except ValueError:
-                return None
-        return None
-
-    def _execute_with_retry(
-        self,
-        func: Callable[[], T],
-        *,
-        attempts: int = 5,
-        delay: float = 0.2,
-    ) -> T:
-        last_exc: Exception | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return func()
-            except (sqlite3.OperationalError, DatabaseError) as exc:
-                message = str(exc).lower()
-                if "locked" not in message and "busy" not in message:
-                    raise
-                last_exc = exc
-                LOGGER.warning(
-                    "Database locked while syncing project documents (attempt %s/%s)",
-                    attempt,
-                    attempts,
-                )
-                time.sleep(delay * attempt)
-        raise RuntimeError(
-            "Unable to sync project documents due to persistent database locks"
-        ) from last_exc
+                if normalized in removed_paths:
+                    try:
+                        repo.delete(document["id"])
+                    except Exception:  # pragma: no cover - defensive
+                        continue
 
     @staticmethod
     def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:

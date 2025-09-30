@@ -124,51 +124,6 @@ def test_dynamic_plan_notes_missing_citations() -> None:
     assert all(turn.citations)
 
 
-def test_single_shot_uses_retrieval_documents_for_citations() -> None:
-    class NoCitationSingleShotClient(StubLMStudioClient):
-        def chat(self, messages, *, preset, extra_options=None) -> ChatMessage:  # type: ignore[override]
-            self.requests.append({"messages": list(messages), "options": extra_options})
-            return ChatMessage(
-                content="Evidence summary",
-                citations=[],
-                reasoning=None,
-                raw_response={"choices": []},
-            )
-
-    client = NoCitationSingleShotClient()
-    manager = ConversationManager(client)
-
-    documents = [
-        {
-            "id": "doc-1",
-            "source": "Doc 1",
-            "snippet": "<mark>Key finding</mark>",
-            "text": "Key finding",
-        }
-    ]
-
-    turn = manager.ask(
-        "Summarize the findings.",
-        context_snippets=["Doc 1\nKey finding"],
-        extra_options={"retrieval": {"documents": documents}},
-    )
-
-    assert client.requests
-    recorded = client.requests[0]
-    options = recorded.get("options")
-    assert isinstance(options, dict)
-    retrieval = options.get("retrieval") if isinstance(options, dict) else None
-    assert isinstance(retrieval, dict)
-    assert retrieval.get("documents")
-
-    assert turn.citations
-    first_citation = turn.citations[0]
-    assert isinstance(first_citation, dict)
-    assert first_citation.get("source") == "Doc 1"
-    assert "<mark>" in first_citation.get("snippet", "")
-    assert turn.answer.rstrip().endswith("[1]")
-
-
 def test_plan_critic_rejects_meta_steps() -> None:
     client = StubLMStudioClient()
     manager = ConversationManager(client)

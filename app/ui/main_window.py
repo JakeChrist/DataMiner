@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import logging
 import queue
-import sqlite3
-import time
 from datetime import datetime
 from functools import partial
 from importlib import metadata
-from numbers import Integral
 from pathlib import Path
 import threading
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
@@ -76,68 +73,6 @@ from .question_input_widget import QuestionInputWidget
 
 
 LOGGER = logging.getLogger(__name__)
-
-T = TypeVar("T")
-
-
-def _coerce_project_id(value: Any) -> int | None:
-    """Convert ``value`` into an integer project identifier when possible."""
-
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, Integral):
-        return int(value)
-    if isinstance(value, float):
-        if value.is_integer():
-            return int(value)
-        return None
-    if isinstance(value, str):
-        cleaned = value.strip()
-        if not cleaned:
-            return None
-        try:
-            return int(cleaned)
-        except ValueError:
-            return None
-    return None
-
-
-def _attempt_document_repository_operation(
-    operation: Callable[[], T],
-    *,
-    attempts: int = 5,
-    delay: float = 0.1,
-) -> tuple[T | None, bool]:
-    """Execute ``operation`` retrying on transient database locks.
-
-    Returns a tuple of ``(result, had_lock_conflict)``. ``result`` is ``None`` when the
-    operation ultimately failed or produced ``None``. ``had_lock_conflict`` is ``True``
-    whenever the operation observed a lock so callers can surface user feedback.
-    """
-
-    lock_conflict = False
-    last_exc: Exception | None = None
-    for attempt in range(1, max(1, attempts) + 1):
-        try:
-            return operation(), lock_conflict
-        except (sqlite3.OperationalError, DatabaseError) as exc:  # pragma: no cover - defensive
-            message = str(exc).lower()
-            if "locked" not in message and "busy" not in message:
-                LOGGER.exception("Document repository operation failed: %s", exc)
-                return None, True
-            lock_conflict = True
-            last_exc = exc
-            sleep_time = max(delay * attempt, 0.0)
-            if sleep_time:
-                time.sleep(sleep_time)
-    LOGGER.warning(
-        "Document repository remained locked after %s attempts: %s",
-        attempts,
-        last_exc,
-    )
-    return None, True
 
 
 class ToastWidget(QFrame):
@@ -758,8 +693,8 @@ class MainWindow(QMainWindow):
         self._load_project_session(project.id)
 
     def _on_project_combo_changed(self, index: int) -> None:
-        project_id = _coerce_project_id(self._project_combo.itemData(index))
-        if project_id is None:
+        project_id = self._project_combo.itemData(index)
+        if not isinstance(project_id, int):
             return
         if project_id == self.project_service.active_project_id:
             return
@@ -1007,10 +942,9 @@ class MainWindow(QMainWindow):
         root: str | None = None,
     ) -> None:
         task_id = f"ingest-{job_id}"
-        normalized_project_id = _coerce_project_id(project_id)
         self._ingest_jobs[job_id] = {
             "task_id": task_id,
-            "project_id": normalized_project_id,
+            "project_id": project_id,
             "description": description,
             "root": root,
         }
@@ -1073,8 +1007,8 @@ class MainWindow(QMainWindow):
         self._ingest_jobs.pop(job_id, None)
 
     def _apply_ingest_results(self, job_info: dict[str, Any], payload: dict[str, Any]) -> None:
-        project_id = _coerce_project_id(job_info.get("project_id"))
-        if project_id is None:
+        project_id = job_info.get("project_id")
+        if not isinstance(project_id, int):
             return
         summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
         known_files = summary.get("known_files", {}) if isinstance(summary, dict) else {}
@@ -1106,15 +1040,6 @@ class MainWindow(QMainWindow):
             if doc.get("source_path")
         }
         normalized_known: dict[str, dict[str, Any]] = {}
-        lock_conflict = False
-
-        def _execute(operation: Callable[[], T]) -> T | None:
-            nonlocal lock_conflict
-            result, locked = _attempt_document_repository_operation(operation)
-            if locked:
-                lock_conflict = True
-            return result
-
         if isinstance(known_files, dict):
             for path, metadata in known_files.items():
                 if not isinstance(path, str):
@@ -1127,18 +1052,13 @@ class MainWindow(QMainWindow):
                 payload = {"file": normalized_known[normalized_path]}
                 if document is None:
                     title = Path(normalized_path).stem or Path(normalized_path).name
-                    created = _execute(
-                        lambda: repo.create(
-                            project_id,
-                            title,
-                            source_type="file",
-                            source_path=normalized_path,
-                            metadata=payload,
-                        )
+                    repo.create(
+                        project_id,
+                        title,
+                        source_type="file",
+                        source_path=normalized_path,
+                        metadata=payload,
                     )
-                    if created and created.get("source_path"):
-                        key = str(Path(created["source_path"]).resolve())
-                        existing_docs[key] = created
                 else:
                     updates: dict[str, Any] = {}
                     if document.get("source_path") != normalized_path:
@@ -1147,17 +1067,7 @@ class MainWindow(QMainWindow):
                     if current_meta.get("file") != normalized_known[normalized_path]:
                         updates["metadata"] = payload
                     if updates:
-                        updated = _execute(
-                            lambda doc_id=document["id"], fields=dict(updates): repo.update(doc_id, **fields)
-                        )
-                        if not updated:
-                            refreshed = _execute(
-                                lambda doc_id=document["id"]: repo.get(doc_id)
-                            )
-                            updated = refreshed
-                        if updated and updated.get("source_path"):
-                            key = str(Path(updated["source_path"]).resolve())
-                            existing_docs[key] = updated
+                        repo.update(document["id"], **updates)
         removed_paths = []
         if isinstance(removed, (list, tuple, set)):
             removed_paths = [str(Path(path).resolve()) for path in removed if isinstance(path, str)]
@@ -1168,18 +1078,7 @@ class MainWindow(QMainWindow):
                     continue
                 normalized = str(Path(source_path).resolve())
                 if normalized in removed_paths:
-                    _execute(lambda doc_id=document["id"]: repo.delete(doc_id))
-
-        if lock_conflict:
-            LOGGER.warning(
-                "Encountered database lock while syncing project %s documents from ingest summary",
-                project_id,
-            )
-            self._show_toast(
-                "Corpus metadata is updating. Documents will appear once indexing finishes.",
-                level="warning",
-                duration_ms=4000,
-            )
+                    repo.delete(document["id"])
 
     def _refresh_corpus_view(self) -> None:
         self._corpus_tree.clear()
@@ -1635,16 +1534,11 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
         step_context_provider = self._build_step_context_provider(question)
-        extra_options = self._build_extra_request_options(
-            question,
-            retrieval_documents=retrieval_documents or None,
-        )
+        extra_options = self._build_extra_request_options(question)
         try:
             turn = self._conversation_manager.ask(
                 question,
-                context_snippets=context_snippets or None,
                 reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
                 response_mode=self.conversation_settings.response_mode,
                 preset=self.conversation_settings.answer_length,
@@ -1761,7 +1655,6 @@ class MainWindow(QMainWindow):
             project_id=project_id,
             include_identifiers=include,
             exclude_identifiers=exclude,
-            limit=9,
         )
         return self._context_payload_from_records(records, project_id)
 

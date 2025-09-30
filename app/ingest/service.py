@@ -616,20 +616,19 @@ class IngestService:
         def _matches(pattern: str) -> bool:
             normalized_relative = relative.replace("\\", "/")
             normalized_pattern = pattern.replace("\\", "/")
-            candidates = [
-                relative,
-                relative.lower(),
-                normalized_relative,
-                normalized_relative.lower(),
-                path.name,
-                path.name.lower(),
-            ]
-            patterns = [pattern, pattern.lower(), normalized_pattern, normalized_pattern.lower()]
-            for candidate in candidates:
-                for current in patterns:
-                    if fnmatch(candidate, current):
-                        return True
-            return False
+            if fnmatch(relative, pattern):
+                return True
+            if fnmatch(normalized_relative, normalized_pattern):
+                return True
+            if fnmatch(path.name, pattern):
+                return True
+
+            folded_relative = normalized_relative.casefold()
+            folded_name = path.name.casefold()
+            folded_pattern = normalized_pattern.casefold()
+            if fnmatch(folded_relative, folded_pattern):
+                return True
+            return fnmatch(folded_name, folded_pattern)
 
         if include_patterns and not any(_matches(pattern) for pattern in include_patterns):
             return False

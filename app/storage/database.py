@@ -616,6 +616,18 @@ class IngestDocumentRepository(BaseRepository):
         preview = self._build_preview(normalized_text)
         ocr_message = parsed.ocr_hint if parsed.needs_ocr else None
 
+        logger.info(
+            "Storing ingest document version",
+            extra={
+                "path": normalized_path,
+                "checksum": checksum,
+                "size": size,
+                "metadata_keys": sorted(metadata.keys()),
+                "needs_ocr": bool(parsed.needs_ocr),
+            },
+        )
+
+        chunk_count = 0
         with self.transaction() as connection:
             existing_rows = connection.execute(
                 "SELECT id FROM ingest_documents WHERE path = ?",
@@ -660,8 +672,16 @@ class IngestDocumentRepository(BaseRepository):
             )
             document_id = cursor.lastrowid
             if previous_ids:
+                logger.info(
+                    "Superseding previous ingest versions",
+                    extra={
+                        "path": normalized_path,
+                        "previous_version_count": len(previous_ids),
+                        "previous_document_ids": previous_ids[:10],
+                    },
+                )
                 self._delete_chunks_for_documents(connection, previous_ids)
-            self._replace_chunks(
+            chunk_count = self._replace_chunks(
                 connection,
                 document_id,
                 normalized_path,
@@ -669,6 +689,15 @@ class IngestDocumentRepository(BaseRepository):
                 normalized_text,
                 metadata,
             )
+        logger.info(
+            "Stored ingest document version",
+            extra={
+                "document_id": document_id,
+                "path": normalized_path,
+                "version": version,
+                "chunk_count": chunk_count,
+            },
+        )
         return self.get(document_id)  # type: ignore[return-value]
 
     def get(self, document_id: int) -> dict[str, Any] | None:
@@ -722,6 +751,14 @@ class IngestDocumentRepository(BaseRepository):
         if not unique_paths:
             return 0
 
+        logger.info(
+            "Deleting ingest documents by path",
+            extra={
+                "path_count": len(unique_paths),
+                "sample_paths": unique_paths[:10],
+            },
+        )
+
         removed = 0
         with self.transaction() as connection:
             for path in unique_paths:
@@ -739,6 +776,13 @@ class IngestDocumentRepository(BaseRepository):
                     document_ids,
                 )
                 removed += len(document_ids)
+                logger.info(
+                    "Deleted ingest documents",
+                    extra={
+                        "path": path,
+                        "document_count": len(document_ids),
+                    },
+                )
         return removed
 
     def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
@@ -822,6 +866,14 @@ class IngestDocumentRepository(BaseRepository):
         chunk_ids = [int(row["id"]) for row in rows]
         if not chunk_ids:
             return
+        logger.info(
+            "Removing existing document chunks",
+            extra={
+                "document_ids": doc_ids[:10],
+                "document_count": len(doc_ids),
+                "chunk_count": len(chunk_ids),
+            },
+        )
         chunk_placeholders = ",".join("?" for _ in chunk_ids)
         connection.execute(
             f"DELETE FROM ingest_document_index WHERE rowid IN ({chunk_placeholders})",
@@ -840,12 +892,20 @@ class IngestDocumentRepository(BaseRepository):
         text: str,
         normalized_text: str,
         metadata: dict[str, Any] | None,
-    ) -> None:
+    ) -> int:
         chunks = self._chunk_document(
             text,
             normalized_text=normalized_text,
             path=path,
             metadata=metadata,
+        )
+        logger.info(
+            "Persisting document chunks",
+            extra={
+                "document_id": document_id,
+                "path": path,
+                "chunk_count": len(chunks),
+            },
         )
         connection.execute(
             "DELETE FROM ingest_document_chunks WHERE document_id = ?",
@@ -885,6 +945,7 @@ class IngestDocumentRepository(BaseRepository):
                     chunk["index"],
                 ),
             )
+        return len(chunks)
 
     _CODE_SUFFIXES = {".py", ".pyw", ".m", ".cpp"}
     _HTML_SUFFIXES = {".html", ".htm"}
@@ -917,7 +978,7 @@ class IngestDocumentRepository(BaseRepository):
         if not matches:
             trimmed = text.strip()
             chunk_text = trimmed if trimmed else normalized_text
-            return [
+            chunks = [
                 {
                     "index": 0,
                     "text": chunk_text,
@@ -927,6 +988,17 @@ class IngestDocumentRepository(BaseRepository):
                     "search_text": self._normalize_text(chunk_text),
                 }
             ]
+            logger.info(
+                "Chunked document",
+                extra={
+                    "path": path,
+                    "chunk_count": len(chunks),
+                    "strategy": strategy,
+                    "max_tokens": resolved_max_tokens,
+                    "overlap": resolved_overlap,
+                },
+            )
+            return chunks
 
         token_positions = [match.start() for match in matches]
         chunks: list[dict[str, Any]] = []
@@ -998,6 +1070,16 @@ class IngestDocumentRepository(BaseRepository):
                     "search_text": self._normalize_text(chunk_text),
                 }
             )
+        logger.info(
+            "Chunked document",
+            extra={
+                "path": path,
+                "chunk_count": len(chunks),
+                "strategy": strategy,
+                "max_tokens": resolved_max_tokens,
+                "overlap": resolved_overlap,
+            },
+        )
         return chunks
 
     def _resolve_chunking_settings(

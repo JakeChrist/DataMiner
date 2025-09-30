@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 import sqlite3
 from typing import Any, Iterable
 
 from app.storage import ChatRepository, DocumentRepository, IngestDocumentRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 class SearchService:
@@ -37,9 +41,23 @@ class SearchService:
     ) -> list[dict[str, Any]]:
         """Search the ingest index and join results with project documents."""
 
+        tags_list = list(tags) if tags is not None else None
+        logger.info(
+            "Executing RAG document search",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "limit": limit,
+                "tags": tags_list,
+                "folder": str(folder) if folder is not None else None,
+                "recursive": recursive,
+                "save_scope": save_scope,
+            },
+        )
+
         scope_tags, scope_folder = self._resolve_scope(
             chat_id,
-            tags,
+            tags_list,
             folder,
             save_scope=save_scope,
         )
@@ -79,6 +97,15 @@ class SearchService:
             )
             if len(results) >= limit:
                 break
+        logger.info(
+            "RAG document search completed",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "result_count": len(results),
+                "candidate_count": len(candidate_documents),
+            },
+        )
         return results
 
     def collect_context_records(
@@ -95,7 +122,24 @@ class SearchService:
     ) -> list[dict[str, Any]]:
         """Return structured retrieval records for ``query`` within scope."""
 
-        scope_tags = list(tags) if tags is not None else None
+        tags_list = list(tags) if tags is not None else None
+        include_list = list(include_identifiers or [])
+        exclude_list = list(exclude_identifiers or [])
+        logger.info(
+            "Collecting RAG context records",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "limit": limit,
+                "tags": tags_list,
+                "folder": str(folder) if folder is not None else None,
+                "recursive": recursive,
+                "include_identifiers": include_list,
+                "exclude_identifiers": exclude_list,
+            },
+        )
+
+        scope_tags = list(tags_list) if tags_list is not None else None
         scope_folder = self._normalize_folder(folder) if folder is not None else None
         candidate_documents = self.documents.list_for_scope(
             project_id,
@@ -104,8 +148,8 @@ class SearchService:
             recursive=recursive,
         )
         documents_by_path = self._build_path_index(candidate_documents)
-        include_set = {str(item) for item in (include_identifiers or []) if str(item)}
-        exclude_set = {str(item) for item in (exclude_identifiers or []) if str(item)}
+        include_set = {str(item) for item in include_list if str(item)}
+        exclude_set = {str(item) for item in exclude_list if str(item)}
         records: list[dict[str, Any]] = []
         seen_chunks: set[int] = set()
         for record in self._search_with_fallback(query, limit=limit * 6):
@@ -146,6 +190,15 @@ class SearchService:
             seen_chunks.add(chunk_id)
             if len(records) >= limit:
                 break
+        logger.info(
+            "Collected RAG context records",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "record_count": len(records),
+                "candidate_count": len(candidate_documents),
+            },
+        )
         return records
 
     def retrieve_context_snippets(
@@ -181,6 +234,14 @@ class SearchService:
                 title = Path(path).name
             label = title or "Document"
             snippets.append(f"{label}: {context.strip()}")
+        logger.info(
+            "Retrieved RAG context snippets",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "snippet_count": len(snippets),
+            },
+        )
         return snippets
 
     def _resolve_scope(
@@ -207,6 +268,18 @@ class SearchService:
                 "folder": explicit_folder,
             }
             self.chats.set_query_scope(chat_id, payload)
+
+        logger.info(
+            "Resolved retrieval scope",
+            extra={
+                "chat_id": chat_id,
+                "explicit_tags": explicit_tags,
+                "explicit_folder": explicit_folder,
+                "resolved_tags": scope_tags,
+                "resolved_folder": scope_folder,
+                "saved": bool(chat_id is not None and save_scope),
+            },
+        )
 
         return scope_tags, scope_folder
 
@@ -331,6 +404,7 @@ class SearchService:
 
         normalized = (query or "").strip()
         if not normalized:
+            logger.info("Skipping empty retrieval query")
             return
 
         attempts: list[str] = [normalized]
@@ -340,6 +414,15 @@ class SearchService:
             attempts.append(" OR ".join(wildcard_tokens))
             if len(tokens) > 1:
                 attempts.append(" ".join(wildcard_tokens))
+
+        logger.info(
+            "Preparing retrieval query attempts",
+            extra={
+                "original_query": normalized,
+                "token_count": len(tokens),
+                "attempt_count": len(attempts),
+            },
+        )
 
         seen_queries: set[str] = set()
         seen_results: set[tuple[Any, ...]] = set()
@@ -362,10 +445,28 @@ class SearchService:
             if not candidate or candidate in seen_queries:
                 continue
             seen_queries.add(candidate)
+            logger.info(
+                "Executing retrieval attempt",
+                extra={
+                    "attempt_query": candidate,
+                    "attempt_index": len(seen_queries),
+                    "limit": limit,
+                },
+            )
             try:
                 results = self.ingest.search(candidate, limit=limit)
             except sqlite3.OperationalError:
+                logger.warning(
+                    "Ingest search failed for attempt", extra={"attempt_query": candidate}
+                )
                 continue
+            logger.info(
+                "Retrieved ingest results",
+                extra={
+                    "attempt_query": candidate,
+                    "result_count": len(results),
+                },
+            )
             for record in results:
                 identity = _result_identity(record)
                 if identity in seen_results:
@@ -374,6 +475,13 @@ class SearchService:
                 yield record
                 yielded += 1
                 if yielded >= limit:
+                    logger.info(
+                        "Reached retrieval limit",
+                        extra={
+                            "attempts_executed": len(seen_queries),
+                            "yielded": yielded,
+                        },
+                    )
                     return
 
     def _tokenize_query(self, query: str) -> list[str]:

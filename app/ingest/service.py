@@ -703,7 +703,7 @@ class IngestService:
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Unable to sync project documents: %s", exc)
             job.errors.append("Failed to sync project documents")
-            return
+            raise RuntimeError("Failed to sync project documents") from exc
 
         def _load_existing() -> dict[str, dict[str, Any]]:
             mapping: dict[str, dict[str, Any]] = {}
@@ -719,11 +719,13 @@ class IngestService:
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Unable to load existing project documents: %s", exc)
             job.errors.append("Failed to sync project documents")
-            return
+            raise RuntimeError("Failed to sync project documents") from exc
 
         known_files_param = job.summary.get("known_files", {})
         if not isinstance(known_files_param, dict):
             known_files_param = {}
+
+        sync_failed = False
 
         for path, metadata in known_files_param.items():
             if not isinstance(path, str):
@@ -755,6 +757,7 @@ class IngestService:
                     job.errors.append(
                         f"Failed to register document metadata for {normalized_path}"
                     )
+                    sync_failed = True
                     continue
                 if created and created.get("source_path"):
                     key = str(Path(created["source_path"]).resolve())
@@ -781,6 +784,7 @@ class IngestService:
                         job.errors.append(
                             f"Failed to update document metadata for {normalized_path}"
                         )
+                        sync_failed = True
                         continue
                     if updated and updated.get("source_path"):
                         key = str(Path(updated["source_path"]).resolve())
@@ -794,7 +798,17 @@ class IngestService:
             ]
 
         if removed_paths:
-            for document in self._execute_with_retry(lambda: repo.list_for_project(project_id)):
+            try:
+                documents = self._execute_with_retry(lambda: repo.list_for_project(project_id))
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning(
+                    "Unable to load project documents for removal sync: %s",
+                    exc,
+                )
+                job.errors.append("Failed to sync project documents")
+                raise RuntimeError("Failed to sync project documents") from exc
+
+            for document in documents:
                 source_path = document.get("source_path")
                 if not source_path:
                     continue
@@ -815,6 +829,10 @@ class IngestService:
                     job.errors.append(
                         f"Failed to remove stale document metadata for {normalized}"
                     )
+                    sync_failed = True
+
+        if sync_failed:
+            raise RuntimeError("Failed to sync project documents")
 
     @staticmethod
     def _coerce_project_id(value: Any) -> int | None:

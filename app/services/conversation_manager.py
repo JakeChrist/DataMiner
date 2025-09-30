@@ -1567,6 +1567,14 @@ class ConversationManager:
                 response_mode=response_mode,
             )
             last_verdict = verdict
+            logger.info(
+                "Adversarial review cycle",
+                extra={
+                    "cycle": cycles,
+                    "decision": verdict.decision,
+                    "reason_codes": verdict.reason_codes,
+                },
+            )
             if verdict.decision == "publish":
                 break
             if verdict.decision == "insufficient_evidence":
@@ -1625,6 +1633,15 @@ class ConversationManager:
             citations = fix.citations
             duplicates_removed_total += fix.duplicates_removed
             sentences_removed_total += fix.sentences_removed
+            logger.info(
+                "Applied adversarial fixes",
+                extra={
+                    "cycle": cycles,
+                    "duplicates_removed": fix.duplicates_removed,
+                    "sentences_removed": fix.sentences_removed,
+                    "citation_count": len(citations),
+                },
+            )
             if (
                 fix.duplicates_removed > 0
                 or fix.sentences_removed > 0
@@ -1922,6 +1939,13 @@ class ConversationManager:
                 )
                 answer_parts.append(message)
                 assumptions.append(message)
+                logger.info(
+                    "Plan step marked insufficient",
+                    extra={
+                        "step_index": index,
+                        "description": plan_item.description,
+                    },
+                )
             plan_item.status = "done"
             combined_answer = "\n\n".join(answer_parts).strip()
             insufficient = self._text_declares_insufficient_evidence(combined_answer)
@@ -1937,6 +1961,13 @@ class ConversationManager:
                 if combined_answer not in assumptions:
                     assumptions.append(combined_answer)
                 result.citations = []
+                logger.info(
+                    "Removed citations from insufficient step",
+                    extra={
+                        "step_index": index,
+                        "assumption_count": len(assumptions),
+                    },
+                )
             elif not result.citations:
                 inferred = self._fallback_citations_from_contexts(used_contexts)
                 if inferred:
@@ -1944,6 +1975,13 @@ class ConversationManager:
                 else:
                     assumptions.append(
                         f"No citations available for step {index}: {plan_item.description}"
+                    )
+                    logger.info(
+                        "Recorded citation assumption",
+                        extra={
+                            "step_index": index,
+                            "description": plan_item.description,
+                        },
                     )
             step_results.append(result)
 
@@ -1958,6 +1996,14 @@ class ConversationManager:
             )
 
         aggregated, citation_index_map = self._aggregate_citations(step_results)
+        logger.info(
+            "Aggregated dynamic plan citations",
+            extra={
+                "unique_citation_count": len(aggregated),
+                "step_count": len(step_results),
+                "assumption_count": len(assumptions),
+            },
+        )
         for result in step_results:
             indexes = self._collect_citation_indexes(result.citations, citation_index_map)
             result.citation_indexes = indexes
@@ -1983,6 +2029,15 @@ class ConversationManager:
             scope=retrieval_scope,
             preset=preset,
             response_mode=response_mode,
+        )
+        logger.info(
+            "Adversarial review completed",
+            extra={
+                "decision": review_report.decision,
+                "revised": review_report.revised,
+                "cycles": review_report.cycles,
+                "reason_codes": review_report.reason_codes,
+            },
         )
 
         if citation_mapping:
@@ -2095,6 +2150,16 @@ class ConversationManager:
             adversarial_review=review_report,
         )
         self.turns.append(turn)
+        logger.info(
+            "Dynamic plan completed",
+            extra={
+                "question_preview": question_preview,
+                "steps": total_steps,
+                "final_citation_count": len(turn.citations),
+                "assumption_count": len(assumptions),
+                "conflict_count": len(consolidation.conflicts),
+            },
+        )
         return turn
 
     @log_call(logger=logger, level=logging.DEBUG, include_args=False)

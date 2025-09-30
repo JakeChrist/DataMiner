@@ -269,6 +269,18 @@ class SearchService:
             }
             self.chats.set_query_scope(chat_id, payload)
 
+        logger.info(
+            "Resolved retrieval scope",
+            extra={
+                "chat_id": chat_id,
+                "explicit_tags": explicit_tags,
+                "explicit_folder": explicit_folder,
+                "resolved_tags": scope_tags,
+                "resolved_folder": scope_folder,
+                "saved": bool(chat_id is not None and save_scope),
+            },
+        )
+
         return scope_tags, scope_folder
 
     def _build_path_index(self, documents: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -392,6 +404,7 @@ class SearchService:
 
         normalized = (query or "").strip()
         if not normalized:
+            logger.info("Skipping empty retrieval query")
             return
 
         attempts: list[str] = [normalized]
@@ -401,6 +414,15 @@ class SearchService:
             attempts.append(" OR ".join(wildcard_tokens))
             if len(tokens) > 1:
                 attempts.append(" ".join(wildcard_tokens))
+
+        logger.info(
+            "Preparing retrieval query attempts",
+            extra={
+                "original_query": normalized,
+                "token_count": len(tokens),
+                "attempt_count": len(attempts),
+            },
+        )
 
         seen_queries: set[str] = set()
         seen_results: set[tuple[Any, ...]] = set()
@@ -423,10 +445,28 @@ class SearchService:
             if not candidate or candidate in seen_queries:
                 continue
             seen_queries.add(candidate)
+            logger.info(
+                "Executing retrieval attempt",
+                extra={
+                    "attempt_query": candidate,
+                    "attempt_index": len(seen_queries),
+                    "limit": limit,
+                },
+            )
             try:
                 results = self.ingest.search(candidate, limit=limit)
             except sqlite3.OperationalError:
+                logger.warning(
+                    "Ingest search failed for attempt", extra={"attempt_query": candidate}
+                )
                 continue
+            logger.info(
+                "Retrieved ingest results",
+                extra={
+                    "attempt_query": candidate,
+                    "result_count": len(results),
+                },
+            )
             for record in results:
                 identity = _result_identity(record)
                 if identity in seen_results:
@@ -435,6 +475,13 @@ class SearchService:
                 yield record
                 yielded += 1
                 if yielded >= limit:
+                    logger.info(
+                        "Reached retrieval limit",
+                        extra={
+                            "attempts_executed": len(seen_queries),
+                            "yielded": yielded,
+                        },
+                    )
                     return
 
     def _tokenize_query(self, query: str) -> list[str]:

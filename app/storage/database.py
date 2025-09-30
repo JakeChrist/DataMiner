@@ -616,6 +616,18 @@ class IngestDocumentRepository(BaseRepository):
         preview = self._build_preview(normalized_text)
         ocr_message = parsed.ocr_hint if parsed.needs_ocr else None
 
+        logger.info(
+            "Storing ingest document version",
+            extra={
+                "path": normalized_path,
+                "checksum": checksum,
+                "size": size,
+                "metadata_keys": sorted(metadata.keys()),
+                "needs_ocr": bool(parsed.needs_ocr),
+            },
+        )
+
+        chunk_count = 0
         with self.transaction() as connection:
             existing_rows = connection.execute(
                 "SELECT id FROM ingest_documents WHERE path = ?",
@@ -660,8 +672,16 @@ class IngestDocumentRepository(BaseRepository):
             )
             document_id = cursor.lastrowid
             if previous_ids:
+                logger.info(
+                    "Superseding previous ingest versions",
+                    extra={
+                        "path": normalized_path,
+                        "previous_version_count": len(previous_ids),
+                        "previous_document_ids": previous_ids[:10],
+                    },
+                )
                 self._delete_chunks_for_documents(connection, previous_ids)
-            self._replace_chunks(
+            chunk_count = self._replace_chunks(
                 connection,
                 document_id,
                 normalized_path,
@@ -669,6 +689,15 @@ class IngestDocumentRepository(BaseRepository):
                 normalized_text,
                 metadata,
             )
+        logger.info(
+            "Stored ingest document version",
+            extra={
+                "document_id": document_id,
+                "path": normalized_path,
+                "version": version,
+                "chunk_count": chunk_count,
+            },
+        )
         return self.get(document_id)  # type: ignore[return-value]
 
     def get(self, document_id: int) -> dict[str, Any] | None:
@@ -722,6 +751,14 @@ class IngestDocumentRepository(BaseRepository):
         if not unique_paths:
             return 0
 
+        logger.info(
+            "Deleting ingest documents by path",
+            extra={
+                "path_count": len(unique_paths),
+                "sample_paths": unique_paths[:10],
+            },
+        )
+
         removed = 0
         with self.transaction() as connection:
             for path in unique_paths:
@@ -739,6 +776,13 @@ class IngestDocumentRepository(BaseRepository):
                     document_ids,
                 )
                 removed += len(document_ids)
+                logger.info(
+                    "Deleted ingest documents",
+                    extra={
+                        "path": path,
+                        "document_count": len(document_ids),
+                    },
+                )
         return removed
 
     def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
@@ -848,7 +892,7 @@ class IngestDocumentRepository(BaseRepository):
         text: str,
         normalized_text: str,
         metadata: dict[str, Any] | None,
-    ) -> None:
+    ) -> int:
         chunks = self._chunk_document(
             text,
             normalized_text=normalized_text,
@@ -901,6 +945,7 @@ class IngestDocumentRepository(BaseRepository):
                     chunk["index"],
                 ),
             )
+        return len(chunks)
 
     _CODE_SUFFIXES = {".py", ".pyw", ".m", ".cpp"}
     _HTML_SUFFIXES = {".html", ".htm"}

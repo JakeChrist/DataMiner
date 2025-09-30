@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 import sqlite3
 from typing import Any, Iterable
 
 from app.storage import ChatRepository, DocumentRepository, IngestDocumentRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 class SearchService:
@@ -37,9 +41,23 @@ class SearchService:
     ) -> list[dict[str, Any]]:
         """Search the ingest index and join results with project documents."""
 
+        tags_list = list(tags) if tags is not None else None
+        logger.info(
+            "Executing RAG document search",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "limit": limit,
+                "tags": tags_list,
+                "folder": str(folder) if folder is not None else None,
+                "recursive": recursive,
+                "save_scope": save_scope,
+            },
+        )
+
         scope_tags, scope_folder = self._resolve_scope(
             chat_id,
-            tags,
+            tags_list,
             folder,
             save_scope=save_scope,
         )
@@ -79,6 +97,15 @@ class SearchService:
             )
             if len(results) >= limit:
                 break
+        logger.info(
+            "RAG document search completed",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "result_count": len(results),
+                "candidate_count": len(candidate_documents),
+            },
+        )
         return results
 
     def collect_context_records(
@@ -95,7 +122,24 @@ class SearchService:
     ) -> list[dict[str, Any]]:
         """Return structured retrieval records for ``query`` within scope."""
 
-        scope_tags = list(tags) if tags is not None else None
+        tags_list = list(tags) if tags is not None else None
+        include_list = list(include_identifiers or [])
+        exclude_list = list(exclude_identifiers or [])
+        logger.info(
+            "Collecting RAG context records",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "limit": limit,
+                "tags": tags_list,
+                "folder": str(folder) if folder is not None else None,
+                "recursive": recursive,
+                "include_identifiers": include_list,
+                "exclude_identifiers": exclude_list,
+            },
+        )
+
+        scope_tags = list(tags_list) if tags_list is not None else None
         scope_folder = self._normalize_folder(folder) if folder is not None else None
         candidate_documents = self.documents.list_for_scope(
             project_id,
@@ -104,8 +148,8 @@ class SearchService:
             recursive=recursive,
         )
         documents_by_path = self._build_path_index(candidate_documents)
-        include_set = {str(item) for item in (include_identifiers or []) if str(item)}
-        exclude_set = {str(item) for item in (exclude_identifiers or []) if str(item)}
+        include_set = {str(item) for item in include_list if str(item)}
+        exclude_set = {str(item) for item in exclude_list if str(item)}
         records: list[dict[str, Any]] = []
         seen_chunks: set[int] = set()
         for record in self._search_with_fallback(query, limit=limit * 6):
@@ -146,6 +190,15 @@ class SearchService:
             seen_chunks.add(chunk_id)
             if len(records) >= limit:
                 break
+        logger.info(
+            "Collected RAG context records",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "record_count": len(records),
+                "candidate_count": len(candidate_documents),
+            },
+        )
         return records
 
     def retrieve_context_snippets(
@@ -181,6 +234,14 @@ class SearchService:
                 title = Path(path).name
             label = title or "Document"
             snippets.append(f"{label}: {context.strip()}")
+        logger.info(
+            "Retrieved RAG context snippets",
+            extra={
+                "query_preview": query.strip()[:120],
+                "project_id": project_id,
+                "snippet_count": len(snippets),
+            },
+        )
         return snippets
 
     def _resolve_scope(

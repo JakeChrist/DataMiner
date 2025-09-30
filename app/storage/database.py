@@ -822,6 +822,14 @@ class IngestDocumentRepository(BaseRepository):
         chunk_ids = [int(row["id"]) for row in rows]
         if not chunk_ids:
             return
+        logger.info(
+            "Removing existing document chunks",
+            extra={
+                "document_ids": doc_ids[:10],
+                "document_count": len(doc_ids),
+                "chunk_count": len(chunk_ids),
+            },
+        )
         chunk_placeholders = ",".join("?" for _ in chunk_ids)
         connection.execute(
             f"DELETE FROM ingest_document_index WHERE rowid IN ({chunk_placeholders})",
@@ -846,6 +854,14 @@ class IngestDocumentRepository(BaseRepository):
             normalized_text=normalized_text,
             path=path,
             metadata=metadata,
+        )
+        logger.info(
+            "Persisting document chunks",
+            extra={
+                "document_id": document_id,
+                "path": path,
+                "chunk_count": len(chunks),
+            },
         )
         connection.execute(
             "DELETE FROM ingest_document_chunks WHERE document_id = ?",
@@ -917,7 +933,7 @@ class IngestDocumentRepository(BaseRepository):
         if not matches:
             trimmed = text.strip()
             chunk_text = trimmed if trimmed else normalized_text
-            return [
+            chunks = [
                 {
                     "index": 0,
                     "text": chunk_text,
@@ -927,6 +943,17 @@ class IngestDocumentRepository(BaseRepository):
                     "search_text": self._normalize_text(chunk_text),
                 }
             ]
+            logger.info(
+                "Chunked document",
+                extra={
+                    "path": path,
+                    "chunk_count": len(chunks),
+                    "strategy": strategy,
+                    "max_tokens": resolved_max_tokens,
+                    "overlap": resolved_overlap,
+                },
+            )
+            return chunks
 
         token_positions = [match.start() for match in matches]
         chunks: list[dict[str, Any]] = []
@@ -998,6 +1025,16 @@ class IngestDocumentRepository(BaseRepository):
                     "search_text": self._normalize_text(chunk_text),
                 }
             )
+        logger.info(
+            "Chunked document",
+            extra={
+                "path": path,
+                "chunk_count": len(chunks),
+                "strategy": strategy,
+                "max_tokens": resolved_max_tokens,
+                "overlap": resolved_overlap,
+            },
+        )
         return chunks
 
     def _resolve_chunking_settings(

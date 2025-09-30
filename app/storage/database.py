@@ -93,6 +93,14 @@ class DatabaseManager:
             self._set_user_version(connection, SCHEMA_VERSION)
 
     @staticmethod
+    def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
     def _table_has_column(
         connection: sqlite3.Connection, table: str, column: str
     ) -> bool:
@@ -102,9 +110,93 @@ class DatabaseManager:
     def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
         """Add chunk metadata storage required for context aware chunking."""
 
+        if not self._table_exists(connection, "ingest_document_chunks"):
+            connection.execute(
+                """
+                CREATE TABLE ingest_document_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    document_id INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    start_offset INTEGER NOT NULL,
+                    end_offset INTEGER NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(document_id, chunk_index),
+                    FOREIGN KEY (document_id) REFERENCES ingest_documents(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ingest_chunks_document_id"
+                " ON ingest_document_chunks(document_id)"
+            )
+
         if not self._table_has_column(connection, "ingest_document_chunks", "metadata"):
             connection.execute("ALTER TABLE ingest_document_chunks ADD COLUMN metadata TEXT")
-        connection.execute("UPDATE ingest_document_chunks SET metadata = '{}' WHERE metadata IS NULL")
+
+        connection.execute(
+            "UPDATE ingest_document_chunks SET metadata = '{}' WHERE metadata IS NULL"
+        )
+
+        existing_documents_without_chunks = connection.execute(
+            """
+            SELECT docs.id, docs.path, docs.text, docs.normalized_text
+            FROM ingest_documents AS docs
+            LEFT JOIN (
+                SELECT DISTINCT document_id FROM ingest_document_chunks
+            ) AS chunks ON chunks.document_id = docs.id
+            WHERE chunks.document_id IS NULL
+            ORDER BY docs.id ASC
+            """
+        ).fetchall()
+
+        def _normalize(value: str | None) -> str:
+            if not value:
+                return ""
+            return re.sub(r"\s+", " ", value.strip())
+
+        for row in existing_documents_without_chunks:
+            document_id = int(row["id"])
+            raw_text = row["text"] or ""
+            normalized_text = row["normalized_text"] or _normalize(raw_text)
+            chunk_text = raw_text or normalized_text
+            token_count = len(chunk_text.split())
+            start_offset = 0
+            end_offset = len(chunk_text)
+            source_path = row["path"] or ""
+            metadata = {
+                "section_path": [],
+                "sections": [],
+                "hierarchy_weight": 1.0,
+                "page_range": {"start": None, "end": None},
+                "position": {
+                    "start_offset": start_offset if chunk_text else None,
+                    "end_offset": end_offset if chunk_text else None,
+                    "line_start": None,
+                    "line_end": None,
+                },
+                "source_path": source_path,
+                "token_count": token_count,
+            }
+            connection.execute(
+                """
+                INSERT INTO ingest_document_chunks (
+                    document_id, chunk_index, text, token_count, start_offset, end_offset, metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_id,
+                    0,
+                    chunk_text,
+                    token_count,
+                    start_offset,
+                    end_offset,
+                    json.dumps(metadata, ensure_ascii=False),
+                ),
+            )
 
         rows = connection.execute(
             """
@@ -134,12 +226,6 @@ class DatabaseManager:
             )
             """
         )
-
-        def _normalize(value: str | None) -> str:
-            if not value:
-                return ""
-            collapsed = re.sub(r"\s+", " ", value.strip())
-            return collapsed
 
         for row in rows:
             chunk_id = int(row["chunk_id"])

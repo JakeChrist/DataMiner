@@ -19,6 +19,28 @@ from app.services.conversation_manager import (
 )
 
 
+def test_build_messages_appends_context_snippets_to_user_prompt() -> None:
+    manager = object.__new__(ConversationManager)
+    manager.system_prompt = "System instructions"
+    manager.turns = []
+    manager.context_window = 0
+
+    messages = manager._build_messages(
+        "Summarise the findings",
+        [
+            "Doc1: Important discovery",
+            "Doc2: Follow-up validation",
+        ],
+    )
+
+    assert messages[0] == {"role": "system", "content": "System instructions"}
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"].startswith("Summarise the findings")
+    assert "Context:\nDoc1: Important discovery\n\nDoc2: Follow-up validation" in messages[-1][
+        "content"
+    ]
+
+
 def test_ensure_answer_citation_markers_aligns_citations_with_sentences():
     answer = "Alpha result shows improvement. Beta data remains flat."
     citations = [

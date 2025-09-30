@@ -204,3 +204,61 @@ def test_ingest_chunk_storage(
         "SELECT COUNT(*) FROM ingest_document_chunks"
     ).fetchone()[0]
     assert count >= 1
+
+
+@pytest.mark.parametrize("suffix", [".py", ".cpp"])
+def test_chunk_document_aligns_code_chunks_to_line_start(
+    ingest_repo: IngestDocumentRepository, suffix: str
+) -> None:
+    code_lines = [f"def func_{index}():\n    return {index}\n" for index in range(6)]
+    text = "\n".join(code_lines)
+    normalized = ingest_repo._normalize_text(text)
+    metadata = {"chunking": {"max_tokens": 6, "overlap": 2}}
+
+    chunks = ingest_repo._chunk_document(
+        text,
+        normalized_text=normalized,
+        path=f"script{suffix}",
+        metadata=metadata,
+    )
+
+    assert len(chunks) >= 2
+    valid_lines = {line.strip() for line in text.splitlines() if line.strip()}
+    for chunk in chunks:
+        lines = [line for line in chunk["text"].splitlines() if line.strip()]
+        assert lines
+        assert lines[0] in valid_lines
+
+
+def test_chunk_document_aligns_html_chunks_to_tag_boundaries(
+    ingest_repo: IngestDocumentRepository,
+) -> None:
+    text = (
+        "<div>\n"
+        "  <p>\n"
+        "    Alpha beta gamma delta.\n"
+        "  </p>\n"
+        "  <p>\n"
+        "    Epsilon zeta eta theta.\n"
+        "  </p>\n"
+        "  <section>\n"
+        "    Iota kappa lambda mu.\n"
+        "  </section>\n"
+        "</div>\n"
+    )
+    normalized = ingest_repo._normalize_text(text)
+    metadata = {"chunking": {"max_tokens": 8, "overlap": 2}}
+
+    chunks = ingest_repo._chunk_document(
+        text,
+        normalized_text=normalized,
+        path="page.html",
+        metadata=metadata,
+    )
+
+    assert len(chunks) >= 2
+    valid_lines = {line.strip() for line in text.splitlines() if line.strip()}
+    for chunk in chunks:
+        lines = [line for line in chunk["text"].splitlines() if line.strip()]
+        assert lines
+        assert lines[0] in valid_lines

@@ -8,12 +8,18 @@ import difflib
 import copy
 import html
 import json
+import logging
 import re
 import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
+
+from ..logging import log_call
+
+
+logger = logging.getLogger(__name__)
 
 from .lmstudio_client import (
     AnswerLength,
@@ -1406,6 +1412,7 @@ class ConversationManager:
 
         return self._connected
 
+    @log_call(logger=logger, level=logging.DEBUG, include_args=False)
     def ask(
         self,
         question: str,
@@ -1418,6 +1425,20 @@ class ConversationManager:
         context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]] | None = None,
     ) -> ConversationTurn:
         """Send ``question`` to LMStudio and append the resulting turn."""
+
+        sanitized_question = question.strip()
+        preview = sanitized_question[:120]
+        logger.info(
+            "Received question",
+            extra={
+                "question_preview": preview,
+                "preset": preset.value,
+                "response_mode": response_mode.value,
+                "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
+                "context_snippet_count": len(context_snippets or []),
+                "planning_enabled": context_provider is not None,
+            },
+        )
 
         if not self._connected:
             message = self._connection_error or "LMStudio is disconnected."
@@ -1452,8 +1473,19 @@ class ConversationManager:
                 response_mode=response_mode,
                 extra_options=extra_options,
             )
+        logger.info(
+            "Completed question",
+            extra={
+                "question_preview": preview,
+                "response_mode": response_mode.value,
+                "plan_step_count": len(turn.plan),
+                "step_result_count": len(getattr(turn, "step_results", [])),
+                "citation_count": len(turn.citations),
+            },
+        )
         return turn
 
+    @log_call(logger=logger, level=logging.DEBUG, include_args=False)
     def _ask_single_shot(
         self,
         question: str,
@@ -1464,7 +1496,18 @@ class ConversationManager:
         response_mode: ResponseMode,
         extra_options: dict[str, Any] | None,
     ) -> ConversationTurn:
+        question_preview = question.strip()[:120]
         messages = self._build_messages(question, context_snippets)
+        logger.info(
+            "Dispatching single-shot query",
+            extra={
+                "question_preview": question_preview,
+                "message_count": len(messages),
+                "context_snippet_count": len(context_snippets or []),
+                "preset": preset.value,
+                "response_mode": response_mode.value,
+            },
+        )
         request_options = self._build_request_options(
             question,
             reasoning_verbosity,
@@ -1483,6 +1526,14 @@ class ConversationManager:
 
         self._update_connection(True, None)
         turn = self._register_turn(question, response, response_mode, preset)
+        logger.info(
+            "Single-shot query completed",
+            extra={
+                "question_preview": question_preview,
+                "citation_count": len(turn.citations),
+                "answer_length": len(turn.answer),
+            },
+        )
         return turn
 
     def _apply_adversarial_review(
@@ -1747,6 +1798,7 @@ class ConversationManager:
     _WORD_PATTERN = re.compile(r"[A-Za-z0-9%$€£¥]+")
     _NUMBER_PATTERN = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?%?")
 
+    @log_call(logger=logger, level=logging.DEBUG, include_args=False)
     def _ask_with_plan(
         self,
         question: str,
@@ -1758,6 +1810,8 @@ class ConversationManager:
         extra_options: dict[str, Any] | None,
         context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]],
     ) -> ConversationTurn:
+        normalized_question = question.strip()
+        question_preview = normalized_question[:120]
         plan_items = self._generate_plan(question)
         if not plan_items:
             raise DynamicPlanningError("No plan items generated")
@@ -1772,6 +1826,15 @@ class ConversationManager:
         ]
         step_results: list[StepResult] = []
         assumptions: list[str] = []
+
+        logger.info(
+            "Executing dynamic plan",
+            extra={
+                "question_preview": question_preview,
+                "plan_step_count": total_steps,
+                "plan_descriptions": [item.description for item in plan_items],
+            },
+        )
 
         for index, plan_item in enumerate(executed_plan, start=1):
             plan_item.status = "running"
@@ -1814,6 +1877,18 @@ class ConversationManager:
                     reasoning_verbosity,
                     response_mode,
                 )
+                logger.info(
+                    "Dispatching plan step",
+                    extra={
+                        "step_index": index,
+                        "pass_index": pass_index,
+                        "total_steps": total_steps,
+                        "question_preview": question_preview,
+                        "description": plan_item.description,
+                        "context_snippet_count": len(combined_snippets),
+                        "document_count": len(batch.documents),
+                    },
+                )
                 try:
                     response = self.client.chat(
                         messages,
@@ -1830,6 +1905,15 @@ class ConversationManager:
                     answer_parts.append(text)
                 if response.citations:
                     citations.extend(copy.deepcopy(response.citations))
+                logger.info(
+                    "Received plan step response",
+                    extra={
+                        "step_index": index,
+                        "pass_index": pass_index,
+                        "answer_length": len(text),
+                        "citation_count": len(response.citations or []),
+                    },
+                )
 
             if not answer_parts:
                 message = (
@@ -1862,6 +1946,16 @@ class ConversationManager:
                         f"No citations available for step {index}: {plan_item.description}"
                     )
             step_results.append(result)
+
+            logger.info(
+                "Plan step completed",
+                extra={
+                    "step_index": index,
+                    "description": plan_item.description,
+                    "insufficient": result.insufficient,
+                    "citation_count": len(result.citations),
+                },
+            )
 
         aggregated, citation_index_map = self._aggregate_citations(step_results)
         for result in step_results:
@@ -2003,6 +2097,7 @@ class ConversationManager:
         self.turns.append(turn)
         return turn
 
+    @log_call(logger=logger, level=logging.DEBUG, include_args=False)
     def _generate_plan(self, question: str) -> list[PlanItem]:
         normalized = question.strip()
         if not normalized:
@@ -2042,6 +2137,14 @@ class ConversationManager:
             plan = [PlanItem(description=normalized, status="queued")]
 
         self._plan_critic.ensure(plan)
+        logger.info(
+            "Generated plan",
+            extra={
+                "question_preview": normalized[:120],
+                "plan_step_count": len(plan),
+                "plan_descriptions": [item.description for item in plan],
+            },
+        )
         return plan
 
     @staticmethod

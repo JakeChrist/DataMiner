@@ -187,6 +187,54 @@ def test_collect_context_records_includes_metadata(
     assert first["chunk"]["id"]
 
 
+def test_search_documents_handles_mixed_windows_paths(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    file_path = corpus_dir / "report.txt"
+    file_path.write_text("Mixed path analysis enables citation lookup.")
+
+    project = project_repo.create("Mixed Paths")
+    document = document_repo.create(project["id"], "Report", source_path=file_path)
+
+    parsed = ParsedDocument(text=file_path.read_text(), metadata={})
+    ingest_record = ingest_repo.store_version(
+        path=str(file_path),
+        checksum=None,
+        size=None,
+        mtime=None,
+        ctime=None,
+        parsed=parsed,
+    )
+
+    with document_repo.transaction() as connection:
+        connection.execute(
+            "UPDATE documents SET source_path = ?, folder_path = ? WHERE id = ?",
+            ("C:\\Corpus\\report.txt", "C:\\Corpus", document["id"]),
+        )
+
+    with ingest_repo.transaction() as connection:
+        connection.execute(
+            "UPDATE ingest_documents SET path = ? WHERE id = ?",
+            ("C:/Corpus/report.txt", ingest_record["id"]),
+        )
+        connection.execute(
+            "UPDATE ingest_document_index SET path = ? WHERE document_id = ?",
+            ("C:/Corpus/report.txt", ingest_record["id"]),
+        )
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+    results = service.search_documents("citation", project_id=project["id"])
+
+    assert results
+    assert results[0]["document"]["id"] == document["id"]
+
+
 def test_search_service_fallback_skips_unscoped_results(
     tmp_path: Path,
     project_repo: ProjectRepository,

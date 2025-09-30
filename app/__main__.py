@@ -6,7 +6,7 @@ import sys
 
 from PyQt6.QtWidgets import QApplication
 
-from .logging import setup_logging
+from .logging import install_exception_hook, setup_logging
 from .ingest.service import IngestService
 from .services.backup_service import BackupService
 from .services.document_hierarchy import DocumentHierarchyService
@@ -21,6 +21,7 @@ from .ui import MainWindow
 def main() -> None:
     """Start the PyQt6 application."""
     logger = setup_logging()
+    install_exception_hook(logger)
     logger.debug("Starting QApplication")
 
     app = QApplication(sys.argv)

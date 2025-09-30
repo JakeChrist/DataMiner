@@ -220,7 +220,7 @@ class MainWindow(QMainWindow):
         self.help_action.triggered.connect(self._open_help)
 
         self.toggle_theme_action = QAction("Toggle Theme", self)
-        self.toggle_theme_action.triggered.connect(self.settings_service.toggle_theme)
+        self.toggle_theme_action.triggered.connect(self._on_toggle_theme_triggered)
 
         self.view_logs_action = QAction("View Logs…", self)
         self.view_logs_action.triggered.connect(self._open_log_viewer)
@@ -547,6 +547,9 @@ class MainWindow(QMainWindow):
             sizes = list(self.settings_service.splitter_sizes)
         if hasattr(self, "_splitter") and sizes and len(sizes) == 3:
             self._splitter.setSizes([max(80, int(size)) for size in sizes])
+
+    def _on_toggle_theme_triggered(self, _: bool) -> None:
+        self.settings_service.toggle_theme()
 
     def _toggle_corpus_panel(self, visible: bool) -> None:
         if visible:

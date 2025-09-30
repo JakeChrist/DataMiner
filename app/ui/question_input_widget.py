@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFontMetrics
 from PyQt6.QtWidgets import (
@@ -18,6 +20,9 @@ from PyQt6.QtWidgets import (
 from ..services.conversation_manager import AnswerLength, ConnectionState
 
 
+logger = logging.getLogger(__name__)
+
+
 class _HistoryTextEdit(QTextEdit):
     """Text edit that surfaces history navigation shortcuts."""
 
@@ -32,16 +37,19 @@ class _HistoryTextEdit(QTextEdit):
             modifiers & Qt.KeyboardModifier.ControlModifier
         ):
             event.accept()
+            logger.info("History submit requested via keyboard")
             self.submit_requested.emit()
             return
         if key == Qt.Key.Key_Up and modifiers == Qt.KeyboardModifier.NoModifier:
             if self.textCursor().atStart():
                 event.accept()
+                logger.info("History previous requested via keyboard")
                 self.history_previous_requested.emit()
                 return
         if key == Qt.Key.Key_Down and modifiers == Qt.KeyboardModifier.NoModifier:
             if self.textCursor().atEnd():
                 event.accept()
+                logger.info("History next requested via keyboard")
                 self.history_next_requested.emit()
                 return
         super().keyPressEvent(event)
@@ -88,7 +96,7 @@ class QuestionInputWidget(QFrame):
         self.scope_button.setVisible(False)
         self.scope_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scope_button.setToolTip("Scope: entire corpus")
-        self.scope_button.clicked.connect(lambda: self.scope_cleared.emit())
+        self.scope_button.clicked.connect(self._on_scope_cleared)
         self._top_row.addWidget(self.scope_button)
 
         self.status_label = QLabel("", self)
@@ -144,6 +152,7 @@ class QuestionInputWidget(QFrame):
         self.editor.clear()
         self._history_index = len(self._history)
         self._update_button_state()
+        logger.info("Question input cleared")
         self.cleared.emit()
 
     # ------------------------------------------------------------------
@@ -262,7 +271,12 @@ class QuestionInputWidget(QFrame):
             return
         self._remember_entry(text)
         self.editor.clear()
+        logger.info("Ask requested", extra={"characters": len(text)})
         self.ask_requested.emit(text)
+
+    def _on_scope_cleared(self) -> None:
+        logger.info("Scope cleared")
+        self.scope_cleared.emit()
 
     def _remember_entry(self, text: str) -> None:
         if text and (not self._history or self._history[-1] != text):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -10,6 +11,9 @@ from PyQt6.QtGui import QFont, QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
 from ..config import ConfigManager
+
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_THEME = "light"
@@ -149,6 +153,7 @@ class SettingsService(QObject):
             return
         self._settings.theme = normalized
         self.save()
+        logger.info("Theme changed", extra={"theme": normalized})
         self.theme_changed.emit(normalized)
 
     def toggle_theme(self) -> None:
@@ -164,6 +169,7 @@ class SettingsService(QObject):
             return
         self._settings.font_scale = value
         self.save()
+        logger.info("Font scale changed", extra={"font_scale": value})
         self.font_scale_changed.emit(value)
 
     def set_density(self, density: str) -> None:
@@ -174,6 +180,7 @@ class SettingsService(QObject):
             return
         self._settings.density = normalized
         self.save()
+        logger.info("Density changed", extra={"density": normalized})
         self.density_changed.emit(normalized)
 
     def set_splitter_sizes(self, sizes: Iterable[int]) -> None:

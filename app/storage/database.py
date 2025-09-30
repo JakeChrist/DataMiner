@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import json
+import logging
 import re
 import shutil
 import sqlite3
@@ -17,6 +18,36 @@ if TYPE_CHECKING:
 
 SCHEMA_VERSION = 4
 SCHEMA_FILENAME = "schema.sql"
+
+
+def _parse_schema_objects() -> dict[str, set[str]]:
+    """Extract schema object names from ``schema.sql`` for compatibility checks."""
+
+    schema_path = Path(__file__).with_name(SCHEMA_FILENAME)
+    schema_sql = schema_path.read_text(encoding="utf-8")
+    patterns = {
+        "table": re.compile(
+            r"CREATE\s+(?:VIRTUAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[A-Za-z_][\w]*)",
+            re.IGNORECASE,
+        ),
+        "index": re.compile(
+            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[A-Za-z_][\w]*)",
+            re.IGNORECASE,
+        ),
+        "trigger": re.compile(
+            r"CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[A-Za-z_][\w]*)",
+            re.IGNORECASE,
+        ),
+    }
+    objects: dict[str, set[str]] = {"table": set(), "index": set(), "trigger": set()}
+    for kind, pattern in patterns.items():
+        for match in pattern.finditer(schema_sql):
+            objects[kind].add(match.group("name"))
+    return objects
+
+
+EXPECTED_SCHEMA_OBJECTS = _parse_schema_objects()
+logger = logging.getLogger(__name__)
 
 
 class DatabaseError(RuntimeError):
@@ -60,9 +91,7 @@ class DatabaseManager:
             with connection:  # Start a transaction so initialization is atomic.
                 version = self._get_user_version(connection)
                 if version > SCHEMA_VERSION:
-                    raise DatabaseError(
-                        "Database schema version is newer than this application supports"
-                    )
+                    version = self._handle_newer_schema(connection, version)
                 if version == 0:
                     self._install_base_schema(connection)
                 elif version < SCHEMA_VERSION:
@@ -82,6 +111,38 @@ class DatabaseManager:
             return
         # No incremental migrations yet; reapply schema to fill gaps.
         self._install_base_schema(connection)
+
+    def _handle_newer_schema(self, connection: sqlite3.Connection, version: int) -> int:
+        """Downgrade ``user_version`` if the schema is still compatible."""
+
+        if not self._is_schema_compatible(connection):
+            raise DatabaseError(
+                "Database schema version is newer than this application supports"
+            )
+        logger.warning(
+            "Detected newer database schema version %s; resetting to supported version %s",
+            version,
+            SCHEMA_VERSION,
+        )
+        self._install_base_schema(connection)
+        return SCHEMA_VERSION
+
+    def _is_schema_compatible(self, connection: sqlite3.Connection) -> bool:
+        """Check that required schema objects exist in the connected database."""
+
+        existing: dict[str, set[str]] = {"table": set(), "index": set(), "trigger": set()}
+        cursor = connection.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'index', 'trigger')"
+        )
+        for row in cursor.fetchall():
+            kind = row["type"]
+            if kind in existing:
+                existing[kind].add(row["name"])
+        for kind, expected in EXPECTED_SCHEMA_OBJECTS.items():
+            missing = expected - existing.get(kind, set())
+            if missing:
+                return False
+        return True
 
     @staticmethod
     def _get_user_version(connection: sqlite3.Connection) -> int:

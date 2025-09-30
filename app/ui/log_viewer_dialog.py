@@ -23,70 +23,93 @@ LOG_PREVIEW_LIMIT = 20_000
 
 
 class LogViewerDialog(QDialog):
-    """Display a formatted traceback alongside recent log file output."""
+    """Display recent log file output with an optional traceback."""
 
     def __init__(
         self,
         *,
         log_path: Optional[Path],
-        traceback_text: str,
+        traceback_text: str = "",
+        message: Optional[str] = None,
+        window_title: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._log_path = log_path
-        self._traceback_text = traceback_text.strip()
-        self.setWindowTitle("DataMiner Crash Report")
+        self._traceback_text = (traceback_text or "").strip()
+        if window_title is None:
+            window_title = (
+                "DataMiner Crash Report" if self._traceback_text else "DataMiner Logs"
+            )
+        self.setWindowTitle(window_title)
         self.resize(960, 640)
 
         layout = QGridLayout(self)
         layout.setColumnStretch(0, 1)
 
-        header = QLabel(
-            "An unexpected error occurred. The traceback and recent log output "
-            "are shown below so that the issue can be diagnosed quickly."
-        )
+        if message is None:
+            if self._traceback_text:
+                message = (
+                    "An unexpected error occurred. The traceback and recent log "
+                    "output are shown below so that the issue can be diagnosed "
+                    "quickly."
+                )
+            else:
+                message = "Recent log output is shown below."
+
+        header = QLabel(message)
         header.setWordWrap(True)
         header.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout.addWidget(header, 0, 0)
 
-        traceback_label = QLabel("Traceback")
-        traceback_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        traceback_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(traceback_label, 1, 0)
-
-        traceback_view = QTextEdit(self)
-        traceback_view.setReadOnly(True)
-        traceback_view.setWordWrapMode(QTextOption.WrapMode.NoWrap)
+        row = 1
         monospaced = _monospace_font()
-        traceback_view.setFont(monospaced)
-        traceback_view.setPlainText(self._traceback_text or "Traceback unavailable.")
-        layout.addWidget(traceback_view, 2, 0)
+
+        if self._traceback_text:
+            traceback_label = QLabel("Traceback")
+            traceback_label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            traceback_label.setStyleSheet("font-weight: bold;")
+            layout.addWidget(traceback_label, row, 0)
+            row += 1
+
+            traceback_view = QTextEdit(self)
+            traceback_view.setReadOnly(True)
+            traceback_view.setWordWrapMode(QTextOption.WrapMode.NoWrap)
+            traceback_view.setFont(monospaced)
+            traceback_view.setPlainText(self._traceback_text or "Traceback unavailable.")
+            layout.addWidget(traceback_view, row, 0)
+            row += 1
 
         log_label = QLabel("Recent log output" + (f" ({log_path})" if log_path else ""))
         log_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         log_label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(log_label, 3, 0)
+        layout.addWidget(log_label, row, 0)
+        row += 1
 
         log_view = QTextEdit(self)
         log_view.setReadOnly(True)
         log_view.setWordWrapMode(QTextOption.WrapMode.NoWrap)
         log_view.setFont(monospaced)
         log_view.setPlainText(self._load_log_preview())
-        layout.addWidget(log_view, 4, 0)
+        layout.addWidget(log_view, row, 0)
+        row += 1
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
         button_box.rejected.connect(self.reject)
         button_box.accepted.connect(self.accept)
-        layout.addWidget(button_box, 5, 0, alignment=Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(button_box, row, 0, alignment=Qt.AlignmentFlag.AlignRight)
 
         if log_path:
             open_button = QPushButton("Open Log File", self)
             open_button.clicked.connect(self._open_log_location)
             button_box.addButton(open_button, QDialogButtonBox.ButtonRole.ActionRole)
 
-        copy_button = QPushButton("Copy Traceback", self)
-        copy_button.clicked.connect(self._copy_traceback)
-        button_box.addButton(copy_button, QDialogButtonBox.ButtonRole.ActionRole)
+        if self._traceback_text:
+            copy_button = QPushButton("Copy Traceback", self)
+            copy_button.clicked.connect(self._copy_traceback)
+            button_box.addButton(copy_button, QDialogButtonBox.ButtonRole.ActionRole)
 
     def _load_log_preview(self) -> str:
         if not self._log_path:

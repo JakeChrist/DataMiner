@@ -67,9 +67,11 @@ from ..services.backup_service import BackupService
 from ..services.export_service import ExportService
 from ..services.settings_service import SettingsService
 from ..storage import DatabaseError
+from ..logging import get_log_file_path
 from .answer_view import AnswerView, TurnCardWidget
 from .evidence_panel import EvidencePanel
 from .question_input_widget import QuestionInputWidget
+from .log_viewer_dialog import LogViewerDialog
 
 
 LOGGER = logging.getLogger(__name__)
@@ -220,6 +222,9 @@ class MainWindow(QMainWindow):
         self.toggle_theme_action = QAction("Toggle Theme", self)
         self.toggle_theme_action.triggered.connect(self.settings_service.toggle_theme)
 
+        self.view_logs_action = QAction("View Logs…", self)
+        self.view_logs_action.triggered.connect(self._open_log_viewer)
+
         self.new_project_action = QAction("New Project…", self)
         self.new_project_action.triggered.connect(self._prompt_new_project)
 
@@ -298,6 +303,8 @@ class MainWindow(QMainWindow):
         menubar.addMenu(help_menu)
 
         view_menu = QMenu("View", self)
+        view_menu.addAction(self.view_logs_action)
+        view_menu.addSeparator()
         view_menu.addAction(self.toggle_theme_action)
         view_menu.addSeparator()
 
@@ -1830,6 +1837,26 @@ class MainWindow(QMainWindow):
 
     def _open_help(self) -> None:
         QMessageBox.information(self, "Help", "Visit the documentation for assistance.")
+
+    def _open_log_viewer(self) -> None:
+        root_logger = logging.getLogger("DataMiner")
+        log_path = get_log_file_path(root_logger)
+        if log_path is None:
+            QMessageBox.warning(
+                self,
+                "Logs Unavailable",
+                "Unable to determine the log file location.",
+            )
+            return
+
+        dialog = LogViewerDialog(
+            log_path=log_path,
+            traceback_text="",
+            message="Recent log output is shown below.",
+            window_title="DataMiner Logs",
+            parent=self,
+        )
+        dialog.exec()
 
     # ------------------------------------------------------------------
     def _apply_theme(self, theme: str) -> None:

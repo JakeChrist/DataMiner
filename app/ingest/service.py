@@ -22,6 +22,7 @@ from app.storage import (
     DocumentRepository,
     IngestDocumentRepository,
 )
+from app.storage.json_utils import make_json_safe
 
 
 TaskCallback = Callable[[int, dict[str, Any]], None]
@@ -403,11 +404,28 @@ class IngestService:
                 job.progress["succeeded"] += 1
                 metadata = result["metadata"]
                 processed_files.append(metadata)
-                known_files[metadata["path"]] = {
+                summary_entry: dict[str, Any] = {
                     "checksum": metadata["checksum"],
                     "mtime": metadata["mtime"],
                     "size": metadata["size"],
                 }
+                if "ctime" in metadata:
+                    summary_entry["ctime"] = metadata["ctime"]
+                if "document_id" in metadata:
+                    summary_entry["document_id"] = metadata["document_id"]
+                if "version" in metadata:
+                    summary_entry["version"] = metadata["version"]
+                if "preview" in metadata:
+                    summary_entry["preview"] = metadata["preview"]
+                if "needs_ocr" in metadata:
+                    summary_entry["needs_ocr"] = metadata["needs_ocr"]
+                if "ocr_message" in metadata:
+                    summary_entry["ocr_message"] = metadata["ocr_message"]
+                parser_meta = metadata.get("parser_metadata")
+                if parser_meta:
+                    summary_entry["parser_metadata"] = parser_meta
+                summary_entry = make_json_safe(summary_entry)
+                known_files[metadata["path"]] = summary_entry
                 if metadata.get("needs_ocr"):
                     job.summary.setdefault("needs_ocr", []).append(
                         {
@@ -468,6 +486,7 @@ class IngestService:
         metadata = {
             "path": normalized_path,
             "mtime": stat.st_mtime,
+            "ctime": stat.st_ctime,
             "size": stat.st_size,
         }
 
@@ -534,7 +553,13 @@ class IngestService:
         metadata["needs_ocr"] = record.get("needs_ocr", False)
         if record.get("ocr_message"):
             metadata["ocr_message"] = record["ocr_message"]
-        metadata["parser_metadata"] = parsed.metadata
+        parser_metadata = make_json_safe(parsed.metadata)
+        if parser_metadata not in (None, {}):
+            metadata["parser_metadata"] = parser_metadata
+
+        metadata = make_json_safe(metadata)
+        if not isinstance(metadata, dict):
+            metadata = {"path": normalized_path}
 
         return {"status": "success", "metadata": metadata}
 
@@ -703,7 +728,7 @@ class IngestService:
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Unable to sync project documents: %s", exc)
             job.errors.append("Failed to sync project documents")
-            return
+            raise RuntimeError("Failed to sync project documents") from exc
 
         def _load_existing() -> dict[str, dict[str, Any]]:
             mapping: dict[str, dict[str, Any]] = {}
@@ -719,11 +744,13 @@ class IngestService:
         except Exception as exc:  # pragma: no cover - defensive
             LOGGER.warning("Unable to load existing project documents: %s", exc)
             job.errors.append("Failed to sync project documents")
-            return
+            raise RuntimeError("Failed to sync project documents") from exc
 
         known_files_param = job.summary.get("known_files", {})
         if not isinstance(known_files_param, dict):
             known_files_param = {}
+
+        sync_failed = False
 
         for path, metadata in known_files_param.items():
             if not isinstance(path, str):
@@ -755,6 +782,7 @@ class IngestService:
                     job.errors.append(
                         f"Failed to register document metadata for {normalized_path}"
                     )
+                    sync_failed = True
                     continue
                 if created and created.get("source_path"):
                     key = str(Path(created["source_path"]).resolve())
@@ -781,6 +809,7 @@ class IngestService:
                         job.errors.append(
                             f"Failed to update document metadata for {normalized_path}"
                         )
+                        sync_failed = True
                         continue
                     if updated and updated.get("source_path"):
                         key = str(Path(updated["source_path"]).resolve())
@@ -794,7 +823,17 @@ class IngestService:
             ]
 
         if removed_paths:
-            for document in self._execute_with_retry(lambda: repo.list_for_project(project_id)):
+            try:
+                documents = self._execute_with_retry(lambda: repo.list_for_project(project_id))
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning(
+                    "Unable to load project documents for removal sync: %s",
+                    exc,
+                )
+                job.errors.append("Failed to sync project documents")
+                raise RuntimeError("Failed to sync project documents") from exc
+
+            for document in documents:
                 source_path = document.get("source_path")
                 if not source_path:
                     continue
@@ -815,6 +854,10 @@ class IngestService:
                     job.errors.append(
                         f"Failed to remove stale document metadata for {normalized}"
                     )
+                    sync_failed = True
+
+        if sync_failed:
+            raise RuntimeError("Failed to sync project documents")
 
     @staticmethod
     def _coerce_project_id(value: Any) -> int | None:

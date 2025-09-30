@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sqlite3
 import sys
 
@@ -288,3 +289,72 @@ def test_initialize_migrates_context_chunking_schema(tmp_path: Path) -> None:
         "SELECT metadata FROM ingest_document_chunks WHERE id = 1"
     ).fetchone()["metadata"]
     assert metadata_value == "{}"
+
+
+def test_initialize_creates_chunk_table_from_version_three(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_v3.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE ingest_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                checksum TEXT,
+                size INTEGER,
+                mtime REAL,
+                ctime REAL,
+                metadata TEXT,
+                text TEXT,
+                normalized_text TEXT,
+                preview TEXT,
+                sections TEXT,
+                pages TEXT,
+                needs_ocr INTEGER NOT NULL DEFAULT 0,
+                ocr_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE VIRTUAL TABLE ingest_document_index
+            USING fts5(
+                content,
+                document_id UNINDEXED,
+                tokenize='porter'
+            );
+            INSERT INTO ingest_documents (
+                path, version, text, normalized_text
+            )
+            VALUES ('/tmp/legacy.txt', 1, 'Legacy payload', 'Legacy payload');
+            INSERT INTO ingest_document_index (rowid, content, document_id)
+            VALUES (1, 'Legacy payload', 1);
+            PRAGMA user_version = 3;
+            """
+        )
+
+    manager = DatabaseManager(db_path)
+    manager.initialize()
+
+    connection = manager.connect()
+    columns = connection.execute("PRAGMA table_info(ingest_document_chunks)").fetchall()
+    names = {row["name"] for row in columns}
+    assert {"id", "document_id", "metadata"}.issubset(names)
+
+    chunk_row = connection.execute(
+        "SELECT id, document_id, chunk_index, text, metadata FROM ingest_document_chunks"
+    ).fetchone()
+    assert chunk_row is not None
+    assert chunk_row["document_id"] == 1
+    assert chunk_row["chunk_index"] == 0
+    assert chunk_row["text"] == "Legacy payload"
+    metadata = json.loads(chunk_row["metadata"])
+    assert metadata["source_path"] == "/tmp/legacy.txt"
+
+    index_row = connection.execute(
+        "SELECT chunk_id, chunk_index, path FROM ingest_document_index"
+    ).fetchone()
+    assert index_row is not None
+    assert index_row["chunk_id"] == chunk_row["id"]
+    assert index_row["chunk_index"] == 0
+    assert index_row["path"] == "/tmp/legacy.txt"
+
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+

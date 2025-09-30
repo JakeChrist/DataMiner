@@ -80,11 +80,43 @@ class DatabaseManager:
         self._set_user_version(connection, SCHEMA_VERSION)
 
     def _apply_migrations(self, connection: sqlite3.Connection, current: int) -> None:
-        """Placeholder for future migrations from ``current`` to ``SCHEMA_VERSION``."""
-        if current >= SCHEMA_VERSION:
-            return
-        # No incremental migrations yet; reapply schema to fill gaps.
-        self._install_base_schema(connection)
+        """Upgrade the schema from ``current`` to ``SCHEMA_VERSION``."""
+
+        upgraded = False
+
+        if current < 5:
+            self._migrate_to_v5(connection)
+            current = 5
+            upgraded = True
+
+        if current < SCHEMA_VERSION:
+            # Future migrations would be chained here.
+            self._install_base_schema(connection)
+            current = SCHEMA_VERSION
+
+        if upgraded or current != SCHEMA_VERSION:
+            self._set_user_version(connection, SCHEMA_VERSION)
+
+    def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
+        """Add chunk metadata storage introduced in schema version 5."""
+
+        columns = self._get_table_columns(connection, "ingest_document_chunks")
+        if "metadata" not in columns:
+            connection.execute("ALTER TABLE ingest_document_chunks ADD COLUMN metadata TEXT")
+            connection.execute(
+                "UPDATE ingest_document_chunks SET metadata = '{}' WHERE metadata IS NULL"
+            )
+
+    @staticmethod
+    def _get_table_columns(connection: sqlite3.Connection, table: str) -> list[str]:
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        columns: list[str] = []
+        for row in rows:
+            try:
+                columns.append(str(row["name"]))
+            except (IndexError, KeyError, TypeError):  # pragma: no cover - defensive
+                continue
+        return columns
 
     @staticmethod
     def _get_user_version(connection: sqlite3.Connection) -> int:

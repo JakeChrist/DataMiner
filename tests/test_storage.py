@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 import sys
 
@@ -208,3 +209,40 @@ def test_ingest_chunk_storage(
         "SELECT COUNT(*) FROM ingest_document_chunks"
     ).fetchone()[0]
     assert count >= 1
+
+
+def test_initialize_migrates_chunk_metadata(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(legacy_path)
+    connection.executescript(
+        """
+        CREATE TABLE ingest_document_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            start_offset INTEGER NOT NULL,
+            end_offset INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        PRAGMA user_version = 4;
+        INSERT INTO ingest_document_chunks (
+            document_id, chunk_index, text, token_count, start_offset, end_offset
+        ) VALUES (1, 0, 'example', 1, 0, 7);
+        """
+    )
+    connection.close()
+
+    manager = DatabaseManager(legacy_path)
+    manager.initialize()
+
+    migrated = manager.connect().execute("PRAGMA table_info(ingest_document_chunks)").fetchall()
+    column_names = {row[1] for row in migrated}
+    assert "metadata" in column_names
+
+    values = manager.connect().execute(
+        "SELECT metadata FROM ingest_document_chunks WHERE id = 1"
+    ).fetchone()
+    assert values is not None
+    assert values[0] == "{}"

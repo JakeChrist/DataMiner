@@ -692,29 +692,34 @@ class IngestService:
             return
 
         repo = self.project_documents
-        connection = repo.db.connect()
         try:
+            connection = repo.db.connect()
             project_exists = connection.execute(
                 "SELECT 1 FROM projects WHERE id = ?",
                 (project_id,),
             ).fetchone()
-        except sqlite3.DatabaseError as exc:  # pragma: no cover - defensive
-            raise RuntimeError("Unable to query project metadata") from exc
-
-        if project_exists is None:
+            if project_exists is None:
+                return
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Unable to sync project documents: %s", exc)
+            job.errors.append("Failed to sync project documents")
             return
 
         def _load_existing() -> dict[str, dict[str, Any]]:
-            entries = repo.list_for_project(project_id)
             mapping: dict[str, dict[str, Any]] = {}
-            for doc in entries:
+            for doc in repo.list_for_project(project_id):
                 source_path = doc.get("source_path")
                 if not source_path:
                     continue
                 mapping[str(Path(source_path).resolve())] = doc
             return mapping
 
-        existing_docs = self._execute_with_retry(_load_existing)
+        try:
+            existing_docs = self._execute_with_retry(_load_existing)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Unable to load existing project documents: %s", exc)
+            job.errors.append("Failed to sync project documents")
+            return
 
         known_files_param = job.summary.get("known_files", {})
         if not isinstance(known_files_param, dict):
@@ -731,16 +736,26 @@ class IngestService:
                 title = Path(normalized_path).stem or Path(normalized_path).name
 
                 def _create() -> dict[str, Any]:
-                    created = repo.create(
+                    return repo.create(
                         project_id,
                         title,
                         source_type="file",
                         source_path=normalized_path,
                         metadata=payload,
                     )
-                    return created
 
-                created = self._execute_with_retry(_create)
+                try:
+                    created = self._execute_with_retry(_create)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning(
+                        "Unable to create project document for %s: %s",
+                        normalized_path,
+                        exc,
+                    )
+                    job.errors.append(
+                        f"Failed to register document metadata for {normalized_path}"
+                    )
+                    continue
                 if created and created.get("source_path"):
                     key = str(Path(created["source_path"]).resolve())
                     existing_docs[key] = created
@@ -752,39 +767,54 @@ class IngestService:
                 if current_meta.get("file") != data:
                     updates["metadata"] = payload
                 if updates:
-
                     def _update() -> dict[str, Any] | None:
                         return repo.update(document["id"], **updates)
 
-                    updated = self._execute_with_retry(_update)
-                    if updated is None:
-
-                        def _reload() -> dict[str, Any] | None:
-                            return repo.get(document["id"])
-
-                        updated = self._execute_with_retry(_reload)
+                    try:
+                        updated = self._execute_with_retry(_update)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        LOGGER.warning(
+                            "Unable to update project document for %s: %s",
+                            normalized_path,
+                            exc,
+                        )
+                        job.errors.append(
+                            f"Failed to update document metadata for {normalized_path}"
+                        )
+                        continue
                     if updated and updated.get("source_path"):
                         key = str(Path(updated["source_path"]).resolve())
                         existing_docs[key] = updated
 
-        removed_paths: set[str] = set()
+        removed_paths: list[str] = []
         removed = job.summary.get("removed")
         if isinstance(removed, (list, tuple, set)):
-            for entry in removed:
-                if not isinstance(entry, str):
-                    continue
-                removed_paths.add(str(Path(entry).resolve()))
+            removed_paths = [
+                str(Path(entry).resolve()) for entry in removed if isinstance(entry, str)
+            ]
 
         if removed_paths:
-            for path, document in list(existing_docs.items()):
-                if path not in removed_paths:
+            for document in self._execute_with_retry(lambda: repo.list_for_project(project_id)):
+                source_path = document.get("source_path")
+                if not source_path:
                     continue
-
+                normalized = str(Path(source_path).resolve())
+                if normalized not in removed_paths:
+                    continue
                 def _delete(doc_id: int = document["id"]) -> None:
                     repo.delete(doc_id)
 
-                self._execute_with_retry(_delete)
-                existing_docs.pop(path, None)
+                try:
+                    self._execute_with_retry(_delete)
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning(
+                        "Unable to delete project document for %s: %s",
+                        normalized,
+                        exc,
+                    )
+                    job.errors.append(
+                        f"Failed to remove stale document metadata for {normalized}"
+                    )
 
     @staticmethod
     def _coerce_project_id(value: Any) -> int | None:

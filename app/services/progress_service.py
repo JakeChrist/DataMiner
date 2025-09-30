@@ -8,6 +8,8 @@ from typing import Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from ..logging import log_call
+
 
 logger = logging.getLogger(__name__)
 
@@ -30,36 +32,42 @@ class ProgressService(QObject):
     progress_finished = pyqtSignal(object)
     toast_requested = pyqtSignal(str, str, int)
 
+    @log_call(logger=logger)
     def __init__(self) -> None:
         super().__init__()
         self._subscriptions: list[Callable[[ProgressUpdate], None]] = []
 
     # ------------------------------------------------------------------
     # Subscription helpers
+    @log_call(logger=logger)
     def subscribe(self, callback: Callable[[ProgressUpdate], None]) -> None:
         """Subscribe ``callback`` to raw progress events."""
 
         if callback not in self._subscriptions:
             self._subscriptions.append(callback)
 
+    @log_call(logger=logger)
     def unsubscribe(self, callback: Callable[[ProgressUpdate], None]) -> None:
         """Remove ``callback`` from the subscription list."""
 
         if callback in self._subscriptions:
             self._subscriptions.remove(callback)
 
+    @log_call(logger=logger)
     def _dispatch(self, update: ProgressUpdate) -> None:
         for callback in list(self._subscriptions):
             callback(update)
 
     # ------------------------------------------------------------------
     # Emission helpers
+    @log_call(logger=logger)
     def start(self, task_id: str, message: str = "") -> None:
         update = ProgressUpdate(task_id=task_id, message=message, percent=0.0)
         logger.info("Progress started", extra={"task_id": task_id, "message": message})
         self.progress_started.emit(update)
         self._dispatch(update)
 
+    @log_call(logger=logger)
     def update(
         self,
         task_id: str,
@@ -86,6 +94,7 @@ class ProgressService(QObject):
         self.progress_updated.emit(update)
         self._dispatch(update)
 
+    @log_call(logger=logger)
     def finish(self, task_id: str, message: str = "") -> None:
         update = ProgressUpdate(task_id=task_id, message=message, percent=100.0)
         logger.info(
@@ -95,6 +104,7 @@ class ProgressService(QObject):
         self.progress_finished.emit(update)
         self._dispatch(update)
 
+    @log_call(logger=logger)
     def notify(self, message: str, *, level: str = "info", duration_ms: int = 4000) -> None:
         """Request a toast notification."""
 
@@ -106,6 +116,7 @@ class ProgressService(QObject):
 
     # ------------------------------------------------------------------
     # Background task integration
+    @log_call(logger=logger)
     def subscribe_to(self, emitter: QObject) -> None:
         """Connect a background task emitter with ``started/progress/finished`` signals."""
 
@@ -119,6 +130,10 @@ class ProgressService(QObject):
             )
         if hasattr(emitter, "finished"):
             emitter.finished.connect(lambda task_id, message="": self.finish(task_id, message))  # type: ignore[arg-type]
+        logger.debug(
+            "Attached progress emitter",
+            extra={"emitter": emitter.__class__.__name__},
+        )
 
 
 __all__ = ["ProgressService", "ProgressUpdate"]

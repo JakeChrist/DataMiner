@@ -5,16 +5,22 @@ from __future__ import annotations
 import datetime as _dt
 import html
 import json
+import logging
 import textwrap
 from pathlib import Path
 from typing import Iterable, Sequence
 
 from .conversation_manager import ConversationTurn
+from ..logging import log_call
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExportService:
     """Render conversation history or snippets to export-friendly formats."""
 
+    @log_call(logger=logger, include_result=True)
     def conversation_to_markdown(
         self,
         turns: Sequence[ConversationTurn] | Iterable[ConversationTurn],
@@ -34,6 +40,7 @@ class ExportService:
             lines.extend(self._turn_to_markdown(turn, index))
         return "\n".join(lines).strip() + "\n"
 
+    @log_call(logger=logger, include_result=True)
     def conversation_to_html(
         self,
         turns: Sequence[ConversationTurn] | Iterable[ConversationTurn],
@@ -77,6 +84,7 @@ class ExportService:
         parts.append("  </body>\n</html>")
         return "\n".join(parts)
 
+    @log_call(logger=logger, include_result=True)
     def snippets_to_text(self, snippets: Iterable[dict | str]) -> str:
         lines: list[str] = []
         for snippet in snippets:
@@ -94,13 +102,16 @@ class ExportService:
             lines.append(text.strip())
         return "\n\n".join(line for line in lines if line)
 
+    @log_call(logger=logger, include_result=True)
     def write_text(self, destination: str | Path, content: str) -> Path:
         path = Path(destination)
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        logger.info("Wrote export", extra={"destination": str(path), "bytes": path.stat().st_size})
         return path
 
+    @log_call(logger=logger, include_result=True)
     def export_conversation_markdown(
         self,
         destination: str | Path,
@@ -112,6 +123,7 @@ class ExportService:
         content = self.conversation_to_markdown(turns, title=title, metadata=metadata)
         return self.write_text(destination, content)
 
+    @log_call(logger=logger, include_result=True)
     def export_conversation_html(
         self,
         destination: str | Path,
@@ -123,6 +135,7 @@ class ExportService:
         content = self.conversation_to_html(turns, title=title, metadata=metadata)
         return self.write_text(destination, content)
 
+    @log_call(logger=logger, include_result=True)
     def export_snippets_text(
         self, destination: str | Path, snippets: Iterable[dict | str]
     ) -> Path:
@@ -130,6 +143,7 @@ class ExportService:
         return self.write_text(destination, content)
 
     # ------------------------------------------------------------------
+    @log_call(logger=logger, include_result=True)
     def _turn_to_markdown(self, turn: ConversationTurn, index: int) -> list[str]:
         asked = turn.asked_at.isoformat() if turn.asked_at else "—"
         answered = turn.answered_at.isoformat() if turn.answered_at else "—"
@@ -163,6 +177,7 @@ class ExportService:
         lines.extend(textwrap.indent(token_json or "{}", "    ").splitlines())
         return lines
 
+    @log_call(logger=logger, include_result=True)
     def _turn_to_html(self, turn: ConversationTurn, index: int) -> str:
         asked = html.escape(turn.asked_at.isoformat()) if turn.asked_at else "—"
         answered = html.escape(turn.answered_at.isoformat()) if turn.answered_at else "—"
@@ -191,6 +206,7 @@ class ExportService:
         )
         return "\n".join(sections)
 
+    @log_call(logger=logger, include_result=True)
     def _format_reasoning_markdown(self, turn: ConversationTurn) -> list[str]:
         lines: list[str] = []
         if turn.reasoning_bullets:
@@ -224,6 +240,7 @@ class ExportService:
                 lines.append(f"- Notes: {self_check.notes}")
         return lines
 
+    @log_call(logger=logger, include_result=True)
     def _format_reasoning_html(self, turn: ConversationTurn) -> str:
         sections: list[str] = []
         if turn.reasoning_bullets:
@@ -271,6 +288,7 @@ class ExportService:
         return "".join(sections)
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _format_citation_text(citation: object) -> str:
         if isinstance(citation, str):
             return citation
@@ -293,6 +311,7 @@ class ExportService:
         return str(citation)
 
     @staticmethod
+    @log_call(logger=logger, include_result=True)
     def _strip_html(value: str | None) -> str:
         if not value:
             return ""

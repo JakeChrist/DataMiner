@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from app.ingest.parsers import parse_file
+from app.ingest.parsers import SUPPORTED_SUFFIXES, parse_file
 
 
 def test_parse_file_supports_code_and_markup(tmp_path: Path) -> None:
@@ -21,3 +21,8 @@ def test_parse_file_supports_code_and_markup(tmp_path: Path) -> None:
 
         assert content.strip().splitlines()[0] in parsed.text
         assert parsed.metadata["encoding"].lower() == "utf-8"
+
+
+def test_supported_suffixes_include_code_extensions() -> None:
+    for suffix in (".m", ".py", ".cpp"):
+        assert suffix in SUPPORTED_SUFFIXES

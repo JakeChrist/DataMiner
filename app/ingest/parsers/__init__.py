@@ -27,10 +27,6 @@ class DocumentSection:
     content: str
     level: int | None = None
     page_number: int | None = None
-    start_offset: int | None = None
-    end_offset: int | None = None
-    line_start: int | None = None
-    line_end: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -71,21 +67,30 @@ from .text_parser import parse_text
 Parser = Callable[[Path], ParsedDocument]
 
 
+_TEXT_SUFFIXES = (
+    ".txt",
+    ".text",
+    ".html",
+    ".htm",
+)
+
+_CODE_SUFFIXES = (
+    ".py",
+    ".pyw",
+    ".m",
+    ".cpp",
+)
+
 _PARSERS: dict[str, Parser] = {
     ".pdf": parse_pdf,
     ".docx": parse_docx,
-    ".txt": parse_text,
-    ".text": parse_text,
     ".md": parse_markdown,
     ".markdown": parse_markdown,
     ".mkd": parse_markdown,
-    ".html": parse_text,
-    ".htm": parse_text,
-    ".py": parse_text,
-    ".pyw": parse_text,
-    ".m": parse_text,
-    ".cpp": parse_text,
 }
+
+for suffix in (*_TEXT_SUFFIXES, *_CODE_SUFFIXES):
+    _PARSERS[suffix] = parse_text
 
 
 SUPPORTED_SUFFIXES: tuple[str, ...] = tuple(_PARSERS.keys())

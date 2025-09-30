@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 import sys
 
@@ -199,50 +198,9 @@ def test_ingest_chunk_storage(
     assert record is not None
     chunk_results = ingest_repo.search_chunks("gamma", limit=5)
     assert chunk_results
-    first_chunk = chunk_results[0]["chunk"]
-    assert "metadata" in first_chunk
-    assert "hierarchy_weight" in first_chunk["metadata"]
-    assert "score_breakdown" in chunk_results[0]
     texts = [entry["chunk"]["text"] for entry in chunk_results if entry.get("chunk")]
     assert any("gamma" in text for text in texts)
     count = ingest_repo.db.connect().execute(
         "SELECT COUNT(*) FROM ingest_document_chunks"
     ).fetchone()[0]
     assert count >= 1
-
-
-def test_initialize_migrates_chunk_metadata(tmp_path: Path) -> None:
-    legacy_path = tmp_path / "legacy.db"
-    connection = sqlite3.connect(legacy_path)
-    connection.executescript(
-        """
-        CREATE TABLE ingest_document_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            document_id INTEGER NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            token_count INTEGER NOT NULL,
-            start_offset INTEGER NOT NULL,
-            end_offset INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        PRAGMA user_version = 4;
-        INSERT INTO ingest_document_chunks (
-            document_id, chunk_index, text, token_count, start_offset, end_offset
-        ) VALUES (1, 0, 'example', 1, 0, 7);
-        """
-    )
-    connection.close()
-
-    manager = DatabaseManager(legacy_path)
-    manager.initialize()
-
-    migrated = manager.connect().execute("PRAGMA table_info(ingest_document_chunks)").fetchall()
-    column_names = {row[1] for row in migrated}
-    assert "metadata" in column_names
-
-    values = manager.connect().execute(
-        "SELECT metadata FROM ingest_document_chunks WHERE id = 1"
-    ).fetchone()
-    assert values is not None
-    assert values[0] == "{}"

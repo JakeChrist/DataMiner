@@ -566,6 +566,12 @@ class DocumentRepository(BaseRepository):
 class IngestDocumentRepository(BaseRepository):
     """Manage parsed document text, previews, and search indexes."""
 
+    _chunk_metadata_supported: bool | None
+
+    def __init__(self, db: DatabaseManager) -> None:
+        super().__init__(db)
+        self._chunk_metadata_supported = None
+
     def store_version(
         self,
         *,
@@ -717,28 +723,8 @@ class IngestDocumentRepository(BaseRepository):
         return self.search_chunks(query, limit=limit)
 
     def search_chunks(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
-        rows = self.db.connect().execute(
-            """
-            SELECT
-                ingest_document_index.rowid AS chunk_id,
-                ingest_document_index.document_id AS document_id,
-                ingest_document_index.chunk_index AS chunk_index,
-                ingest_document_index.path AS path,
-                highlight(ingest_document_index, 0, '<mark>', '</mark>') AS snippet,
-                bm25(ingest_document_index) AS score,
-                chunks.text AS chunk_text,
-                chunks.token_count AS token_count,
-                chunks.start_offset AS start_offset,
-                chunks.end_offset AS end_offset,
-                chunks.metadata AS metadata
-            FROM ingest_document_index
-            INNER JOIN ingest_document_chunks AS chunks ON chunks.id = ingest_document_index.rowid
-            WHERE ingest_document_index MATCH ?
-            ORDER BY score ASC, chunk_index ASC
-            LIMIT ?
-            """,
-            (query, limit),
-        ).fetchall()
+        connection = self.db.connect()
+        rows, metadata_supported = self._execute_search(connection, query, limit)
 
         if not rows:
             return []
@@ -758,7 +744,7 @@ class IngestDocumentRepository(BaseRepository):
             document = documents.get(doc_id)
             if document is None:
                 continue
-            metadata_raw = row["metadata"]
+            metadata_raw = row["metadata"] if metadata_supported else None
             chunk_metadata = json.loads(metadata_raw) if metadata_raw else {}
             chunk = {
                 "id": int(row["chunk_id"]),
@@ -797,6 +783,76 @@ class IngestDocumentRepository(BaseRepository):
             )
         results.sort(key=lambda item: item["score"], reverse=True)
         return results[:limit]
+
+    def _execute_search(
+        self, connection: sqlite3.Connection, query: str, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """Execute a search query with backward compatibility for legacy schemas."""
+
+        if self._chunk_metadata_supported is False:
+            rows = self._execute_legacy_search(connection, query, limit)
+            return rows, False
+
+        try:
+            rows = connection.execute(
+                """
+                SELECT
+                    ingest_document_index.rowid AS chunk_id,
+                    ingest_document_index.document_id AS document_id,
+                    ingest_document_index.chunk_index AS chunk_index,
+                    ingest_document_index.path AS path,
+                    highlight(ingest_document_index, 0, '<mark>', '</mark>') AS snippet,
+                    bm25(ingest_document_index) AS score,
+                    chunks.text AS chunk_text,
+                    chunks.token_count AS token_count,
+                    chunks.start_offset AS start_offset,
+                    chunks.end_offset AS end_offset,
+                    chunks.metadata AS metadata
+                FROM ingest_document_index
+                INNER JOIN ingest_document_chunks AS chunks ON chunks.id = ingest_document_index.rowid
+                WHERE ingest_document_index MATCH ?
+                ORDER BY score ASC, chunk_index ASC
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "metadata" not in message:
+                raise
+            rows = self._execute_legacy_search(connection, query, limit)
+            self._chunk_metadata_supported = False
+            return rows, False
+
+        self._chunk_metadata_supported = True
+        return rows, True
+
+    def _execute_legacy_search(
+        self, connection: sqlite3.Connection, query: str, limit: int
+    ) -> list[sqlite3.Row]:
+        """Fallback search for databases without chunk metadata support."""
+
+        return connection.execute(
+            """
+            SELECT
+                ingest_document_index.rowid AS chunk_id,
+                ingest_document_index.document_id AS document_id,
+                ingest_document_index.chunk_index AS chunk_index,
+                ingest_document_index.path AS path,
+                highlight(ingest_document_index, 0, '<mark>', '</mark>') AS snippet,
+                bm25(ingest_document_index) AS score,
+                chunks.text AS chunk_text,
+                chunks.token_count AS token_count,
+                chunks.start_offset AS start_offset,
+                chunks.end_offset AS end_offset
+            FROM ingest_document_index
+            INNER JOIN ingest_document_chunks AS chunks ON chunks.id = ingest_document_index.rowid
+            WHERE ingest_document_index MATCH ?
+            ORDER BY score ASC, chunk_index ASC
+            LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
 
     @staticmethod
     def _normalize_text(text: str) -> str:

@@ -176,7 +176,6 @@ CREATE TABLE IF NOT EXISTS ingest_document_chunks (
     token_count INTEGER NOT NULL,
     start_offset INTEGER NOT NULL,
     end_offset INTEGER NOT NULL,
-    metadata TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(document_id, chunk_index),
     FOREIGN KEY (document_id) REFERENCES ingest_documents(id) ON DELETE CASCADE

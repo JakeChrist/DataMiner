@@ -48,14 +48,10 @@ def parse_docx(path: Path) -> ParsedDocument:
     sections: list[DocumentSection] = []
     current_section: DocumentSection | None = None
     body_parts: list[str] = []
-    char_offset = 0
-    line_number = 0
 
     for paragraph in document.paragraphs:
-        text = paragraph.text.rstrip()
+        text = paragraph.text.strip()
         if not text:
-            char_offset += 1
-            line_number += 1
             continue
         body_parts.append(text)
         style_name = paragraph.style.name if paragraph.style is not None else ""
@@ -64,39 +60,15 @@ def parse_docx(path: Path) -> ParsedDocument:
                 level = int("".join(filter(str.isdigit, style_name)))
             except ValueError:
                 level = None
-            current_section = DocumentSection(
-                title=text,
-                content="",
-                level=level,
-                page_number=1,
-                start_offset=char_offset,
-                end_offset=char_offset + len(text),
-                line_start=line_number + 1,
-                line_end=line_number + 1,
-            )
+            current_section = DocumentSection(title=text, content="", level=level)
             sections.append(current_section)
-            char_offset += len(text) + 1
-            line_number += 1
             continue
         if current_section is None:
-            current_section = DocumentSection(
-                title=None,
-                content="",
-                level=None,
-                page_number=1,
-                start_offset=char_offset,
-                line_start=line_number + 1,
-            )
+            current_section = DocumentSection(title=None, content="")
             sections.append(current_section)
         if current_section.content:
             current_section.content += "\n"
         current_section.content += text
-        current_section.end_offset = char_offset + len(text)
-        current_section.line_end = line_number + 1
-        if current_section.line_start is None:
-            current_section.line_start = line_number + 1
-        char_offset += len(text) + 1
-        line_number += 1
 
     # Remove empty trailing sections to keep output compact.
     sections = [section for section in sections if section.content or section.title]

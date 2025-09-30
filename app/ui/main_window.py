@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 import queue
+import sqlite3
+import time
 from datetime import datetime
 from functools import partial
 from importlib import metadata
 from numbers import Integral
 from pathlib import Path
 import threading
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, TypeVar
 
 from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
 from PyQt6.QtGui import (
@@ -75,6 +77,8 @@ from .question_input_widget import QuestionInputWidget
 
 LOGGER = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 
 def _coerce_project_id(value: Any) -> int | None:
     """Convert ``value`` into an integer project identifier when possible."""
@@ -98,6 +102,42 @@ def _coerce_project_id(value: Any) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _attempt_document_repository_operation(
+    operation: Callable[[], T],
+    *,
+    attempts: int = 5,
+    delay: float = 0.1,
+) -> tuple[T | None, bool]:
+    """Execute ``operation`` retrying on transient database locks.
+
+    Returns a tuple of ``(result, had_lock_conflict)``. ``result`` is ``None`` when the
+    operation ultimately failed or produced ``None``. ``had_lock_conflict`` is ``True``
+    whenever the operation observed a lock so callers can surface user feedback.
+    """
+
+    lock_conflict = False
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return operation(), lock_conflict
+        except (sqlite3.OperationalError, DatabaseError) as exc:  # pragma: no cover - defensive
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                LOGGER.exception("Document repository operation failed: %s", exc)
+                return None, True
+            lock_conflict = True
+            last_exc = exc
+            sleep_time = max(delay * attempt, 0.0)
+            if sleep_time:
+                time.sleep(sleep_time)
+    LOGGER.warning(
+        "Document repository remained locked after %s attempts: %s",
+        attempts,
+        last_exc,
+    )
+    return None, True
 
 
 class ToastWidget(QFrame):
@@ -1066,6 +1106,15 @@ class MainWindow(QMainWindow):
             if doc.get("source_path")
         }
         normalized_known: dict[str, dict[str, Any]] = {}
+        lock_conflict = False
+
+        def _execute(operation: Callable[[], T]) -> T | None:
+            nonlocal lock_conflict
+            result, locked = _attempt_document_repository_operation(operation)
+            if locked:
+                lock_conflict = True
+            return result
+
         if isinstance(known_files, dict):
             for path, metadata in known_files.items():
                 if not isinstance(path, str):
@@ -1078,13 +1127,18 @@ class MainWindow(QMainWindow):
                 payload = {"file": normalized_known[normalized_path]}
                 if document is None:
                     title = Path(normalized_path).stem or Path(normalized_path).name
-                    repo.create(
-                        project_id,
-                        title,
-                        source_type="file",
-                        source_path=normalized_path,
-                        metadata=payload,
+                    created = _execute(
+                        lambda: repo.create(
+                            project_id,
+                            title,
+                            source_type="file",
+                            source_path=normalized_path,
+                            metadata=payload,
+                        )
                     )
+                    if created and created.get("source_path"):
+                        key = str(Path(created["source_path"]).resolve())
+                        existing_docs[key] = created
                 else:
                     updates: dict[str, Any] = {}
                     if document.get("source_path") != normalized_path:
@@ -1093,7 +1147,17 @@ class MainWindow(QMainWindow):
                     if current_meta.get("file") != normalized_known[normalized_path]:
                         updates["metadata"] = payload
                     if updates:
-                        repo.update(document["id"], **updates)
+                        updated = _execute(
+                            lambda doc_id=document["id"], fields=dict(updates): repo.update(doc_id, **fields)
+                        )
+                        if not updated:
+                            refreshed = _execute(
+                                lambda doc_id=document["id"]: repo.get(doc_id)
+                            )
+                            updated = refreshed
+                        if updated and updated.get("source_path"):
+                            key = str(Path(updated["source_path"]).resolve())
+                            existing_docs[key] = updated
         removed_paths = []
         if isinstance(removed, (list, tuple, set)):
             removed_paths = [str(Path(path).resolve()) for path in removed if isinstance(path, str)]
@@ -1104,7 +1168,18 @@ class MainWindow(QMainWindow):
                     continue
                 normalized = str(Path(source_path).resolve())
                 if normalized in removed_paths:
-                    repo.delete(document["id"])
+                    _execute(lambda doc_id=document["id"]: repo.delete(doc_id))
+
+        if lock_conflict:
+            LOGGER.warning(
+                "Encountered database lock while syncing project %s documents from ingest summary",
+                project_id,
+            )
+            self._show_toast(
+                "Corpus metadata is updating. Documents will appear once indexing finishes.",
+                level="warning",
+                duration_ms=4000,
+            )
 
     def _refresh_corpus_view(self) -> None:
         self._corpus_tree.clear()

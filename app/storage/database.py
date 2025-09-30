@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from app.ingest.parsers import ParsedDocument
 
 from app.ingest.parsers import DocumentSection
+from .json_utils import make_json_safe
 
 SCHEMA_VERSION = 5
 SCHEMA_FILENAME = "schema.sql"
@@ -707,8 +708,14 @@ class IngestDocumentRepository(BaseRepository):
         base_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized_path = str(Path(path).resolve())
-        metadata = dict(base_metadata or {})
-        metadata.update(parsed.metadata)
+        metadata = make_json_safe(base_metadata or {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        parser_metadata = make_json_safe(parsed.metadata)
+        if isinstance(parser_metadata, dict):
+            metadata.update(parser_metadata)
+        elif parser_metadata not in (None, {}):
+            metadata["parser_metadata"] = parser_metadata
         metadata_json = json.dumps(metadata, ensure_ascii=False)
         sections_json = json.dumps(
             [section.to_dict() for section in parsed.sections], ensure_ascii=False

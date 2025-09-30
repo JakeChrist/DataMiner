@@ -22,6 +22,7 @@ from app.storage import (
     DocumentRepository,
     IngestDocumentRepository,
 )
+from app.storage.json_utils import make_json_safe
 
 
 TaskCallback = Callable[[int, dict[str, Any]], None]
@@ -403,11 +404,28 @@ class IngestService:
                 job.progress["succeeded"] += 1
                 metadata = result["metadata"]
                 processed_files.append(metadata)
-                known_files[metadata["path"]] = {
+                summary_entry: dict[str, Any] = {
                     "checksum": metadata["checksum"],
                     "mtime": metadata["mtime"],
                     "size": metadata["size"],
                 }
+                if "ctime" in metadata:
+                    summary_entry["ctime"] = metadata["ctime"]
+                if "document_id" in metadata:
+                    summary_entry["document_id"] = metadata["document_id"]
+                if "version" in metadata:
+                    summary_entry["version"] = metadata["version"]
+                if "preview" in metadata:
+                    summary_entry["preview"] = metadata["preview"]
+                if "needs_ocr" in metadata:
+                    summary_entry["needs_ocr"] = metadata["needs_ocr"]
+                if "ocr_message" in metadata:
+                    summary_entry["ocr_message"] = metadata["ocr_message"]
+                parser_meta = metadata.get("parser_metadata")
+                if parser_meta:
+                    summary_entry["parser_metadata"] = parser_meta
+                summary_entry = make_json_safe(summary_entry)
+                known_files[metadata["path"]] = summary_entry
                 if metadata.get("needs_ocr"):
                     job.summary.setdefault("needs_ocr", []).append(
                         {
@@ -468,6 +486,7 @@ class IngestService:
         metadata = {
             "path": normalized_path,
             "mtime": stat.st_mtime,
+            "ctime": stat.st_ctime,
             "size": stat.st_size,
         }
 
@@ -534,7 +553,13 @@ class IngestService:
         metadata["needs_ocr"] = record.get("needs_ocr", False)
         if record.get("ocr_message"):
             metadata["ocr_message"] = record["ocr_message"]
-        metadata["parser_metadata"] = parsed.metadata
+        parser_metadata = make_json_safe(parsed.metadata)
+        if parser_metadata not in (None, {}):
+            metadata["parser_metadata"] = parser_metadata
+
+        metadata = make_json_safe(metadata)
+        if not isinstance(metadata, dict):
+            metadata = {"path": normalized_path}
 
         return {"status": "success", "metadata": metadata}
 

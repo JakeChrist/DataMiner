@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -52,6 +56,7 @@ class ProgressService(QObject):
     # Emission helpers
     def start(self, task_id: str, message: str = "") -> None:
         update = ProgressUpdate(task_id=task_id, message=message, percent=0.0)
+        logger.info("Progress started", extra={"task_id": task_id, "message": message})
         self.progress_started.emit(update)
         self._dispatch(update)
 
@@ -69,17 +74,34 @@ class ProgressService(QObject):
             percent=percent,
             indeterminate=bool(indeterminate) if indeterminate is not None else False,
         )
+        logger.info(
+            "Progress updated",
+            extra={
+                "task_id": task_id,
+                "message": update.message,
+                "percent": percent,
+                "indeterminate": update.indeterminate,
+            },
+        )
         self.progress_updated.emit(update)
         self._dispatch(update)
 
     def finish(self, task_id: str, message: str = "") -> None:
         update = ProgressUpdate(task_id=task_id, message=message, percent=100.0)
+        logger.info(
+            "Progress finished",
+            extra={"task_id": task_id, "message": message},
+        )
         self.progress_finished.emit(update)
         self._dispatch(update)
 
     def notify(self, message: str, *, level: str = "info", duration_ms: int = 4000) -> None:
         """Request a toast notification."""
 
+        logger.info(
+            "Toast notification requested",
+            extra={"message": message, "level": level, "duration_ms": duration_ms},
+        )
         self.toast_requested.emit(message, level, duration_ms)
 
     # ------------------------------------------------------------------

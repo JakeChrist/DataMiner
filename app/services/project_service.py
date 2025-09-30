@@ -573,9 +573,15 @@ class ProjectService(QObject):
                     return False
 
     def _emit_projects_changed(self) -> None:
-        self.projects_changed.emit(self.list_projects())
+        projects = self.list_projects()
+        logger.info("Projects changed", extra={"project_count": len(projects)})
+        self.projects_changed.emit(projects)
 
     def _emit_active_project_changed(self, project: ProjectRecord) -> None:
+        logger.info(
+            "Active project changed",
+            extra={"project_id": project.id, "project_name": project.name},
+        )
         self.active_project_changed.emit(project)
 
 

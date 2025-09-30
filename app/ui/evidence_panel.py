@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 import hashlib
 import html
@@ -22,6 +23,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -135,20 +139,20 @@ class _EvidenceRow(QFrame):
         self.copy_button = QToolButton(self)
         self.copy_button.setObjectName("copyEvidence")
         self.copy_button.setText("Copy")
-        self.copy_button.clicked.connect(self.copy_requested.emit)
+        self.copy_button.clicked.connect(self._emit_copy_requested)
         self._actions_row.addWidget(self.copy_button)
 
         self.open_button = QToolButton(self)
         self.open_button.setObjectName("openEvidence")
         self.open_button.setText("Open")
         self.open_button.setEnabled(bool(record.path))
-        self.open_button.clicked.connect(self.open_requested.emit)
+        self.open_button.clicked.connect(self._emit_open_requested)
         self._actions_row.addWidget(self.open_button)
 
         self.locate_button = QToolButton(self)
         self.locate_button.setObjectName("locateEvidence")
         self.locate_button.setText("Locate")
-        self.locate_button.clicked.connect(self.locate_requested.emit)
+        self.locate_button.clicked.connect(self._emit_locate_requested)
         self._actions_row.addWidget(self.locate_button)
 
         self._actions_row.addStretch(1)
@@ -211,6 +215,10 @@ class _EvidenceRow(QFrame):
         else:
             state = "neutral" if not self.exclude_button.isChecked() else "exclude"
         self.record = self.record.copy_with_state(state)
+        logger.info(
+            "Evidence row state changed",
+            extra={"identifier": self.record.identifier, "state": state},
+        )
         self.state_changed.emit(state)
 
     def _on_exclude_toggled(self, checked: bool) -> None:
@@ -221,7 +229,32 @@ class _EvidenceRow(QFrame):
         else:
             state = "include" if self.include_button.isChecked() else "neutral"
         self.record = self.record.copy_with_state(state)
+        logger.info(
+            "Evidence row state changed",
+            extra={"identifier": self.record.identifier, "state": state},
+        )
         self.state_changed.emit(state)
+
+    def _emit_copy_requested(self) -> None:
+        logger.info(
+            "Evidence copy requested",
+            extra={"identifier": self.record.identifier},
+        )
+        self.copy_requested.emit()
+
+    def _emit_open_requested(self) -> None:
+        logger.info(
+            "Evidence open requested",
+            extra={"identifier": self.record.identifier, "path": self.record.path},
+        )
+        self.open_requested.emit()
+
+    def _emit_locate_requested(self) -> None:
+        logger.info(
+            "Evidence locate requested",
+            extra={"identifier": self.record.identifier},
+        )
+        self.locate_requested.emit()
 
 
 class _SignalBlocker:
@@ -288,7 +321,7 @@ class EvidencePanel(QWidget):
         self._reask_button = QPushButton("Re-ask", self)
         self._reask_button.setObjectName("reaskEvidenceButton")
         self._reask_button.setEnabled(False)
-        self._reask_button.clicked.connect(self.reask_requested.emit)
+        self._reask_button.clicked.connect(self._emit_reask_requested)
         meta_row.addWidget(self._reask_button)
 
         self._reset_scope_button = QPushButton("Reset scope", self)
@@ -354,6 +387,14 @@ class EvidencePanel(QWidget):
         self._update_reask_button_state()
         if emit_scope:
             scope = self.current_scope
+            logger.info(
+                "Scope changed",
+                extra={
+                    "include_count": len(scope["include"]),
+                    "exclude_count": len(scope["exclude"]),
+                    "context": "set_evidence",
+                },
+            )
             self.scope_changed.emit(scope["include"], scope["exclude"])
 
     def select_index(self, index: int) -> None:
@@ -383,6 +424,14 @@ class EvidencePanel(QWidget):
         finally:
             self._suppress_scope = False
         scope = self.current_scope
+        logger.info(
+            "Scope changed",
+            extra={
+                "include_count": len(scope["include"]),
+                "exclude_count": len(scope["exclude"]),
+                "context": "reset_scope",
+            },
+        )
         self.scope_changed.emit(scope["include"], scope["exclude"])
         self._update_reset_button_state()
 
@@ -624,7 +673,12 @@ class EvidencePanel(QWidget):
             for part in [record.label, snippet, record.metadata_text]
             if part and part.strip()
         )
-        self.copy_requested.emit(payload.strip())
+        payload_text = payload.strip()
+        logger.info(
+            "Evidence copy payload emitted",
+            extra={"identifier": record.identifier, "characters": len(payload_text)},
+        )
+        self.copy_requested.emit(payload_text)
 
     def _handle_locate(self, record: EvidenceRecord, item: QListWidgetItem) -> None:
         row = self._list.row(item)
@@ -635,6 +689,10 @@ class EvidencePanel(QWidget):
             "path": record.path,
             "passage_id": record.passage_id,
         }
+        logger.info(
+            "Evidence locate payload emitted",
+            extra={"identifier": record.identifier},
+        )
         self.locate_requested.emit(payload)
 
     def _handle_open(self, record: EvidenceRecord, item: QListWidgetItem) -> None:
@@ -649,6 +707,10 @@ class EvidencePanel(QWidget):
             return
         self._update_preview(row)
         record = self._records[row]
+        logger.info(
+            "Evidence selected",
+            extra={"row": row, "identifier": record.identifier},
+        )
         self.evidence_selected.emit(row, record.identifier)
 
     def _update_preview(self, index: int) -> None:
@@ -691,6 +753,14 @@ class EvidencePanel(QWidget):
                 break
         if not self._suppress_scope:
             scope = self.current_scope
+            logger.info(
+                "Scope changed",
+                extra={
+                    "include_count": len(scope["include"]),
+                    "exclude_count": len(scope["exclude"]),
+                    "context": "state_changed",
+                },
+            )
             self.scope_changed.emit(scope["include"], scope["exclude"])
         self._update_reset_button_state()
 
@@ -698,6 +768,10 @@ class EvidencePanel(QWidget):
         if not any(record.state != "include" for record in self._records):
             return
         self.reset_scope()
+
+    def _emit_reask_requested(self) -> None:
+        logger.info("Re-ask requested from evidence panel")
+        self.reask_requested.emit()
 
     def _set_conflict_banner(self, records: list[EvidenceRecord]) -> None:
         if records:

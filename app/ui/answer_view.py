@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import logging
 from datetime import datetime
 from typing import Iterable
 
@@ -23,6 +24,9 @@ from PyQt6.QtWidgets import (
 from ..services.conversation_manager import ConversationTurn
 from ..services.conversation_settings import ConversationSettings
 from ..services.progress_service import ProgressService
+
+
+logger = logging.getLogger(__name__)
 
 
 def _format_timestamp(value: datetime | None) -> str:
@@ -363,6 +367,10 @@ class TurnCardWidget(QFrame):
             except (ValueError, IndexError):
                 return
             self.set_selected_citation(index)
+            logger.info(
+                "Citation activated",
+                extra={"card_question": self.turn.question, "citation_index": index},
+            )
             self.citation_activated.emit(index)
 
 
@@ -442,6 +450,10 @@ class AnswerView(QScrollArea):
             bar.setValue(bar.maximum())
 
     def _emit_citation(self, card: TurnCardWidget, index: int) -> None:
+        logger.info(
+            "Citation activated in answer view",
+            extra={"question": card.turn.question, "citation_index": index},
+        )
         self.citation_activated.emit(card, index)
 
     def set_density(self, density: str) -> None:

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .conversation_manager import ReasoningVerbosity, ResponseMode
 from .lmstudio_client import AnswerLength
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationSettings(QObject):
@@ -38,6 +43,10 @@ class ConversationSettings(QObject):
         if verbosity is self._reasoning_verbosity:
             return
         self._reasoning_verbosity = verbosity
+        logger.info(
+            "Reasoning verbosity changed",
+            extra={"verbosity": verbosity.name},
+        )
         self.reasoning_verbosity_changed.emit(verbosity)
 
     # ------------------------------------------------------------------
@@ -50,6 +59,7 @@ class ConversationSettings(QObject):
         if value == self._show_plan:
             return
         self._show_plan = value
+        logger.info("Show plan toggled", extra={"enabled": value})
         self.show_plan_changed.emit(value)
 
     # ------------------------------------------------------------------
@@ -62,6 +72,7 @@ class ConversationSettings(QObject):
         if value == self._show_assumptions:
             return
         self._show_assumptions = value
+        logger.info("Show assumptions toggled", extra={"enabled": value})
         self.show_assumptions_changed.emit(value)
 
     # ------------------------------------------------------------------
@@ -74,6 +85,7 @@ class ConversationSettings(QObject):
         if value == self._sources_only_mode:
             return
         self._sources_only_mode = value
+        logger.info("Sources only mode toggled", extra={"enabled": value})
         self.sources_only_mode_changed.emit(value)
 
     # ------------------------------------------------------------------
@@ -96,6 +108,10 @@ class ConversationSettings(QObject):
         if preset is self._answer_length:
             return
         self._answer_length = preset
+        logger.info(
+            "Answer length changed",
+            extra={"answer_length": preset.name},
+        )
         self.answer_length_changed.emit(preset)
 
     # ------------------------------------------------------------------
@@ -110,6 +126,7 @@ class ConversationSettings(QObject):
         if cleaned == self._model_name:
             return
         self._model_name = cleaned
+        logger.info("Model changed", extra={"model": cleaned})
         self.model_changed.emit(cleaned)
 
 

@@ -111,6 +111,21 @@ class DatabaseManager:
     def _migrate_to_v5(self, connection: sqlite3.Connection) -> None:
         """Add chunk metadata storage required for context aware chunking."""
 
+        connection.execute("DROP TABLE IF EXISTS ingest_document_index")
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE ingest_document_index
+            USING fts5(
+                content,
+                path UNINDEXED,
+                document_id UNINDEXED,
+                chunk_id UNINDEXED,
+                chunk_index UNINDEXED,
+                tokenize='porter'
+            )
+            """
+        )
+
         if not self._table_exists(connection, "ingest_document_chunks"):
             connection.execute(
                 """
@@ -199,43 +214,52 @@ class DatabaseManager:
                 ),
             )
 
+        self._rebuild_ingest_document_index(connection)
+        self._set_user_version(connection, 5)
+
+    @staticmethod
+    def _normalize_search_text(value: str | None) -> str:
+        if not value:
+            return ""
+        return re.sub(r"\s+", " ", value.strip())
+
+    def _rebuild_ingest_document_index(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
             """
             SELECT
                 chunks.id AS chunk_id,
+                chunks.document_id AS document_id,
                 chunks.chunk_index AS chunk_index,
                 chunks.text AS chunk_text,
-                chunks.document_id AS document_id,
-                docs.path AS document_path
+                chunks.metadata AS metadata,
+                docs.path AS path
             FROM ingest_document_chunks AS chunks
-            LEFT JOIN ingest_documents AS docs ON docs.id = chunks.document_id
+            INNER JOIN ingest_documents AS docs ON docs.id = chunks.document_id
             ORDER BY chunks.id ASC
             """
         ).fetchall()
 
-        connection.execute("DROP TABLE IF EXISTS ingest_document_index")
-        connection.execute(
-            """
-            CREATE VIRTUAL TABLE ingest_document_index
-            USING fts5(
-                content,
-                path UNINDEXED,
-                document_id UNINDEXED,
-                chunk_id UNINDEXED,
-                chunk_index UNINDEXED,
-                tokenize='porter'
-            )
-            """
-        )
-
         for row in rows:
             chunk_id = int(row["chunk_id"])
+            document_id = int(row["document_id"])
             chunk_index = int(row["chunk_index"])
-            document_id = int(row["document_id"]) if row["document_id"] is not None else None
-            path = row["document_path"] or ""
-            if document_id is None:
-                continue
-            search_text = _normalize(row["chunk_text"])
+            chunk_text = row["chunk_text"] or ""
+            metadata_raw = row["metadata"]
+            metadata: dict[str, Any]
+            try:
+                metadata = json.loads(metadata_raw) if metadata_raw else {}
+            except json.JSONDecodeError:
+                metadata = {}
+            section_path = metadata.get("section_path") if isinstance(metadata, dict) else []
+            if not isinstance(section_path, (list, tuple)):
+                section_path = []
+            section_terms = " ".join(
+                str(part) for part in section_path if isinstance(part, str)
+            )
+            search_basis = f"{section_terms} {chunk_text}".strip()
+            search_text = self._normalize_search_text(search_basis)
+            path = row["path"] or ""
+            normalized_path = str(Path(path).resolve()) if path else ""
             connection.execute(
                 """
                 INSERT INTO ingest_document_index (
@@ -243,10 +267,15 @@ class DatabaseManager:
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (chunk_id, search_text, path, document_id, chunk_id, chunk_index),
+                (
+                    chunk_id,
+                    search_text,
+                    normalized_path,
+                    document_id,
+                    chunk_id,
+                    chunk_index,
+                ),
             )
-
-        self._set_user_version(connection, 5)
 
     @staticmethod
     def _get_user_version(connection: sqlite3.Connection) -> int:

@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import threading
+from bisect import bisect_left
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -666,6 +667,7 @@ class IngestDocumentRepository(BaseRepository):
                 normalized_path,
                 parsed.text,
                 normalized_text,
+                metadata,
             )
         return self.get(document_id)  # type: ignore[return-value]
 
@@ -837,8 +839,14 @@ class IngestDocumentRepository(BaseRepository):
         path: str,
         text: str,
         normalized_text: str,
+        metadata: dict[str, Any] | None,
     ) -> None:
-        chunks = self._chunk_document(text, normalized_text=normalized_text)
+        chunks = self._chunk_document(
+            text,
+            normalized_text=normalized_text,
+            path=path,
+            metadata=metadata,
+        )
         connection.execute(
             "DELETE FROM ingest_document_chunks WHERE document_id = ?",
             (document_id,),
@@ -878,17 +886,38 @@ class IngestDocumentRepository(BaseRepository):
                 ),
             )
 
+    _CODE_SUFFIXES = {".py", ".pyw", ".m", ".cpp"}
+    _HTML_SUFFIXES = {".html", ".htm"}
+    _SENTENCE_BOUNDARY_CHARS = ".!?:;"
+    _CLOSING_PUNCTUATION = "\"')]}»”"
+    _BOUNDARY_LOOKBACK = 1200
+    _BOUNDARY_LOOKAHEAD = 1200
+
     def _chunk_document(
-        self, text: str, *, normalized_text: str, max_tokens: int = 200, overlap: int = 40
+        self,
+        text: str,
+        *,
+        normalized_text: str,
+        path: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        max_tokens: int = 200,
+        overlap: int = 40,
     ) -> list[dict[str, Any]]:
-        max_tokens = max(1, int(max_tokens))
-        overlap = max(0, min(int(overlap), max_tokens - 1))
+        (
+            strategy,
+            resolved_max_tokens,
+            resolved_overlap,
+        ) = self._resolve_chunking_settings(
+            path=path,
+            metadata=metadata,
+            default_max_tokens=max_tokens,
+            default_overlap=overlap,
+        )
         matches = list(re.finditer(r"\S+", text))
-        chunks: list[dict[str, Any]] = []
         if not matches:
             trimmed = text.strip()
             chunk_text = trimmed if trimmed else normalized_text
-            chunks.append(
+            return [
                 {
                     "index": 0,
                     "text": chunk_text,
@@ -897,42 +926,65 @@ class IngestDocumentRepository(BaseRepository):
                     "end_offset": len(chunk_text),
                     "search_text": self._normalize_text(chunk_text),
                 }
-            )
-            return chunks
+            ]
 
-        step = max_tokens - overlap if max_tokens > overlap else max_tokens
-        start_token = 0
+        token_positions = [match.start() for match in matches]
+        chunks: list[dict[str, Any]] = []
+        start_index = 0
         chunk_index = 0
         text_length = len(text)
+        step = max(1, resolved_max_tokens - resolved_overlap)
 
-        while start_token < len(matches):
-            end_token = min(start_token + max_tokens, len(matches))
-            start_offset = matches[start_token].start()
-            end_offset = matches[end_token - 1].end() if end_token > start_token else start_offset
-            if end_token >= len(matches):
+        while start_index < len(matches):
+            end_index = min(start_index + resolved_max_tokens, len(matches))
+            start_offset = matches[start_index].start()
+            end_offset = (
+                matches[end_index - 1].end() if end_index > start_index else start_offset
+            )
+            if end_index >= len(matches):
                 end_offset = text_length
+            else:
+                adjusted_start = self._adjust_chunk_start(text, start_offset, strategy)
+                adjusted_end = self._adjust_chunk_end(text, end_offset, strategy)
+                if adjusted_start <= start_offset:
+                    start_offset = max(0, adjusted_start)
+                if adjusted_end >= end_offset:
+                    end_offset = min(text_length, adjusted_end)
+
+            end_offset = min(text_length, max(end_offset, start_offset + 1))
+            start_offset = max(0, min(start_offset, end_offset - 1))
             chunk_text = text[start_offset:end_offset].strip()
             if not chunk_text:
-                if chunks:
-                    start_token += step
-                    chunk_index += 1
+                start_index = end_index if end_index > start_index else start_index + 1
+                continue
+            actual_start_index = bisect_left(token_positions, start_offset)
+            actual_end_index = bisect_left(token_positions, end_offset)
+            if actual_end_index <= actual_start_index:
+                actual_end_index = min(len(matches), actual_start_index + 1)
+                end_offset = matches[actual_end_index - 1].end()
+                chunk_text = text[start_offset:end_offset].strip()
+                if not chunk_text:
+                    start_index = end_index if end_index > start_index else start_index + 1
                     continue
-                chunk_text = normalized_text
+            token_count = max(1, actual_end_index - actual_start_index)
             search_text = self._normalize_text(chunk_text)
             chunks.append(
                 {
                     "index": chunk_index,
                     "text": chunk_text,
-                    "token_count": end_token - start_token,
+                    "token_count": token_count,
                     "start_offset": start_offset,
                     "end_offset": end_offset,
                     "search_text": search_text,
                 }
             )
-            if end_token >= len(matches):
-                break
-            start_token += step
             chunk_index += 1
+            if end_index >= len(matches):
+                break
+            next_index = max(actual_start_index, actual_end_index - resolved_overlap)
+            if next_index <= start_index:
+                next_index = start_index + step
+            start_index = min(next_index, len(matches))
 
         if not chunks:
             chunk_text = normalized_text
@@ -947,6 +999,166 @@ class IngestDocumentRepository(BaseRepository):
                 }
             )
         return chunks
+
+    def _resolve_chunking_settings(
+        self,
+        *,
+        path: str | None,
+        metadata: dict[str, Any] | None,
+        default_max_tokens: int,
+        default_overlap: int,
+    ) -> tuple[str, int, int]:
+        strategy = "text"
+        max_tokens = max(1, int(default_max_tokens))
+        overlap = max(0, min(int(default_overlap), max_tokens - 1))
+        suffix = Path(path).suffix.lower() if path else ""
+        if suffix in self._CODE_SUFFIXES:
+            strategy = "code"
+            max_tokens = 160
+            overlap = min(48, max_tokens - 1)
+        elif suffix in self._HTML_SUFFIXES:
+            strategy = "html"
+            max_tokens = 220
+            overlap = min(60, max_tokens - 1)
+
+        chunking_meta = None
+        if isinstance(metadata, dict):
+            chunking_meta = metadata.get("chunking")
+        if isinstance(chunking_meta, dict):
+            max_tokens = max(1, int(chunking_meta.get("max_tokens", max_tokens)))
+            overlap = max(
+                0,
+                min(int(chunking_meta.get("overlap", overlap)), max_tokens - 1),
+            )
+            override_strategy = chunking_meta.get("strategy")
+            if (
+                isinstance(override_strategy, str)
+                and override_strategy.lower() in {"text", "code", "html"}
+            ):
+                strategy = override_strategy.lower()
+
+        return strategy, max_tokens, overlap
+
+    def _adjust_chunk_start(self, text: str, offset: int, strategy: str) -> int:
+        offset = max(0, min(offset, len(text)))
+        if strategy == "code":
+            candidate = self._rewind_to_line_start(text, offset)
+            return min(offset, candidate)
+        if strategy == "html":
+            tag_start = self._rewind_to_tag_start(text, offset)
+            if tag_start is not None:
+                return min(offset, tag_start)
+            candidate = self._rewind_to_line_start(text, offset)
+            return min(offset, candidate)
+        candidate = self._rewind_to_sentence_start(text, offset)
+        return min(offset, candidate)
+
+    def _adjust_chunk_end(self, text: str, offset: int, strategy: str) -> int:
+        offset = max(0, min(offset, len(text)))
+        if strategy == "code":
+            candidate = self._advance_to_code_boundary(text, offset)
+            return max(offset, candidate)
+        if strategy == "html":
+            tag_end = self._advance_to_tag_end(text, offset)
+            if tag_end is not None:
+                return max(offset, tag_end)
+            candidate = self._advance_to_sentence_end(text, offset)
+            return max(offset, candidate)
+        candidate = self._advance_to_sentence_end(text, offset)
+        return max(offset, candidate)
+
+    @staticmethod
+    def _rewind_to_line_start(text: str, offset: int) -> int:
+        newline = text.rfind("\n", 0, offset)
+        return newline + 1 if newline != -1 else 0
+
+    def _rewind_to_tag_start(self, text: str, offset: int) -> int | None:
+        lt = text.rfind("<", 0, offset)
+        gt = text.rfind(">", 0, offset)
+        if lt != -1 and (gt < lt):
+            return lt
+        return None
+
+    def _rewind_to_sentence_start(self, text: str, offset: int) -> int:
+        if offset <= 0:
+            return 0
+        pos = offset - 1
+        limit = max(0, offset - self._BOUNDARY_LOOKBACK)
+        while pos > limit and text[pos] in " \t":
+            pos -= 1
+        while (
+            pos > limit
+            and text[pos] not in self._SENTENCE_BOUNDARY_CHARS
+            and text[pos] != "\n"
+        ):
+            pos -= 1
+        if pos <= limit:
+            newline = text.rfind("\n", limit, offset)
+            if newline != -1:
+                return newline + 1
+            return limit
+        if text[pos] == "\n":
+            newline = text.rfind("\n", 0, pos)
+            return newline + 1 if newline != -1 else 0
+        pos += 1
+        while pos < len(text) and text[pos] in self._CLOSING_PUNCTUATION:
+            pos += 1
+        while pos < len(text) and text[pos] in " \t":
+            pos += 1
+        if pos < len(text) and text[pos] in "\r\n":
+            while pos < len(text) and text[pos] in "\r\n":
+                pos += 1
+        return pos
+
+    def _advance_to_sentence_end(self, text: str, offset: int) -> int:
+        length = len(text)
+        if offset >= length:
+            return length
+        pos = offset
+        limit = min(length, offset + self._BOUNDARY_LOOKAHEAD)
+        while pos < limit and text[pos] in " \t":
+            pos += 1
+        while (
+            pos < limit
+            and text[pos] not in self._SENTENCE_BOUNDARY_CHARS
+            and text[pos] != "\n"
+        ):
+            pos += 1
+        if pos >= limit or pos >= length:
+            return min(length, limit)
+        if text[pos] == "\n":
+            return pos
+        pos += 1
+        while pos < length and text[pos] in self._CLOSING_PUNCTUATION:
+            pos += 1
+        while pos < length and text[pos] == " ":
+            pos += 1
+        if pos < length and text[pos] == "\n":
+            while pos < length and text[pos] in "\r\n":
+                pos += 1
+        return pos
+
+    def _advance_to_code_boundary(self, text: str, offset: int) -> int:
+        length = len(text)
+        if offset >= length:
+            return length
+        limit = min(length, offset + self._BOUNDARY_LOOKAHEAD)
+        newline_newline = text.find("\n\n", offset, limit)
+        if newline_newline != -1:
+            return newline_newline
+        newline = text.find("\n", offset, limit)
+        if newline != -1:
+            return newline
+        return limit
+
+    def _advance_to_tag_end(self, text: str, offset: int) -> int | None:
+        length = len(text)
+        if offset >= length:
+            return length
+        gt = text.find(">", offset)
+        if gt != -1:
+            return gt + 1
+        return None
 
     @staticmethod
     def _build_preview(text: str, *, limit: int = 320) -> str:

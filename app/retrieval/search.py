@@ -216,8 +216,13 @@ class SearchService:
             source_path = document.get("source_path")
             if not source_path:
                 continue
-            normalized = self._normalize_path(source_path)
-            index[normalized] = document
+            lookup_key = self._normalize_path(source_path)
+            if not lookup_key:
+                continue
+            index[lookup_key] = document
+            raw_key = str(source_path)
+            if raw_key not in index:
+                index[raw_key] = document
         return index
 
     @staticmethod
@@ -237,9 +242,40 @@ class SearchService:
 
     @staticmethod
     def _normalize_path(path: str | Path) -> str:
-        """Return a canonical absolute string representation for ``path``."""
+        """Return a canonical lookup key for ``path``."""
 
-        return str(Path(path).expanduser().resolve())
+        return SearchService._canonical_path_key(path)
+
+    @staticmethod
+    def _canonical_path_key(path: str | Path) -> str:
+        """Normalise paths for reliable cross-platform comparisons."""
+
+        text = str(path).strip()
+        if not text:
+            return ""
+
+        collapsed = text.replace("\\", "/")
+        drive_match = re.search(r"(?i)([a-z]):/", collapsed)
+        if drive_match:
+            collapsed = collapsed[drive_match.start(1) :]
+        else:
+            unc_index = collapsed.find("//")
+            if unc_index > 0:
+                collapsed = collapsed[unc_index:]
+
+        if collapsed.startswith("//"):
+            prefix = "//"
+            remainder = collapsed[2:]
+        elif collapsed.startswith("/"):
+            prefix = "/"
+            remainder = collapsed[1:]
+        else:
+            prefix = ""
+            remainder = collapsed
+
+        remainder = re.sub(r"/+", "/", remainder)
+        normalized = prefix + remainder
+        return normalized.lower()
 
     @staticmethod
     def _normalize_folder(folder: str | Path | None) -> str | None:

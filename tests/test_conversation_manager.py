@@ -19,6 +19,42 @@ from app.services.conversation_manager import (
 )
 
 
+def test_ensure_answer_citation_markers_aligns_citations_with_sentences():
+    answer = "Alpha result shows improvement. Beta data remains flat."
+    citations = [
+        {"id": "doc-1", "snippet": "<mark>result shows improvement</mark> over baseline"},
+        {"id": "doc-2", "snippet": "<mark>data remains flat</mark> in the latest report"},
+    ]
+
+    cited = ConversationManager._ensure_answer_citation_markers(answer, citations)
+
+    assert cited == "Alpha result shows improvement.[1] Beta data remains flat.[2]"
+
+
+def test_ensure_answer_citation_markers_keeps_existing_references():
+    answer = "Alpha result.[1] Beta data.[2]"
+    citations = [
+        {"id": "doc-1", "snippet": "<mark>Alpha result</mark> details"},
+        {"id": "doc-2", "snippet": "<mark>Beta data</mark> summary"},
+    ]
+
+    cited = ConversationManager._ensure_answer_citation_markers(answer, citations)
+
+    assert cited == answer
+
+
+def test_ensure_answer_citation_markers_handles_bullet_lists():
+    answer = "- First finding\n- Second finding"
+    citations = [
+        {"id": "doc-1", "snippet": "<mark>First finding</mark> supported"},
+        {"id": "doc-2", "snippet": "<mark>Second finding</mark> supported"},
+    ]
+
+    cited = ConversationManager._ensure_answer_citation_markers(answer, citations)
+
+    assert cited == "- First finding [1]\n- Second finding [2]"
+
+
 def test_compose_final_answer_deduplicates_and_merges_citations():
     step_results = [
         StepResult(

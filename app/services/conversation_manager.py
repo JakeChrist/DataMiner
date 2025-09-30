@@ -2277,18 +2277,175 @@ class ConversationManager:
         if ConversationManager._CITATION_PATTERN.search(answer):
             return answer
 
-        markers = " ".join(f"[{index}]" for index in range(1, len(citations) + 1))
-        if not markers:
+        fragments: list[dict[str, Any]] = []
+        for match in ConversationManager._SENTENCE_FRAGMENT_PATTERN.finditer(answer):
+            raw = match.group(0)
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            leading_len = len(raw) - len(raw.lstrip())
+            trailing_len = len(raw) - len(raw.rstrip())
+            leading = raw[:leading_len]
+            trailing = raw[len(raw) - trailing_len :] if trailing_len else ""
+            core = (
+                raw[leading_len:-trailing_len]
+                if trailing_len
+                else raw[leading_len:]
+            )
+            fragments.append(
+                {
+                    "start": match.start(),
+                    "end": match.end(),
+                    "leading": leading,
+                    "core": core,
+                    "trailing": trailing,
+                    "text": stripped,
+                }
+            )
+
+        if not fragments:
             return answer
 
-        trimmed = answer.rstrip()
-        if trimmed and trimmed[-1] not in ".!?":
-            trimmed = f"{trimmed}."
+        token_pattern = re.compile(r"[A-Za-z0-9']+")
 
-        if not trimmed:
-            return markers
+        def tokenize(text: str) -> set[str]:
+            return {
+                token
+                for token in token_pattern.findall(text.lower())
+                if len(token) > 2
+            }
 
-        return f"{trimmed} {markers}".strip()
+        def citation_text(citation: Any) -> str:
+            if isinstance(citation, dict):
+                snippet = citation.get("snippet") or citation.get("text")
+                if isinstance(snippet, str) and snippet.strip():
+                    snippet_plain = html.unescape(snippet)
+                    snippet_plain = re.sub(r"<[^>]+>", " ", snippet_plain)
+                    snippet_plain = " ".join(snippet_plain.split())
+                    if snippet_plain:
+                        return snippet_plain
+                label = citation.get("label") or citation.get("source")
+                if isinstance(label, str) and label.strip():
+                    return label.strip()
+                path = citation.get("path")
+                if isinstance(path, str) and path.strip():
+                    return path.strip()
+            return str(citation)
+
+        fragment_tokens: list[set[str]] = []
+        fragment_lower: list[str] = []
+        for fragment in fragments:
+            fragment_lower.append(fragment["text"].lower())
+            fragment_tokens.append(tokenize(fragment["text"]))
+
+        citation_infos: list[dict[str, Any]] = []
+        for index, citation in enumerate(citations, start=1):
+            text = citation_text(citation).strip()
+            citation_infos.append(
+                {
+                    "index": index,
+                    "text": text,
+                    "lower": text.lower(),
+                    "tokens": tokenize(text),
+                }
+            )
+
+        if not citation_infos:
+            return answer
+
+        scores: list[list[float]] = []
+        for fragment_index, fragment in enumerate(fragments):
+            fragment_scores: list[float] = []
+            fragment_token_set = fragment_tokens[fragment_index]
+            fragment_lower_text = fragment_lower[fragment_index]
+            for info in citation_infos:
+                tokens = info["tokens"]
+                overlap = len(fragment_token_set & tokens)
+                ratio = overlap / max(len(tokens), 1)
+                snippet_match = 0.0
+                snippet = info["lower"]
+                if snippet and snippet in fragment_lower_text:
+                    snippet_match = max(len(tokens), 1) * 2.0
+                elif tokens:
+                    partial_matches = sum(
+                        1 for token in tokens if token in fragment_lower_text
+                    )
+                    snippet_match = partial_matches * 0.5
+                fragment_scores.append(overlap + ratio + snippet_match)
+            scores.append(fragment_scores)
+
+        assignments: list[list[int]] = [[] for _ in fragments]
+        citation_used = [False] * len(citation_infos)
+
+        for citation_index, info in enumerate(citation_infos):
+            best_fragment = max(
+                range(len(fragments)),
+                key=lambda idx: scores[idx][citation_index],
+                default=None,
+            )
+            if best_fragment is None:
+                continue
+            best_score = scores[best_fragment][citation_index]
+            if best_score > 0:
+                assignments[best_fragment].append(info["index"])
+                citation_used[citation_index] = True
+
+        for fragment_index in range(len(fragments)):
+            if assignments[fragment_index]:
+                continue
+            best_citation = max(
+                range(len(citation_infos)),
+                key=lambda idx: scores[fragment_index][idx],
+                default=None,
+            )
+            if best_citation is None:
+                continue
+            assignments[fragment_index].append(
+                citation_infos[best_citation]["index"]
+            )
+            citation_used[best_citation] = True
+
+        for citation_index, used in enumerate(citation_used):
+            if used:
+                continue
+            best_fragment = max(
+                range(len(fragments)),
+                key=lambda idx: scores[idx][citation_index],
+                default=None,
+            )
+            if best_fragment is None:
+                continue
+            citation_number = citation_infos[citation_index]["index"]
+            if citation_number not in assignments[best_fragment]:
+                assignments[best_fragment].append(citation_number)
+
+        rebuilt: list[str] = []
+        last_end = 0
+        for fragment_index, fragment in enumerate(fragments):
+            start = fragment["start"]
+            end = fragment["end"]
+            rebuilt.append(answer[last_end:start])
+            markers = "".join(
+                f"[{number}]" for number in sorted(dict.fromkeys(assignments[fragment_index]))
+            )
+            core = fragment["core"]
+            if markers:
+                base_end = len(core)
+                while base_end > 0 and core[base_end - 1] in "\"'”’)]":
+                    base_end -= 1
+                base = core[:base_end]
+                tail = core[base_end:]
+                if base and base[-1].isalnum():
+                    core_with_markers = f"{base} {markers}{tail}"
+                else:
+                    core_with_markers = f"{base}{markers}{tail}"
+            else:
+                core_with_markers = core
+            rebuilt.append(fragment["leading"] + core_with_markers + fragment["trailing"])
+            last_end = end
+        rebuilt.append(answer[last_end:])
+
+        return "".join(rebuilt)
 
     @staticmethod
     def _build_request_options(
@@ -2418,6 +2575,7 @@ class ConversationManager:
         return sorted(indexes)
 
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
+    _SENTENCE_FRAGMENT_PATTERN = re.compile(r"[^.!?\n]+[.!?]?")
     _STEP_PREFIX_PATTERN = re.compile(
         r"""
         ^\s*

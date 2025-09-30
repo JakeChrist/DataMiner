@@ -12,8 +12,6 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
-from app.storage.json_utils import make_json_safe
-
 if TYPE_CHECKING:
     from app.ingest.parsers import ParsedDocument
 
@@ -547,9 +545,6 @@ class IngestDocumentRepository(BaseRepository):
         normalized_path = str(Path(path).resolve())
         metadata = dict(base_metadata or {})
         metadata.update(parsed.metadata)
-        metadata = make_json_safe(metadata)
-        if not isinstance(metadata, dict):
-            metadata = {"metadata": metadata}
         metadata_json = json.dumps(metadata, ensure_ascii=False)
         sections_json = json.dumps(
             [section.to_dict() for section in parsed.sections], ensure_ascii=False

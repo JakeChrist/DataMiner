@@ -13,13 +13,71 @@ import re
 import textwrap
 from dataclasses import dataclass, field
 from datetime import datetime
+from difflib import SequenceMatcher
 from enum import Enum
+from html.parser import HTMLParser
 from typing import Any, Literal
 
 from ..logging import log_call
 
 
 logger = logging.getLogger(__name__)
+
+
+class _SnippetMarkParser(HTMLParser):
+    """Parse HTML snippets and remember original highlight spans."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._ranges: list[tuple[int, int]] = []
+        self._position = 0
+        self._mark_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:  # noqa: D401
+        if tag.lower() == "mark":
+            self._mark_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:  # noqa: D401
+        if tag.lower() == "mark" and self._mark_depth:
+            self._mark_depth -= 1
+
+    def handle_data(self, data: str) -> None:  # noqa: D401
+        self._append_text(data)
+
+    def handle_entityref(self, name: str) -> None:  # noqa: D401
+        self._append_text(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name: str) -> None:  # noqa: D401
+        self._append_text(html.unescape(f"&#{name};"))
+
+    def _append_text(self, data: str) -> None:
+        if not data:
+            return
+        self._parts.append(data)
+        length = len(data)
+        if self._mark_depth > 0:
+            self._ranges.append((self._position, self._position + length))
+        self._position += length
+
+    @property
+    def text(self) -> str:
+        return "".join(self._parts)
+
+    @property
+    def mark_ranges(self) -> list[tuple[int, int]]:
+        merged: list[tuple[int, int]] = []
+        for start, end in sorted(self._ranges):
+            if not merged:
+                merged.append((start, end))
+                continue
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        return merged
+
 
 from .lmstudio_client import (
     AnswerLength,
@@ -2539,7 +2597,13 @@ class ConversationManager:
                         1 for token in tokens if token in fragment_lower_text
                     )
                     snippet_match = partial_matches * 0.5
-                fragment_scores.append(overlap + ratio + snippet_match)
+                semantic_similarity = 0.0
+                if snippet:
+                    semantic_similarity = (
+                        SequenceMatcher(None, fragment_lower_text, snippet).ratio()
+                        * max(len(tokens), 1)
+                    )
+                fragment_scores.append(overlap + ratio + snippet_match + semantic_similarity)
             scores.append(fragment_scores)
 
         assignments: list[list[int]] = [[] for _ in fragments]
@@ -3194,13 +3258,9 @@ class ConversationManager:
         snippet_text = str(snippet_raw).strip()
         if not snippet_text:
             return None
-        snippet_text = ConversationManager._trim_snippet(snippet_text)
-        if "<" in snippet_text:
-            snippet = snippet_text
-        else:
-            snippet = html.escape(snippet_text)
-        if "<mark" not in snippet:
-            snippet = f"<mark>{snippet}</mark>"
+        snippet = ConversationManager._build_snippet_html(snippet_text)
+        if not snippet:
+            return None
 
         citation: dict[str, Any] = {
             "id": document.get("id") or document.get("document_id") or source,
@@ -3250,6 +3310,144 @@ class ConversationManager:
         citation.setdefault("tag_names", []).append("Context")
 
         return citation
+
+    @staticmethod
+    def _build_snippet_html(snippet: str, *, max_chars: int = 320) -> str:
+        parser = _SnippetMarkParser()
+        parser.feed(snippet)
+        parser.close()
+        plain_text = parser.text
+        if not plain_text.strip():
+            return ""
+
+        sentences = ConversationManager._sentence_spans_for_snippet(plain_text)
+        if not sentences:
+            normalized = " ".join(plain_text.split())
+            if not normalized:
+                return ""
+            escaped = html.escape(normalized)
+            if parser.mark_ranges:
+                return f"<mark>{escaped}</mark>"
+            return escaped
+
+        highlight_indices: set[int] = set()
+        for index, (start, end, _text) in enumerate(sentences):
+            for mark_start, mark_end in parser.mark_ranges:
+                if mark_start < end and mark_end > start:
+                    highlight_indices.add(index)
+                    break
+        if parser.mark_ranges and not highlight_indices:
+            highlight_indices = {idx for idx in range(len(sentences))}
+
+        selected: set[int] = set(highlight_indices)
+        if not selected:
+            selected.add(0)
+
+        def snippet_length(indices: set[int]) -> int:
+            if not indices:
+                return 0
+            parts: list[str] = []
+            previous_index: int | None = None
+            for idx in sorted(indices):
+                if previous_index is not None and idx - previous_index > 1:
+                    parts.append("…")
+                parts.append(sentences[idx][2])
+                previous_index = idx
+            return len(" ".join(parts))
+
+        left_index = min(selected) - 1
+        right_index = max(selected) + 1
+        while True:
+            expanded = False
+            if left_index >= 0:
+                candidate = set(selected)
+                candidate.add(left_index)
+                if snippet_length(candidate) <= max_chars:
+                    selected = candidate
+                    left_index -= 1
+                    expanded = True
+                else:
+                    left_index = -1
+            if right_index < len(sentences):
+                candidate = set(selected)
+                candidate.add(right_index)
+                if snippet_length(candidate) <= max_chars:
+                    selected = candidate
+                    right_index += 1
+                    expanded = True
+                else:
+                    right_index = len(sentences)
+            if not expanded:
+                break
+
+        parts: list[str] = []
+        previous_index: int | None = None
+        mark_sentences = bool(parser.mark_ranges)
+        for idx in sorted(selected):
+            if previous_index is not None and idx - previous_index > 1:
+                parts.append("…")
+            text = sentences[idx][2]
+            escaped = html.escape(text)
+            if mark_sentences and idx in highlight_indices:
+                parts.append(f"<mark>{escaped}</mark>")
+            else:
+                parts.append(escaped)
+            previous_index = idx
+
+        return " ".join(parts).strip()
+
+    @staticmethod
+    def _sentence_spans_for_snippet(text: str) -> list[tuple[int, int, str]]:
+        spans: list[tuple[int, int, str]] = []
+        length = len(text)
+        start = 0
+        position = 0
+        while position < length:
+            character = text[position]
+            if character in ".!?":
+                end = position + 1
+                while end < length and text[end] in " \t":
+                    end += 1
+                trimmed_start = start
+                while trimmed_start < end and text[trimmed_start].isspace():
+                    trimmed_start += 1
+                trimmed_end = end
+                while trimmed_end > trimmed_start and text[trimmed_end - 1].isspace():
+                    trimmed_end -= 1
+                segment = text[trimmed_start:trimmed_end]
+                normalized = " ".join(segment.split())
+                if normalized:
+                    spans.append((trimmed_start, trimmed_end, normalized))
+                start = end
+                position = end
+                continue
+            if character == "\n":
+                trimmed_start = start
+                trimmed_end = position
+                while trimmed_start < trimmed_end and text[trimmed_start].isspace():
+                    trimmed_start += 1
+                while trimmed_end > trimmed_start and text[trimmed_end - 1].isspace():
+                    trimmed_end -= 1
+                segment = text[trimmed_start:trimmed_end]
+                normalized = " ".join(segment.split())
+                if normalized:
+                    spans.append((trimmed_start, trimmed_end, normalized))
+                start = position + 1
+            position += 1
+
+        if start < length:
+            trimmed_start = start
+            trimmed_end = length
+            while trimmed_start < trimmed_end and text[trimmed_start].isspace():
+                trimmed_start += 1
+            while trimmed_end > trimmed_start and text[trimmed_end - 1].isspace():
+                trimmed_end -= 1
+            segment = text[trimmed_start:trimmed_end]
+            normalized = " ".join(segment.split())
+            if normalized:
+                spans.append((trimmed_start, trimmed_end, normalized))
+
+        return spans
 
     @staticmethod
     def _trim_snippet(snippet: str, *, max_chars: int = 320) -> str:

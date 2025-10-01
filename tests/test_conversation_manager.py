@@ -77,6 +77,36 @@ def test_ensure_answer_citation_markers_handles_bullet_lists():
     assert cited == "- First finding [1]\n- Second finding [2]"
 
 
+def test_context_document_to_citation_expands_snippet_to_sentence() -> None:
+    document = {
+        "id": "doc-1",
+        "source": "Report",
+        "snippet": "The platform uses <mark>semantic retrieval</mark> for evidence alignment. Additional context follows.",
+    }
+
+    citation = ConversationManager._context_document_to_citation(document)
+
+    assert citation is not None
+    assert citation["snippet"] == (
+        "<mark>The platform uses semantic retrieval for evidence alignment.</mark> Additional context follows."
+    )
+
+
+def test_build_snippet_html_highlights_multiple_sentences() -> None:
+    snippet = (
+        "First detail introduces the topic."
+        " Supporting facts mention <mark>keyword evidence</mark> across sources."
+        " Closing remarks add next steps."
+    )
+
+    result = ConversationManager._build_snippet_html(snippet, max_chars=160)
+
+    assert (
+        result
+        == "First detail introduces the topic. <mark>Supporting facts mention keyword evidence across sources.</mark> Closing remarks add next steps."
+    )
+
+
 def test_compose_final_answer_deduplicates_and_merges_citations():
     step_results = [
         StepResult(

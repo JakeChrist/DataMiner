@@ -77,6 +77,16 @@ def test_ensure_answer_citation_markers_handles_bullet_lists():
     assert cited == "- First finding [1]\n- Second finding [2]"
 
 
+def test_strip_citation_markers_removes_doc_and_requirement_references() -> None:
+    text = "Handles example (DOC23 chunk 1, DOC21 R-021)."
+
+    cleaned = ConversationManager._strip_citation_markers(text)
+
+    assert cleaned == "Handles example ."
+    assert "DOC" not in cleaned
+    assert "R-021" not in cleaned
+
+
 def test_context_document_to_citation_expands_snippet_to_sentence() -> None:
     document = {
         "id": "doc-1",

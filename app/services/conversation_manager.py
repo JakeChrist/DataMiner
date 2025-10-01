@@ -2836,7 +2836,7 @@ class ConversationManager:
                 return ""
             lowered = content.lower()
             lowered = re.sub(
-                r"(?:doc\s*-?\d+|doc\d+|chunk\s*\d+|section\s*\d+|snippet\s*\d+|source\s*\d+)",
+                r"(?:doc\s*-?\d+|doc\d+|chunk\s*\d+|section\s*\d+|snippet\s*\d+|source\s*\d+|r(?:eq)?\s*-?(?:\d+[\da-z]*))",
                 "",
                 lowered,
             )

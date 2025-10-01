@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import datetime as _dt
 import json
@@ -11,11 +12,12 @@ import shutil
 import sqlite3
 import threading
 from bisect import bisect_left
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 if TYPE_CHECKING:
-    from app.ingest.parsers import ParsedDocument
+    from app.ingest.parsers import DocumentSection, ParsedDocument
 
 SCHEMA_VERSION = 4
 SCHEMA_FILENAME = "schema.sql"
@@ -688,6 +690,7 @@ class IngestDocumentRepository(BaseRepository):
                 parsed.text,
                 normalized_text,
                 metadata,
+                parsed.sections,
             )
         logger.info(
             "Stored ingest document version",
@@ -892,12 +895,14 @@ class IngestDocumentRepository(BaseRepository):
         text: str,
         normalized_text: str,
         metadata: dict[str, Any] | None,
+        sections: Sequence["DocumentSection"] | Sequence[dict[str, Any]] | None = None,
     ) -> int:
         chunks = self._chunk_document(
             text,
             normalized_text=normalized_text,
             path=path,
             metadata=metadata,
+            sections=sections,
         )
         logger.info(
             "Persisting document chunks",
@@ -953,6 +958,9 @@ class IngestDocumentRepository(BaseRepository):
     _CLOSING_PUNCTUATION = "\"')]}»”"
     _BOUNDARY_LOOKBACK = 1200
     _BOUNDARY_LOOKAHEAD = 1200
+    _TEXT_TARGET_TOKENS = 450
+    _TEXT_MIN_TOKENS = 180
+    _TEXT_MAX_TOKENS = 620
 
     def _chunk_document(
         self,
@@ -961,8 +969,9 @@ class IngestDocumentRepository(BaseRepository):
         normalized_text: str,
         path: str | None = None,
         metadata: dict[str, Any] | None = None,
-        max_tokens: int = 200,
-        overlap: int = 40,
+        max_tokens: int = 450,
+        overlap: int = 60,
+        sections: Sequence["DocumentSection"] | Sequence[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         (
             strategy,
@@ -974,41 +983,493 @@ class IngestDocumentRepository(BaseRepository):
             default_max_tokens=max_tokens,
             default_overlap=overlap,
         )
+
+        if strategy == "code":
+            chunks = self._chunk_code_document(
+                text,
+                normalized_text=normalized_text,
+                max_tokens=resolved_max_tokens,
+                path=path,
+            )
+        elif strategy == "html":
+            chunks = self._chunk_markup_document(
+                text,
+                normalized_text=normalized_text,
+                max_tokens=resolved_max_tokens,
+                overlap=resolved_overlap,
+                strategy=strategy,
+            )
+        else:
+            resolved_sections = self._resolve_section_spans(text, sections)
+            chunks = self._chunk_text_document(
+                text,
+                normalized_text=normalized_text,
+                target_tokens=resolved_max_tokens,
+                sections=resolved_sections,
+            )
+
+        if not chunks:
+            fallback_text = normalized_text or text.strip()
+            if not fallback_text:
+                fallback_text = text
+            chunks = [
+                {
+                    "index": 0,
+                    "text": fallback_text,
+                    "token_count": max(1, self._count_tokens(fallback_text)),
+                    "start_offset": 0,
+                    "end_offset": len(fallback_text),
+                    "search_text": self._normalize_text(fallback_text),
+                }
+            ]
+
+        logger.info(
+            "Chunked document",
+            extra={
+                "path": path,
+                "chunk_count": len(chunks),
+                "strategy": strategy,
+                "max_tokens": resolved_max_tokens,
+                "overlap": resolved_overlap,
+            },
+        )
+        return chunks
+
+    def _chunk_text_document(
+        self,
+        text: str,
+        *,
+        normalized_text: str,
+        target_tokens: int,
+        sections: list[tuple[int, int]],
+    ) -> list[dict[str, Any]]:
+        target, min_tokens, max_tokens = self._resolve_text_chunk_bounds(target_tokens)
+        chunks: list[dict[str, Any]] = []
+        chunk_index = 0
+        for section_start, section_end in sections:
+            if section_start >= section_end:
+                continue
+            for start_offset, end_offset in self._chunk_text_section(
+                text,
+                section_start,
+                section_end,
+                target,
+                min_tokens,
+                max_tokens,
+            ):
+                snippet = text[start_offset:end_offset]
+                if not snippet.strip():
+                    continue
+                chunks.append(
+                    {
+                        "index": chunk_index,
+                        "text": snippet,
+                        "token_count": max(1, self._count_tokens(snippet)),
+                        "start_offset": start_offset,
+                        "end_offset": end_offset,
+                        "search_text": self._normalize_text(snippet),
+                    }
+                )
+                chunk_index += 1
+        if not chunks and text.strip():
+            snippet = normalized_text or text.strip()
+            chunks.append(
+                {
+                    "index": 0,
+                    "text": snippet,
+                    "token_count": max(1, self._count_tokens(snippet)),
+                    "start_offset": 0,
+                    "end_offset": len(snippet),
+                    "search_text": self._normalize_text(snippet),
+                }
+            )
+        return chunks
+
+    def _chunk_text_section(
+        self,
+        text: str,
+        section_start: int,
+        section_end: int,
+        target_tokens: int,
+        min_tokens: int,
+        max_tokens: int,
+    ) -> list[tuple[int, int]]:
+        sentences = self._collect_sentence_spans(text, section_start, section_end)
+        if not sentences:
+            if section_end > section_start:
+                return [(section_start, section_end)]
+            return []
+        chunks: list[tuple[int, int]] = []
+        index = 0
+        total = len(sentences)
+        while index < total:
+            chunk_start_idx = index
+            cursor = index
+            accumulated = 0
+            while cursor < total:
+                start, end = sentences[cursor]
+                tokens = max(1, self._count_tokens(text[start:end]))
+                if accumulated and accumulated + tokens > max_tokens:
+                    break
+                accumulated += tokens
+                cursor += 1
+                if accumulated >= target_tokens:
+                    if cursor >= total:
+                        break
+                    next_start = sentences[cursor][0]
+                    last_end = sentences[cursor - 1][1]
+                    if self._has_paragraph_break(text, last_end, next_start):
+                        break
+                    if accumulated >= min_tokens:
+                        break
+            if cursor == chunk_start_idx:
+                start, end = sentences[chunk_start_idx]
+                accumulated = max(1, self._count_tokens(text[start:end]))
+                cursor += 1
+            if accumulated < min_tokens and cursor < total:
+                start, end = sentences[cursor]
+                accumulated += max(1, self._count_tokens(text[start:end]))
+                cursor += 1
+            chunk_start_offset = sentences[chunk_start_idx][0]
+            chunk_end_offset = sentences[cursor - 1][1]
+            if chunk_start_idx == 0:
+                chunk_start_offset = min(chunk_start_offset, section_start)
+            if cursor >= total:
+                chunk_end_offset = section_end
+            chunks.append((chunk_start_offset, max(chunk_start_offset + 1, chunk_end_offset)))
+            if cursor >= total:
+                break
+            next_start = sentences[cursor][0]
+            last_end = sentences[cursor - 1][1]
+            if not self._has_paragraph_break(text, last_end, next_start):
+                overlap_index = cursor - 1
+                index = overlap_index if overlap_index > chunk_start_idx else cursor
+            else:
+                index = cursor
+        return chunks
+
+    def _collect_sentence_spans(
+        self, text: str, start: int, end: int
+    ) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        offset = max(0, start)
+        limit = min(len(text), end)
+        while offset < limit:
+            while offset < limit and text[offset].isspace():
+                offset += 1
+            if offset >= limit:
+                break
+            sentence_end = self._advance_to_sentence_end(text, offset)
+            if sentence_end <= offset:
+                sentence_end = min(limit, offset + self._BOUNDARY_LOOKAHEAD)
+            sentence_end = min(sentence_end, limit)
+            spans.append((offset, sentence_end))
+            offset = sentence_end
+        return spans
+
+    def _has_paragraph_break(self, text: str, start: int, end: int) -> bool:
+        if start >= end:
+            return False
+        return bool(re.search(r"\n\s*\n", text[start:end]))
+
+    def _resolve_section_spans(
+        self,
+        text: str,
+        sections: Sequence["DocumentSection"] | Sequence[dict[str, Any]] | None,
+    ) -> list[tuple[int, int]]:
+        if not sections:
+            return [(0, len(text))]
+        spans: list[tuple[int, int]] = []
+        cursor = 0
+        length = len(text)
+        for section in sections:
+            content = None
+            if hasattr(section, "content"):
+                content = getattr(section, "content")
+            elif isinstance(section, dict):
+                content = section.get("content")
+            if not content:
+                continue
+            search_value = content
+            start_offset = text.find(search_value, cursor)
+            if start_offset == -1:
+                trimmed = search_value.strip()
+                if trimmed:
+                    start_offset = text.find(trimmed, cursor)
+                    if start_offset != -1:
+                        search_value = trimmed
+            if start_offset == -1:
+                continue
+            if start_offset < cursor:
+                start_offset = text.find(search_value, cursor)
+                if start_offset == -1:
+                    continue
+            end_offset = start_offset + len(search_value)
+            if cursor < start_offset:
+                spans.append((cursor, start_offset))
+            spans.append((start_offset, end_offset))
+            cursor = max(cursor, end_offset)
+        if cursor < length:
+            spans.append((cursor, length))
+        merged: list[tuple[int, int]] = []
+        for start_offset, end_offset in spans:
+            if start_offset >= end_offset:
+                continue
+            if merged and start_offset < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end_offset))
+            else:
+                merged.append((start_offset, end_offset))
+        return merged or [(0, len(text))]
+
+    def _resolve_text_chunk_bounds(self, target_tokens: int) -> tuple[int, int, int]:
+        base_target = max(1, target_tokens)
+        if base_target < self._TEXT_MIN_TOKENS:
+            target = max(220, base_target)
+            min_tokens = max(90, int(target * 0.6))
+        else:
+            target = min(self._TEXT_MAX_TOKENS, base_target)
+            min_tokens = max(self._TEXT_MIN_TOKENS, int(target * 0.5))
+        max_tokens = min(self._TEXT_MAX_TOKENS, max(target + 120, int(target * 1.25)))
+        if min_tokens >= target:
+            min_tokens = max(1, int(target * 0.75))
+        if min_tokens >= max_tokens:
+            min_tokens = max(1, max_tokens - 1)
+        return target, min_tokens, max_tokens
+
+    def _chunk_code_document(
+        self,
+        text: str,
+        *,
+        normalized_text: str,
+        max_tokens: int,
+        path: str | None,
+    ) -> list[dict[str, Any]]:
+        suffix = Path(path).suffix.lower() if path else ""
+        spans: list[tuple[int, int]]
+        if suffix in {".py", ".pyw"}:
+            spans = self._chunk_python_code(text)
+            if not spans:
+                spans = self._chunk_markup_document(
+                    text,
+                    normalized_text=normalized_text,
+                    max_tokens=max_tokens,
+                    overlap=min(max(0, max_tokens // 4), max_tokens - 1),
+                    strategy="code",
+                    return_spans=True,
+                )
+        else:
+            spans = self._chunk_markup_document(
+                text,
+                normalized_text=normalized_text,
+                max_tokens=max_tokens,
+                overlap=min(max(0, max_tokens // 5), max_tokens - 1),
+                strategy="code",
+                return_spans=True,
+            )
+        if not spans:
+            snippet = normalized_text or text.strip()
+            if not snippet:
+                return []
+            return [
+                {
+                    "index": 0,
+                    "text": snippet,
+                    "token_count": max(1, self._count_tokens(snippet)),
+                    "start_offset": 0,
+                    "end_offset": len(snippet),
+                    "search_text": self._normalize_text(snippet),
+                }
+            ]
+        chunks: list[dict[str, Any]] = []
+        for index, (start_offset, end_offset) in enumerate(spans):
+            if suffix not in {".py", ".pyw"}:
+                adjusted_start = self._rewind_to_line_start(text, start_offset)
+                if adjusted_start <= start_offset:
+                    start_offset = max(0, adjusted_start)
+                end_offset = min(len(text), max(end_offset, start_offset + 1))
+                if end_offset < len(text) and text[end_offset - 1] != "\n":
+                    end_offset = self._advance_to_code_boundary(text, end_offset)
+            snippet = text[start_offset:end_offset]
+            if not snippet.strip():
+                continue
+            chunks.append(
+                {
+                    "index": index,
+                    "text": snippet,
+                    "token_count": max(1, self._count_tokens(snippet)),
+                    "start_offset": start_offset,
+                    "end_offset": end_offset,
+                    "search_text": self._normalize_text(snippet),
+                }
+            )
+        return chunks
+
+    def _chunk_python_code(self, text: str) -> list[tuple[int, int]]:
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        line_offsets = self._compute_line_offsets(text)
+        return self._chunk_python_body(tree.body, 0, len(text), line_offsets, text)
+
+    def _chunk_python_body(
+        self,
+        nodes: list[ast.stmt],
+        start_offset: int,
+        end_offset: int,
+        line_offsets: list[int],
+        text: str,
+    ) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        block_start = start_offset
+        for node in nodes:
+            child_start = self._python_symbol_start(node, text, line_offsets)
+            child_end = self._python_node_end(node, text, line_offsets)
+            if isinstance(node, ast.ClassDef):
+                if block_start < child_start:
+                    snippet = text[block_start:child_start]
+                    if snippet.strip():
+                        spans.append((block_start, child_start))
+                spans.extend(self._chunk_python_class(node, line_offsets, text))
+                block_start = max(block_start, child_end)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if block_start < child_start:
+                    snippet = text[block_start:child_start]
+                    if snippet.strip():
+                        spans.append((block_start, child_start))
+                spans.append((child_start, child_end))
+                block_start = max(block_start, child_end)
+            else:
+                continue
+        if block_start < end_offset:
+            snippet = text[block_start:end_offset]
+            if snippet.strip():
+                spans.append((block_start, end_offset))
+        return spans
+
+    def _chunk_python_class(
+        self, node: ast.ClassDef, line_offsets: list[int], text: str
+    ) -> list[tuple[int, int]]:
+        class_start = self._python_symbol_start(node, text, line_offsets)
+        class_end = self._python_node_end(node, text, line_offsets)
+        spans: list[tuple[int, int]] = []
+        block_start = class_start
+        for child in node.body:
+            child_start = self._python_symbol_start(child, text, line_offsets)
+            child_end = self._python_node_end(child, text, line_offsets)
+            if isinstance(child, ast.ClassDef):
+                if block_start < child_start:
+                    snippet = text[block_start:child_start]
+                    if snippet.strip():
+                        spans.append((block_start, child_start))
+                spans.extend(self._chunk_python_class(child, line_offsets, text))
+                block_start = max(block_start, child_end)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if block_start < child_start:
+                    snippet = text[block_start:child_start]
+                    if snippet.strip():
+                        spans.append((block_start, child_start))
+                spans.append((child_start, child_end))
+                block_start = max(block_start, child_end)
+            else:
+                continue
+        if block_start < class_end:
+            snippet = text[block_start:class_end]
+            if snippet.strip():
+                spans.append((block_start, class_end))
+        return spans
+
+    def _compute_line_offsets(self, text: str) -> list[int]:
+        offsets = [0]
+        for match in re.finditer(r"\n", text):
+            offsets.append(match.end())
+        if offsets[-1] != len(text):
+            offsets.append(len(text))
+        return offsets
+
+    def _offset_from_line_col(
+        self, lineno: int | None, col_offset: int | None, line_offsets: list[int], length: int
+    ) -> int:
+        if lineno is None or lineno < 1:
+            return 0
+        index = min(len(line_offsets) - 1, lineno - 1)
+        base = line_offsets[index]
+        column = col_offset or 0
+        return max(0, min(length, base + column))
+
+    def _python_symbol_start(
+        self, node: ast.AST, text: str, line_offsets: list[int]
+    ) -> int:
+        lineno = getattr(node, "lineno", None)
+        col_offset = getattr(node, "col_offset", 0)
+        start = self._offset_from_line_col(lineno, col_offset, line_offsets, len(text))
+        if lineno is None:
+            return start
+        line_index = lineno - 2
+        best_start = start
+        while line_index >= 0:
+            line_start = line_offsets[line_index]
+            line_end = line_offsets[line_index + 1] if line_index + 1 < len(line_offsets) else len(text)
+            line_text = text[line_start:line_end]
+            stripped = line_text.strip()
+            if not stripped:
+                break
+            if stripped.startswith("#"):
+                best_start = line_start
+                line_index -= 1
+                continue
+            break
+        return best_start
+
+    def _python_node_end(
+        self, node: ast.AST, text: str, line_offsets: list[int]
+    ) -> int:
+        end_lineno = getattr(node, "end_lineno", None)
+        end_col = getattr(node, "end_col_offset", None)
+        if end_lineno is None or end_col is None:
+            segment = ast.get_source_segment(text, node)
+            if segment is None:
+                return len(text)
+            start = self._python_symbol_start(node, text, line_offsets)
+            return min(len(text), start + len(segment))
+        return self._offset_from_line_col(end_lineno, end_col, line_offsets, len(text))
+
+    def _count_tokens(self, text: str) -> int:
+        return len(re.findall(r"\S+", text))
+
+    def _chunk_markup_document(
+        self,
+        text: str,
+        *,
+        normalized_text: str,
+        max_tokens: int,
+        overlap: int,
+        strategy: str,
+        return_spans: bool = False,
+    ) -> list[dict[str, Any]] | list[tuple[int, int]]:
         matches = list(re.finditer(r"\S+", text))
         if not matches:
             trimmed = text.strip()
             chunk_text = trimmed if trimmed else normalized_text
-            chunks = [
+            if return_spans:
+                return [(0, len(chunk_text))] if chunk_text else []
+            return [
                 {
                     "index": 0,
                     "text": chunk_text,
-                    "token_count": 0,
+                    "token_count": max(1, self._count_tokens(chunk_text)),
                     "start_offset": 0,
                     "end_offset": len(chunk_text),
                     "search_text": self._normalize_text(chunk_text),
                 }
             ]
-            logger.info(
-                "Chunked document",
-                extra={
-                    "path": path,
-                    "chunk_count": len(chunks),
-                    "strategy": strategy,
-                    "max_tokens": resolved_max_tokens,
-                    "overlap": resolved_overlap,
-                },
-            )
-            return chunks
-
         token_positions = [match.start() for match in matches]
-        chunks: list[dict[str, Any]] = []
+        spans: list[tuple[int, int]] = []
         start_index = 0
-        chunk_index = 0
         text_length = len(text)
-        step = max(1, resolved_max_tokens - resolved_overlap)
-
+        step = max(1, max_tokens - overlap)
         while start_index < len(matches):
-            end_index = min(start_index + resolved_max_tokens, len(matches))
+            end_index = min(start_index + max_tokens, len(matches))
             start_offset = matches[start_index].start()
             end_offset = (
                 matches[end_index - 1].end() if end_index > start_index else start_offset
@@ -1022,64 +1483,55 @@ class IngestDocumentRepository(BaseRepository):
                     start_offset = max(0, adjusted_start)
                 if adjusted_end >= end_offset:
                     end_offset = min(text_length, adjusted_end)
-
             end_offset = min(text_length, max(end_offset, start_offset + 1))
             start_offset = max(0, min(start_offset, end_offset - 1))
-            chunk_text = text[start_offset:end_offset].strip()
-            if not chunk_text:
+            snippet = text[start_offset:end_offset]
+            if not snippet.strip():
                 start_index = end_index if end_index > start_index else start_index + 1
                 continue
-            actual_start_index = bisect_left(token_positions, start_offset)
-            actual_end_index = bisect_left(token_positions, end_offset)
-            if actual_end_index <= actual_start_index:
-                actual_end_index = min(len(matches), actual_start_index + 1)
-                end_offset = matches[actual_end_index - 1].end()
-                chunk_text = text[start_offset:end_offset].strip()
-                if not chunk_text:
+            actual_start = bisect_left(token_positions, start_offset)
+            actual_end = bisect_left(token_positions, end_offset)
+            if (
+                strategy == "code"
+                and end_offset < text_length
+                and (end_offset <= 0 or text[end_offset - 1] != "\n")
+            ):
+                line_break = text.rfind("\n", start_offset, end_offset)
+                if line_break != -1 and line_break >= start_offset:
+                    end_offset = line_break + 1
+                    actual_end = bisect_left(token_positions, end_offset)
+                    snippet = text[start_offset:end_offset]
+            if actual_end <= actual_start:
+                actual_end = min(len(matches), actual_start + 1)
+                end_offset = matches[actual_end - 1].end()
+                snippet = text[start_offset:end_offset]
+                if not snippet.strip():
                     start_index = end_index if end_index > start_index else start_index + 1
                     continue
-            token_count = max(1, actual_end_index - actual_start_index)
-            search_text = self._normalize_text(chunk_text)
-            chunks.append(
-                {
-                    "index": chunk_index,
-                    "text": chunk_text,
-                    "token_count": token_count,
-                    "start_offset": start_offset,
-                    "end_offset": end_offset,
-                    "search_text": search_text,
-                }
-            )
-            chunk_index += 1
+            spans.append((start_offset, end_offset))
             if end_index >= len(matches):
                 break
-            next_index = max(actual_start_index, actual_end_index - resolved_overlap)
+            next_index = max(actual_start, actual_end - overlap)
             if next_index <= start_index:
                 next_index = start_index + step
             start_index = min(next_index, len(matches))
-
-        if not chunks:
-            chunk_text = normalized_text
+        if return_spans:
+            return spans
+        chunks: list[dict[str, Any]] = []
+        for index, (start_offset, end_offset) in enumerate(spans):
+            snippet = text[start_offset:end_offset]
+            if not snippet.strip():
+                continue
             chunks.append(
                 {
-                    "index": 0,
-                    "text": chunk_text,
-                    "token_count": len(matches),
-                    "start_offset": 0,
-                    "end_offset": len(chunk_text),
-                    "search_text": self._normalize_text(chunk_text),
+                    "index": index,
+                    "text": snippet,
+                    "token_count": max(1, self._count_tokens(snippet)),
+                    "start_offset": start_offset,
+                    "end_offset": end_offset,
+                    "search_text": self._normalize_text(snippet),
                 }
             )
-        logger.info(
-            "Chunked document",
-            extra={
-                "path": path,
-                "chunk_count": len(chunks),
-                "strategy": strategy,
-                "max_tokens": resolved_max_tokens,
-                "overlap": resolved_overlap,
-            },
-        )
         return chunks
 
     def _resolve_chunking_settings(
@@ -1096,12 +1548,12 @@ class IngestDocumentRepository(BaseRepository):
         suffix = Path(path).suffix.lower() if path else ""
         if suffix in self._CODE_SUFFIXES:
             strategy = "code"
-            max_tokens = 160
-            overlap = min(48, max_tokens - 1)
+            max_tokens = 220
+            overlap = min(32, max_tokens - 1)
         elif suffix in self._HTML_SUFFIXES:
             strategy = "html"
-            max_tokens = 220
-            overlap = min(60, max_tokens - 1)
+            max_tokens = 360
+            overlap = min(72, max_tokens - 1)
 
         chunking_meta = None
         if isinstance(metadata, dict):

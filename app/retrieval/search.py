@@ -84,7 +84,12 @@ class SearchService:
             seen_documents.add(doc_id)
             chunk: dict[str, Any] = record.get("chunk") or {}
             chunk_text = chunk.get("text") if isinstance(chunk, dict) else None
-            highlight = record.get("highlight") or chunk_text or doc_payload.get("preview")
+            highlight = self._build_evidence_snippet(
+                query,
+                chunk_text=chunk_text,
+                highlight_html=record.get("highlight"),
+                preview=doc_payload.get("preview"),
+            )
             results.append(
                 {
                     "document": document,
@@ -172,11 +177,15 @@ class SearchService:
             text = chunk.get("text") if isinstance(chunk, dict) else None
             if not text:
                 continue
-            highlight = (
-                record.get("highlight")
-                or chunk.get("highlight")
-                or doc_payload.get("preview")
-                or text
+            highlight = self._build_evidence_snippet(
+                query,
+                chunk_text=text,
+                highlight_html=(
+                    record.get("highlight")
+                    or chunk.get("highlight")
+                    or doc_payload.get("preview")
+                ),
+                preview=doc_payload.get("preview"),
             )
             context_record = {
                 "document": document,
@@ -356,6 +365,39 @@ class SearchService:
             return None
         return str(Path(folder).expanduser().resolve())
 
+    def _build_evidence_snippet(
+        self,
+        query: str,
+        *,
+        chunk_text: str | None,
+        highlight_html: str | None,
+        preview: str | None,
+    ) -> str:
+        """Return an evidence snippet that contains meaningful support."""
+
+        chunk_text = (chunk_text or "").strip()
+        highlight_html = (highlight_html or "").strip()
+        preview = (preview or "").strip()
+
+        base_text = chunk_text or self._strip_tags(highlight_html) or preview
+        if not base_text:
+            return highlight_html or ""
+
+        keywords = self._extract_marked_terms(highlight_html)
+        if not keywords:
+            keywords = self._tokenize_query(query)
+        if not keywords:
+            keywords = self._extract_keywords(base_text)
+
+        snippet = self._select_relevant_text(base_text, keywords)
+        if not snippet:
+            snippet = base_text
+
+        snippet = self._normalize_whitespace(snippet)
+        snippet = self._limit_length(snippet)
+        highlighted = self._apply_highlights(snippet, keywords)
+        return highlighted
+
     # ------------------------------------------------------------------
     _TOKEN_PATTERN = re.compile(r"[\w-]+", re.UNICODE)
     _SAFE_MATCH_TOKEN = re.compile(r"^[0-9A-Za-z_]+$")
@@ -521,3 +563,147 @@ class SearchService:
             return token
         escaped = token.replace("\"", "\"\"")
         return f'"{escaped}"'
+
+    @staticmethod
+    def _strip_tags(text: str) -> str:
+        if not text:
+            return ""
+        return re.sub(r"<[^>]+>", "", text)
+
+    @staticmethod
+    def _extract_marked_terms(highlight_html: str) -> list[str]:
+        if not highlight_html:
+            return []
+        matches = re.findall(r"<mark>(.*?)</mark>", highlight_html, flags=re.IGNORECASE)
+        terms: list[str] = []
+        seen: set[str] = set()
+        for match in matches:
+            token = SearchService._normalize_whitespace(match)
+            if not token:
+                continue
+            lowered = token.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            terms.append(token)
+        return terms
+
+    def _extract_keywords(self, text: str) -> list[str]:
+        tokens = [match.group(0) for match in self._TOKEN_PATTERN.finditer(text)]
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            lowered = token.lower()
+            if lowered in self._STOPWORDS or len(lowered) < 3:
+                continue
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            keywords.append(token)
+        return keywords
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _select_relevant_text(self, text: str, keywords: Iterable[str]) -> str:
+        normalized = self._normalize_whitespace(text)
+        if not normalized:
+            return ""
+        sentences = self._split_sentences(normalized)
+        if not sentences:
+            return normalized
+        keyword_list = [term.lower() for term in keywords if term]
+        keyword_list = [term for i, term in enumerate(keyword_list) if term not in keyword_list[:i]]
+        if not keyword_list:
+            snippet = sentences[0]
+            if len(snippet) < 80 and len(sentences) > 1:
+                snippet = " ".join(sentences[:2])
+            return snippet
+
+        matched_indices: list[int] = []
+        for idx, sentence in enumerate(sentences):
+            lower_sentence = sentence.lower()
+            if any(keyword in lower_sentence for keyword in keyword_list):
+                matched_indices.append(idx)
+
+        if not matched_indices:
+            snippet = sentences[0]
+            if len(snippet) < 80 and len(sentences) > 1:
+                snippet = " ".join(sentences[:2])
+            return snippet
+
+        start = matched_indices[0]
+        end = matched_indices[-1] + 1
+        snippet = " ".join(sentences[start:end])
+        while len(snippet) < 120 and start > 0:
+            start -= 1
+            snippet = " ".join(sentences[start:end])
+        while len(snippet) < 120 and end < len(sentences):
+            end += 1
+            snippet = " ".join(sentences[start:end])
+        return snippet
+
+    @staticmethod
+    def _split_sentences(text: str) -> list[str]:
+        if not text:
+            return []
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        sentences = [part.strip() for part in parts if part.strip()]
+        return sentences if sentences else [text]
+
+    @staticmethod
+    def _limit_length(text: str, *, max_length: int = 500) -> str:
+        if len(text) <= max_length:
+            return text
+        truncated = text[:max_length].rstrip()
+        if not truncated.endswith("…"):
+            truncated = truncated.rstrip(".,;: ") + "…"
+        return truncated
+
+    @staticmethod
+    def _apply_highlights(text: str, keywords: Iterable[str]) -> str:
+        terms = [term for term in keywords if term]
+        if not terms:
+            return text
+        unique_terms: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            lowered = term.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            unique_terms.append(term)
+        lower_text = text.lower()
+        spans: list[tuple[int, int]] = []
+
+        def _overlaps(start: int, end: int) -> bool:
+            for existing_start, existing_end in spans:
+                if start < existing_end and end > existing_start:
+                    return True
+            return False
+
+        for term in sorted(unique_terms, key=lambda value: len(value), reverse=True):
+            search = term.lower()
+            start_index = 0
+            while start_index < len(lower_text):
+                match_index = lower_text.find(search, start_index)
+                if match_index == -1:
+                    break
+                end_index = match_index + len(search)
+                if not _overlaps(match_index, end_index):
+                    spans.append((match_index, end_index))
+                start_index = end_index
+
+        if not spans:
+            return text
+
+        spans.sort()
+        parts: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            parts.append(text[cursor:start])
+            parts.append(f"<mark>{text[start:end]}</mark>")
+            cursor = end
+        parts.append(text[cursor:])
+        return "".join(parts)

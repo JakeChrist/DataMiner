@@ -2807,6 +2807,7 @@ class ConversationManager:
         return sorted(indexes)
 
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
+    _DOC_REFERENCE_PAREN_PATTERN = re.compile(r"\(([^()]*)\)")
     _SENTENCE_FRAGMENT_PATTERN = re.compile(r"[^.!?\n]+[.!?]?")
     _STEP_PREFIX_PATTERN = re.compile(
         r"""
@@ -2827,7 +2828,26 @@ class ConversationManager:
 
     @staticmethod
     def _strip_citation_markers(text: str) -> str:
-        return ConversationManager._CITATION_PATTERN.sub("", text)
+        without_brackets = ConversationManager._CITATION_PATTERN.sub("", text)
+
+        def _maybe_strip_parenthetical(match: re.Match[str]) -> str:
+            content = match.group(1).strip()
+            if not content:
+                return ""
+            lowered = content.lower()
+            lowered = re.sub(
+                r"(?:doc\s*-?\d+|doc\d+|chunk\s*\d+|section\s*\d+|snippet\s*\d+|source\s*\d+)",
+                "",
+                lowered,
+            )
+            lowered = re.sub(r"[\s,;:&/\\-]+", "", lowered)
+            if not lowered:
+                return ""
+            return match.group(0)
+
+        return ConversationManager._DOC_REFERENCE_PAREN_PATTERN.sub(
+            _maybe_strip_parenthetical, without_brackets
+        )
 
     @staticmethod
     def _remove_step_prefix(text: str) -> str:

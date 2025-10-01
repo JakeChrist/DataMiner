@@ -358,6 +358,7 @@ class SearchService:
 
     # ------------------------------------------------------------------
     _TOKEN_PATTERN = re.compile(r"[\w-]+", re.UNICODE)
+    _SAFE_MATCH_TOKEN = re.compile(r"^[0-9A-Za-z_]+$")
     _STOPWORDS = {
         "a",
         "an",
@@ -407,12 +408,20 @@ class SearchService:
             logger.info("Skipping empty retrieval query")
             return
 
-        attempts: list[str] = [normalized]
+        attempts: list[str] = []
+        base_terms = [match.group(0) for match in self._TOKEN_PATTERN.finditer(normalized)]
+        sanitized_terms = [self._escape_match_token(term) for term in base_terms if term]
+        if sanitized_terms:
+            attempts.append(" ".join(sanitized_terms))
+        else:
+            attempts.append(normalized)
+
         tokens = self._tokenize_query(normalized)
         if tokens:
-            wildcard_tokens = [f"{token}*" for token in tokens]
+            escaped_tokens = [self._escape_match_token(token) for token in tokens]
+            wildcard_tokens = [f"{token}*" for token in escaped_tokens]
             attempts.append(" OR ".join(wildcard_tokens))
-            if len(tokens) > 1:
+            if len(wildcard_tokens) > 1:
                 attempts.append(" ".join(wildcard_tokens))
 
         logger.info(
@@ -455,9 +464,10 @@ class SearchService:
             )
             try:
                 results = self.ingest.search(candidate, limit=limit)
-            except sqlite3.OperationalError:
+            except sqlite3.OperationalError as exc:
                 logger.warning(
-                    "Ingest search failed for attempt", extra={"attempt_query": candidate}
+                    "Ingest search failed for attempt",
+                    extra={"attempt_query": candidate, "error": str(exc)},
                 )
                 continue
             logger.info(
@@ -500,3 +510,14 @@ class SearchService:
                 seen.add(token)
                 unique.append(token)
         return unique
+
+    @classmethod
+    def _escape_match_token(cls, token: str) -> str:
+        """Escape tokens so they are safe for use in SQLite FTS MATCH queries."""
+
+        if not token:
+            return token
+        if cls._SAFE_MATCH_TOKEN.fullmatch(token):
+            return token
+        escaped = token.replace("\"", "\"\"")
+        return f'"{escaped}"'

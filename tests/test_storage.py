@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.ingest.parsers import ParsedDocument
+from app.ingest.parsers import DocumentSection, ParsedDocument
 from app.storage import (
     ChatRepository,
     DatabaseManager,
@@ -227,7 +227,7 @@ def test_chunk_document_aligns_code_chunks_to_line_start(
     for chunk in chunks:
         lines = [line for line in chunk["text"].splitlines() if line.strip()]
         assert lines
-        assert lines[0] in valid_lines
+        assert lines[0].strip() in valid_lines
 
 
 def test_chunk_document_aligns_html_chunks_to_tag_boundaries(
@@ -261,4 +261,96 @@ def test_chunk_document_aligns_html_chunks_to_tag_boundaries(
     for chunk in chunks:
         lines = [line for line in chunk["text"].splitlines() if line.strip()]
         assert lines
-        assert lines[0] in valid_lines
+        assert lines[0].strip() in valid_lines
+
+
+def test_semantic_text_chunking_respects_sections(
+    ingest_repo: IngestDocumentRepository,
+) -> None:
+    text = (
+        "Overview starts here.\n\n"
+        "More introductory context.\n\n"
+        "Main discussion begins now. It continues with additional detail."
+        " Further elaboration to reach target length.\n\n"
+        "Final remarks conclude the document."
+    )
+    sections = [
+        DocumentSection(title="Overview", content="Overview starts here.\n\nMore introductory context."),
+        DocumentSection(
+            title="Discussion",
+            content=(
+                "Main discussion begins now. It continues with additional detail."
+                " Further elaboration to reach target length."
+            ),
+        ),
+        DocumentSection(title="Conclusion", content="Final remarks conclude the document."),
+    ]
+
+    normalized = ingest_repo._normalize_text(text)
+    chunks = ingest_repo._chunk_document(
+        text,
+        normalized_text=normalized,
+        path="report.txt",
+        metadata={},
+        sections=sections,
+    )
+
+    assert chunks
+
+    boundaries: list[tuple[int, int]] = []
+    cursor = 0
+    for section in sections:
+        start = text.find(section.content, cursor)
+        assert start != -1
+        end = start + len(section.content)
+        boundaries.append((start, end))
+        cursor = end
+
+    for chunk in chunks:
+        start = chunk["start_offset"]
+        end = chunk["end_offset"]
+        assert chunk["text"] == text[start:end]
+        containing = next(((s, e) for s, e in boundaries if s <= start < e), None)
+        assert containing is not None
+        assert end <= containing[1]
+
+
+def test_python_chunking_separates_symbols(
+    ingest_repo: IngestDocumentRepository,
+) -> None:
+    code = (
+        '"""Module docstring"""\n'
+        "import os\n\n"
+        "def helper() -> int:\n"
+        "    return 1\n\n"
+        "class Foo:\n"
+        "    def method_one(self) -> str:\n"
+        "        return \"one\"\n\n"
+        "    # comment about method two\n"
+        "    def method_two(self) -> str:\n"
+        "        return \"two\"\n"
+    )
+    normalized = ingest_repo._normalize_text(code)
+
+    chunks = ingest_repo._chunk_document(
+        code,
+        normalized_text=normalized,
+        path="module.py",
+        metadata={},
+    )
+
+    assert chunks
+    for chunk in chunks:
+        start = chunk["start_offset"]
+        end = chunk["end_offset"]
+        assert chunk["text"] == code[start:end]
+
+    helper_chunks = [chunk for chunk in chunks if "def helper" in chunk["text"]]
+    assert len(helper_chunks) == 1
+    assert "def method_two" not in helper_chunks[0]["text"]
+
+    method_one_chunks = [chunk for chunk in chunks if "def method_one" in chunk["text"]]
+    assert len(method_one_chunks) == 1
+    method_two_chunks = [chunk for chunk in chunks if "def method_two" in chunk["text"]]
+    assert len(method_two_chunks) == 1
+    assert "# comment" in method_two_chunks[0]["text"]

@@ -602,12 +602,23 @@ class ProjectService(QObject):
     @log_call(logger=logger, include_result=True)
     def _project_storage_dir(self, project_id: int) -> Path | None:
         stored = self._load_project_storage_path(project_id)
-        if stored is not None:
-            return stored
         primary_root = self._primary_corpus_root(project_id)
-        if primary_root is None:
+        preferred: Path | None = None
+        if primary_root is not None:
+            preferred = primary_root / "DataMiner" / "projects" / str(project_id)
+
+        if stored is not None:
+            if (
+                preferred is not None
+                and stored != preferred
+                and self._is_legacy_hidden_storage(stored, primary_root)
+            ):
+                self._migrate_storage_directory(project_id, stored, preferred)
+                stored = preferred
+            return stored
+        if preferred is None:
             return None
-        storage = primary_root / ".dataminer" / "projects" / str(project_id)
+        storage = preferred
         legacy = self._storage_root / "projects" / str(project_id)
         if legacy.exists() and not storage.exists():
             storage.parent.mkdir(parents=True, exist_ok=True)
@@ -618,6 +629,46 @@ class ProjectService(QObject):
             extra={"project_id": project_id, "path": str(storage)},
         )
         return storage
+
+    @staticmethod
+    def _is_legacy_hidden_storage(path: Path, primary_root: Path | None) -> bool:
+        try:
+            parts = path.resolve().parts
+        except FileNotFoundError:
+            parts = path.parts
+        if ".dataminer" not in parts:
+            return False
+        if primary_root is None:
+            return True
+        try:
+            return path.resolve(strict=False).is_relative_to(
+                primary_root.resolve(strict=False)
+            )
+        except AttributeError:  # pragma: no cover - Python < 3.9 fallback
+            try:
+                path.resolve(strict=False).relative_to(primary_root.resolve(strict=False))
+                return True
+            except ValueError:
+                return False
+
+    @log_call(logger=logger)
+    def _migrate_storage_directory(
+        self, project_id: int, source: Path, destination: Path
+    ) -> None:
+        if source == destination:
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.exists():
+            shutil.move(str(source), str(destination))
+        self._store_project_storage_path(project_id, destination)
+        logger.info(
+            "Migrated project storage",
+            extra={
+                "project_id": project_id,
+                "source": str(source),
+                "destination": str(destination),
+            },
+        )
 
     @log_call(logger=logger, include_result=True)
     def _ensure_project_storage(self, project_id: int) -> Path | None:

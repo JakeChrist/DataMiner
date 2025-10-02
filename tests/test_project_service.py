@@ -42,7 +42,7 @@ def test_corpus_root_management(tmp_path: Path) -> None:
         storage_path = service.get_project_storage(project.id)
         assert storage_path.exists()
         assert storage_path.parent.name == "projects"
-        assert storage_path.parent.parent.name == ".dataminer"
+        assert storage_path.parent.parent.name == "DataMiner"
         assert storage_path.parent.parent.parent == first.resolve()
         snapshot_path = storage_path / "dataminer.db"
         assert snapshot_path.exists()

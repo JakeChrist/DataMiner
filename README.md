@@ -72,3 +72,14 @@ app/
 
 Each subpackage is prepared for future expansion to cover document ingestion,
 storage, retrieval, background services, and the PyQt6 user interface.
+
+### Response Quality Assets
+
+The `Docs/` directory now includes the artifacts produced by the response quality improvement initiative:
+
+- `response_template.md` – canonical structure for long-form answers.
+- `research_quick_reference.md` – rapid research checklist and prompts.
+- `quality_assurance_workflow.md` – peer review process and QA checklist.
+- `knowledge_base/` – seeded repository of reusable insights, evidence logs, and playbooks.
+
+These materials support richer, more consistent responses and should be reviewed before drafting substantive answers.

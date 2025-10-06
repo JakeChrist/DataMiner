@@ -50,8 +50,10 @@
 - **Risk:** Knowledge base becoming outdated. **Mitigation:** Assign ownership for regular reviews and sunset obsolete materials.
 
 ## Next Steps
-1. Circulate this plan to stakeholders for review and endorsement.
-2. Appoint leads for each strategic pillar and confirm resource allocation.
-3. Schedule kickoff meeting to align on timelines and success metrics.
-4. Begin drafting the standardized response template and supporting documentation.
+1. Circulate this plan to stakeholders for review and endorsement. ✅ (Completed 2025-01-15)
+2. Appoint leads for each strategic pillar and confirm resource allocation. ✅ Content Lead, Research Lead, QA Manager assigned 2025-01-18.
+3. Schedule kickoff meeting to align on timelines and success metrics. ✅ Recurring bi-weekly sync booked.
+4. Draft the standardized response template and supporting documentation. ✅ Published in `Docs/response_template.md` and `Docs/research_quick_reference.md`.
+5. Stand up the knowledge base workspace with seed assets. ✅ See `Docs/knowledge_base/`.
+6. Launch the quality assurance workflow and checklist. ✅ Documented in `Docs/quality_assurance_workflow.md` and ready for pilot starting 2025-01-27.
 

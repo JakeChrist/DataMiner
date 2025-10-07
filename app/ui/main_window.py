@@ -722,7 +722,8 @@ class MainWindow(QMainWindow):
         self._turns = list(session.get("turns", []))
         self._conversation_manager.turns = list(self._turns)
         self.answer_view.render_turns(self._turns)
-        self._active_card = self.answer_view.cards[-1] if self.answer_view.cards else None
+        turns = self.answer_view.turns
+        self._active_card = turns[-1] if turns else None
         scope = session.get("scope")
         if isinstance(scope, dict):
             include = list(scope.get("include", []))

@@ -244,6 +244,7 @@ class TextBlockWidget(QTextBrowser):
         text: str,
         *,
         accent: str,
+        text_color: str | None = None,
         highlight: int | None = None,
     ) -> None:
         super().__init__()
@@ -259,6 +260,7 @@ class TextBlockWidget(QTextBrowser):
         self._raw_text = text
         self._accent = accent
         self._highlight = highlight
+        self._text_color = text_color
         self._has_citation = False
         self._sources_only = False
         self.anchorClicked.connect(self._on_anchor)
@@ -291,12 +293,19 @@ class TextBlockWidget(QTextBrowser):
         self._accent = color
         self._render()
 
+    def set_text_color(self, color: str | None) -> None:
+        if color == self._text_color:
+            return
+        self._text_color = color
+        self._render()
+
     def _render(self) -> None:
         html_text, has_citation = _render_inline_html(
             self._raw_text, highlight=self._highlight, accent=self._accent
         )
         self._has_citation = has_citation
-        self.setHtml(f"<div class='chat-paragraph'>{html_text}</div>")
+        style_attr = f" style='color:{self._text_color};'" if self._text_color else ""
+        self.setHtml(f"<div class='chat-paragraph'{style_attr}>{html_text}</div>")
         self._update_visibility()
         self.document().adjustSize()
         self.setMinimumHeight(math.ceil(self.document().size().height()))
@@ -875,7 +884,7 @@ class UserBubbleWidget(ChatBubbleWidget):
             progress=progress,
         )
         self._raw_text = text
-        self._text_widget = TextBlockWidget(text, accent=accent)
+        self._text_widget = TextBlockWidget(text, accent=accent, text_color=text_color)
         self.add_widget(self._text_widget)
         self.add_action("Copy", self._copy_text)
 
@@ -888,6 +897,7 @@ class UserBubbleWidget(ChatBubbleWidget):
         self.set_accent(accent)
         self.set_text_color(text_color)
         self._text_widget.set_accent(accent)
+        self._text_widget.set_text_color(text_color)
 
 
 class AssistantBubbleWidget(ChatBubbleWidget):
@@ -946,7 +956,7 @@ class AssistantBubbleWidget(ChatBubbleWidget):
                 container.setContentsMargins(0, 0, 0, 0)
                 container.setSpacing(4)
                 for item in block.items:
-                    text_widget = TextBlockWidget(item, accent=accent)
+                    text_widget = TextBlockWidget(item, accent=accent, text_color=text_color)
                     text_widget.citation_activated.connect(self._on_citation_activated)
                     self._text_blocks.append(text_widget)
                     container.addWidget(text_widget)
@@ -955,7 +965,7 @@ class AssistantBubbleWidget(ChatBubbleWidget):
                 wrapper.setObjectName("listWrapper")
                 self.add_widget(wrapper)
             else:
-                text_widget = TextBlockWidget(block.text, accent=accent)
+                text_widget = TextBlockWidget(block.text, accent=accent, text_color=text_color)
                 text_widget.citation_activated.connect(self._on_citation_activated)
                 self._text_blocks.append(text_widget)
                 self.add_widget(text_widget)
@@ -1235,6 +1245,7 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         self.set_text_color(text_color)
         for block in self._text_blocks:
             block.set_accent(accent)
+            block.set_text_color(text_color)
         for code_block in self._code_blocks:
             code_block.set_background(code_background)
         for section in self._section_order:

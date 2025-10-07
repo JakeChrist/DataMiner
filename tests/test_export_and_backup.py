@@ -63,6 +63,50 @@ def test_export_service_includes_reasoning_and_citations() -> None:
     assert "Self-check" in html
 
 
+def test_export_service_formats_rich_citations() -> None:
+    export = ExportService()
+    citations = [
+        {
+            "title": "Summary Report",
+            "steps": ["1", "2"],
+            "page": 2,
+            "section": "Findings",
+            "snippet_html": "<p><strong>Key</strong> insight about <em>data</em>.</p>",
+            "metadata_text": "Confidence: High",
+        },
+        {
+            "path": "research_notes.md",
+            "page_start": 10,
+            "page_end": 12,
+            "line_start": 30,
+            "line_end": 34,
+            "snippet": "Secondary findings highlight follow-up results.",
+            "metadata": {"Confidence": "Medium", "Reviewer": "Alice"},
+        },
+    ]
+    turn = ConversationTurn(
+        question="Provide supporting details.",
+        answer="See detailed evidence [1][2].",
+        citations=citations,
+    )
+
+    markdown = export.conversation_to_markdown([turn])
+    assert "Summary Report" in markdown
+    assert "Steps 1, 2, Page 2, Findings" in markdown
+    assert "Confidence: High" in markdown
+    assert "Key insight about data." in markdown
+    assert "research_notes.md" in markdown
+    assert "Pages 10–12, Lines 30–34" in markdown
+    assert "Confidence: Medium; Reviewer: Alice" in markdown
+
+    html = export.conversation_to_html([turn])
+    assert "Summary Report" in html
+    assert "Steps 1, 2, Page 2, Findings" in html
+    assert "Key insight about data." in html
+    assert "Pages 10–12, Lines 30–34" in html
+    assert "Confidence: Medium; Reviewer: Alice" in html
+
+
 def test_project_service_lifecycle_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     service = build_project_service(tmp_path)

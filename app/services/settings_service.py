@@ -53,7 +53,9 @@ class ChatStyleSettings:
     """Themeable colors used by the chat style answer view."""
 
     ai_bubble_color: str = "#315389"
+    ai_text_color: str = "#f2f5f9"
     user_bubble_color: str = "#ffffff"
+    user_text_color: str = "#1e2430"
     code_block_background: str = "#1f2530"
     citation_accent: str = "#d8893a"
 
@@ -146,19 +148,38 @@ class SettingsService(QObject):
         chat_data = ui_settings.get("chat_style", {})
         if not isinstance(chat_data, dict):
             chat_data = {}
+
+        def _load_chat_color(*keys: str, fallback: str) -> str:
+            for key in keys:
+                if key in chat_data:
+                    return _normalize_color(chat_data.get(key), fallback=fallback)
+            return fallback
+
         defaults = ChatStyleSettings()
         chat_style = ChatStyleSettings(
-            ai_bubble_color=_normalize_color(
-                chat_data.get("ai_bubble"), fallback=defaults.ai_bubble_color
+            ai_bubble_color=_load_chat_color(
+                "ai_bubble_color", "ai_bubble", fallback=defaults.ai_bubble_color
             ),
-            user_bubble_color=_normalize_color(
-                chat_data.get("user_bubble"), fallback=defaults.user_bubble_color
+            ai_text_color=_load_chat_color(
+                "ai_text_color",
+                "ai_text",
+                "answer_text_color",
+                fallback=defaults.ai_text_color,
             ),
-            code_block_background=_normalize_color(
-                chat_data.get("code_background"), fallback=defaults.code_block_background
+            user_bubble_color=_load_chat_color(
+                "user_bubble_color", "user_bubble", fallback=defaults.user_bubble_color
             ),
-            citation_accent=_normalize_color(
-                chat_data.get("citation_accent"), fallback=defaults.citation_accent
+            user_text_color=_load_chat_color(
+                "user_text_color",
+                "user_text",
+                "question_text_color",
+                fallback=defaults.user_text_color,
+            ),
+            code_block_background=_load_chat_color(
+                "code_block_background", "code_background", fallback=defaults.code_block_background
+            ),
+            citation_accent=_load_chat_color(
+                "citation_accent", fallback=defaults.citation_accent
             ),
         )
         self._settings = UISettings(
@@ -239,7 +260,9 @@ class SettingsService(QObject):
         style = self._settings.chat_style
         return ChatStyleSettings(
             ai_bubble_color=style.ai_bubble_color,
+            ai_text_color=style.ai_text_color,
             user_bubble_color=style.user_bubble_color,
+            user_text_color=style.user_text_color,
             code_block_background=style.code_block_background,
             citation_accent=style.citation_accent,
         )
@@ -368,7 +391,9 @@ class SettingsService(QObject):
         self,
         *,
         ai_bubble_color: str | None = None,
+        ai_text_color: str | None = None,
         user_bubble_color: str | None = None,
+        user_text_color: str | None = None,
         code_block_background: str | None = None,
         citation_accent: str | None = None,
     ) -> None:
@@ -377,8 +402,14 @@ class SettingsService(QObject):
             ai_bubble_color=_normalize_color(
                 ai_bubble_color, fallback=current.ai_bubble_color
             ),
+            ai_text_color=_normalize_color(
+                ai_text_color, fallback=current.ai_text_color
+            ),
             user_bubble_color=_normalize_color(
                 user_bubble_color, fallback=current.user_bubble_color
+            ),
+            user_text_color=_normalize_color(
+                user_text_color, fallback=current.user_text_color
             ),
             code_block_background=_normalize_color(
                 code_block_background, fallback=current.code_block_background

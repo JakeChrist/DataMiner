@@ -596,6 +596,7 @@ class ChatBubbleWidget(QFrame):
         speaker: str,
         background: str,
         accent: str,
+        text_color: str | None,
         progress: ProgressService,
     ) -> None:
         super().__init__()
@@ -603,6 +604,7 @@ class ChatBubbleWidget(QFrame):
         self._progress = progress
         self._accent = accent
         self._background = background
+        self._text_color = text_color
         self.setObjectName(f"chatBubble_{speaker}")
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
         self.setMouseTracking(True)
@@ -730,6 +732,12 @@ class ChatBubbleWidget(QFrame):
         self._background = color
         self._apply_background()
 
+    def set_text_color(self, color: str | None) -> None:
+        if color == self._text_color:
+            return
+        self._text_color = color
+        self._apply_background()
+
     @property
     def accent(self) -> str:
         return self._accent
@@ -742,12 +750,13 @@ class ChatBubbleWidget(QFrame):
 
     def _apply_background(self) -> None:
         radius = 18
+        text_color = self._text_color or "palette(text)"
         self.setStyleSheet(
             f"QFrame#chatBubble_{self._speaker} {{"
             f"background-color: {self._background};"
             "border: 0;"
             f"border-radius: {radius}px;"
-            "color: palette(text);"
+            f"color: {text_color};"
             "}}"
         )
 
@@ -855,9 +864,16 @@ class UserBubbleWidget(ChatBubbleWidget):
         text: str,
         background: str,
         accent: str,
+        text_color: str,
         progress: ProgressService,
     ) -> None:
-        super().__init__(speaker="user", background=background, accent=accent, progress=progress)
+        super().__init__(
+            speaker="user",
+            background=background,
+            accent=accent,
+            text_color=text_color,
+            progress=progress,
+        )
         self._raw_text = text
         self._text_widget = TextBlockWidget(text, accent=accent)
         self.add_widget(self._text_widget)
@@ -867,9 +883,10 @@ class UserBubbleWidget(ChatBubbleWidget):
         QApplication.clipboard().setText(self._raw_text)
         self.notify_copy("Prompt copied")
 
-    def apply_colors(self, *, background: str, accent: str) -> None:
+    def apply_colors(self, *, background: str, accent: str, text_color: str) -> None:
         self.set_background(background)
         self.set_accent(accent)
+        self.set_text_color(text_color)
         self._text_widget.set_accent(accent)
 
 
@@ -885,10 +902,17 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         settings: ConversationSettings,
         background: str,
         accent: str,
+        text_color: str,
         code_background: str,
         progress: ProgressService,
     ) -> None:
-        super().__init__(speaker="assistant", background=background, accent=accent, progress=progress)
+        super().__init__(
+            speaker="assistant",
+            background=background,
+            accent=accent,
+            text_color=text_color,
+            progress=progress,
+        )
         self.turn = turn
         self._settings = settings
         self._code_background = code_background
@@ -1204,10 +1228,11 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         self._update_expand_control_buttons()
 
     def set_background_colors(
-        self, *, background: str, code_background: str, accent: str
+        self, *, background: str, code_background: str, accent: str, text_color: str
     ) -> None:
         self.set_background(background)
         self.set_accent(accent)
+        self.set_text_color(text_color)
         for block in self._text_blocks:
             block.set_accent(accent)
         for code_block in self._code_blocks:
@@ -1273,6 +1298,7 @@ class ChatTurnWidget(QFrame):
             text=turn.question,
             background=colors.user_bubble_color,
             accent=colors.citation_accent,
+            text_color=colors.user_text_color,
             progress=progress,
         )
         user_row.addStretch(1)
@@ -1287,6 +1313,7 @@ class ChatTurnWidget(QFrame):
             settings=settings,
             background=colors.ai_bubble_color,
             accent=colors.citation_accent,
+            text_color=colors.ai_text_color,
             code_background=colors.code_block_background,
             progress=progress,
         )
@@ -1312,11 +1339,13 @@ class ChatTurnWidget(QFrame):
         self.user_bubble.apply_colors(
             background=colors.user_bubble_color,
             accent=colors.citation_accent,
+            text_color=colors.user_text_color,
         )
         self.assistant_bubble.set_background_colors(
             background=colors.ai_bubble_color,
             code_background=colors.code_block_background,
             accent=colors.citation_accent,
+            text_color=colors.ai_text_color,
         )
 
 

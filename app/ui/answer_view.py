@@ -17,8 +17,10 @@ from PyQt6.QtCore import (
     QPoint,
     QPointF,
     QPropertyAnimation,
+    QSize,
     Qt,
     QTimer,
+    QWIDGETSIZE_MAX,
     pyqtSignal,
 )
 from PyQt6.QtGui import QColor, QCursor, QTextOption, QWheelEvent
@@ -585,6 +587,9 @@ class CollapsibleSection(QFrame):
 class ChatBubbleWidget(QFrame):
     """Base widget representing a speaker bubble in the chat transcript."""
 
+    _RESIZE_MARGIN = 12
+    _MIN_WIDTH = 180
+
     def __init__(
         self,
         *,
@@ -600,7 +605,13 @@ class ChatBubbleWidget(QFrame):
         self._background = background
         self.setObjectName(f"chatBubble_{speaker}")
         self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
         self._hover_actions: list[QPushButton] = []
+        self._resize_region: str | None = None
+        self._drag_start: QPoint | None = None
+        self._initial_size: QSize = QSize()
+        self._manual_width: int | None = None
+        self._manual_height: int | None = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 12, 16, 12)
@@ -630,8 +641,9 @@ class ChatBubbleWidget(QFrame):
         self._typing_label.hide()
         outer.addWidget(self._typing_label)
 
-        radius = 18
         self._apply_background()
+        self._set_manual_width(None)
+        self._set_manual_height(None)
 
     def add_widget(self, widget: QWidget) -> None:
         self._content_layout.addWidget(widget)
@@ -665,6 +677,49 @@ class ChatBubbleWidget(QFrame):
     def leaveEvent(self, event):  # pragma: no cover
         super().leaveEvent(event)
         self._actions_widget.setVisible(False)
+        if not self._resize_region:
+            self.unsetCursor()
+
+    def mousePressEvent(self, event):  # pragma: no cover - UI behaviour
+        if event.button() == Qt.MouseButton.LeftButton:
+            region = self._hit_test_resize(event.position().toPoint())
+            if region:
+                self._resize_region = region
+                self._drag_start = event.globalPosition().toPoint()
+                self._initial_size = self.size()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # pragma: no cover - UI behaviour
+        if self._resize_region and self._drag_start is not None:
+            self._perform_resize(event)
+            event.accept()
+            return
+
+        region = self._hit_test_resize(event.position().toPoint())
+        self._update_cursor(region)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # pragma: no cover - UI behaviour
+        if event.button() == Qt.MouseButton.LeftButton and self._resize_region:
+            self._resize_region = None
+            self._drag_start = None
+            self._initial_size = QSize()
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):  # pragma: no cover - UI behaviour
+        region = self._hit_test_resize(event.position().toPoint())
+        if region:
+            self._set_manual_width(None)
+            self._set_manual_height(None)
+            self.updateGeometry()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def notify_copy(self, message: str) -> None:
         self._progress.notify(message, level="info", duration_ms=1500)
@@ -680,7 +735,10 @@ class ChatBubbleWidget(QFrame):
         return self._accent
 
     def set_accent(self, color: str) -> None:
+        if color == self._accent:
+            return
         self._accent = color
+        self._apply_background()
 
     def _apply_background(self) -> None:
         radius = 18
@@ -692,6 +750,100 @@ class ChatBubbleWidget(QFrame):
             "color: palette(text);"
             "}}"
         )
+
+    # ------------------------------------------------------------------
+    def _hit_test_resize(self, pos: QPoint) -> str:
+        rect = self.rect()
+        margin = self._RESIZE_MARGIN
+        if rect.isNull():
+            return ""
+        left = pos.x() <= margin
+        right = pos.x() >= rect.width() - margin
+        bottom = pos.y() >= rect.height() - margin
+        if bottom and right:
+            return "bottomright"
+        if bottom and left:
+            return "bottomleft"
+        if right:
+            return "right"
+        if left:
+            return "left"
+        if bottom:
+            return "bottom"
+        return ""
+
+    def _update_cursor(self, region: str) -> None:
+        if self._resize_region:
+            return
+        if region in {"left", "right"}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif region == "bottom":
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif region == "bottomright":
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif region == "bottomleft":
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        else:
+            self.unsetCursor()
+
+    def _perform_resize(self, event) -> None:
+        if not self._resize_region or self._drag_start is None:
+            return
+
+        current = event.globalPosition().toPoint()
+        delta = current - self._drag_start
+        new_width: int | None = None
+        new_height: int | None = None
+
+        if "right" in self._resize_region:
+            new_width = self._initial_size.width() + delta.x()
+        elif "left" in self._resize_region:
+            new_width = self._initial_size.width() - delta.x()
+
+        if new_width is not None:
+            new_width = max(self._MIN_WIDTH, new_width)
+            self._set_manual_width(int(new_width))
+
+        if "bottom" in self._resize_region:
+            desired = self._initial_size.height() + delta.y()
+            minimum = max(self._content_height_hint(), 0)
+            new_height = max(minimum, desired)
+            self._set_manual_height(int(new_height))
+
+        if new_width is None and self._manual_width is not None:
+            self._set_manual_width(self._manual_width)
+        if new_height is None and self._manual_height is not None:
+            self._set_manual_height(self._manual_height)
+
+        self.updateGeometry()
+
+    def _set_manual_width(self, width: int | None) -> None:
+        self._manual_width = width
+        if width is None:
+            self.setMinimumWidth(self._MIN_WIDTH)
+            self.setMaximumWidth(QWIDGETSIZE_MAX)
+        else:
+            bounded = max(self._MIN_WIDTH, width)
+            self.setMinimumWidth(bounded)
+            self.setMaximumWidth(bounded)
+        self.updateGeometry()
+
+    def _set_manual_height(self, height: int | None) -> None:
+        self._manual_height = height
+        if height is None:
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(QWIDGETSIZE_MAX)
+        else:
+            self.setMinimumHeight(height)
+            self.setMaximumHeight(height)
+        self.updateGeometry()
+
+    def _content_height_hint(self) -> int:
+        layout = self.layout()
+        if layout is None:
+            return self.sizeHint().height()
+        hint = layout.sizeHint()
+        return hint.height()
 
 
 class UserBubbleWidget(ChatBubbleWidget):

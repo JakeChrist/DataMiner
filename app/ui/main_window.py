@@ -11,7 +11,14 @@ from pathlib import Path
 import threading
 from typing import Any, Callable, Iterable
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QMetaObject,
+    QPropertyAnimation,
+    Qt,
+    QTimer,
+    QUrl,
+)
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -1600,11 +1607,19 @@ class MainWindow(QMainWindow):
                     context_provider=step_context_provider,
                 )
             except LMStudioError as exc:
-                QTimer.singleShot(0, partial(_handle_error, exc))
+                QMetaObject.invokeMethod(
+                    self,
+                    lambda exc=exc: _handle_error(exc),
+                    Qt.ConnectionType.QueuedConnection,
+                )
                 return
 
             answered_at = datetime.now()
-            QTimer.singleShot(0, partial(_handle_success, turn, answered_at))
+            QMetaObject.invokeMethod(
+                self,
+                lambda turn=turn, answered_at=answered_at: _handle_success(turn, answered_at),
+                Qt.ConnectionType.QueuedConnection,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 

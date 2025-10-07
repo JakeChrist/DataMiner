@@ -291,23 +291,168 @@ class ExportService:
     @log_call(logger=logger, include_result=True)
     def _format_citation_text(citation: object) -> str:
         if isinstance(citation, str):
-            return citation
+            return citation.strip()
         if isinstance(citation, dict):
-            source = citation.get("source") or citation.get("title") or citation.get("path")
-            location: list[str] = []
-            page = citation.get("page")
-            section = citation.get("section")
-            if page is not None:
-                location.append(f"page {page}")
-            if section:
-                location.append(str(section))
-            snippet = citation.get("snippet")
-            label = source or "Reference"
-            tail = f" ({', '.join(location)})" if location else ""
-            if snippet:
-                snippet_text = ExportService._strip_html(snippet)
-                return f"{label}{tail}: {snippet_text}"
-            return f"{label}{tail}".strip()
+            data = dict(citation)
+            nested = data.get("citation")
+            if isinstance(nested, dict):
+                merged = dict(nested)
+                for key, value in data.items():
+                    if key not in merged:
+                        merged[key] = value
+                data = merged
+
+            label = (
+                str(
+                    data.get("source")
+                    or data.get("title")
+                    or data.get("document")
+                    or data.get("path")
+                    or data.get("file_path")
+                    or ""
+                ).strip()
+            )
+
+            def _format_range(
+                start: object,
+                end: object,
+                *,
+                singular: str,
+                plural: str,
+            ) -> str | None:
+                if start is not None:
+                    start_text = str(start).strip()
+                else:
+                    start_text = ""
+                if end is not None:
+                    end_text = str(end).strip()
+                else:
+                    end_text = ""
+                if start_text and end_text:
+                    if start_text == end_text:
+                        return f"{singular} {start_text}"
+                    return f"{plural} {start_text}–{end_text}"
+                if start_text:
+                    return f"{singular} {start_text}"
+                if end_text:
+                    return f"{singular} {end_text}"
+                return None
+
+            location_parts: list[str] = []
+
+            step_values: list[str] = []
+            steps = data.get("steps")
+            if isinstance(steps, Iterable) and not isinstance(steps, (str, bytes, dict)):
+                for value in steps:
+                    text = str(value).strip()
+                    if text:
+                        step_values.append(text)
+            else:
+                single_step = data.get("step") or data.get("step_index")
+                if single_step is not None:
+                    text = str(single_step).strip()
+                    if text:
+                        step_values.append(text)
+            if step_values:
+                prefix = "Step" if len(step_values) == 1 else "Steps"
+                location_parts.append(f"{prefix} {', '.join(step_values)}")
+
+            page_range = _format_range(
+                data.get("page_start") or data.get("page_begin"),
+                data.get("page_end") or data.get("page_finish"),
+                singular="Page",
+                plural="Pages",
+            )
+            if page_range:
+                location_parts.append(page_range)
+            else:
+                page = data.get("page") or data.get("page_number")
+                if page is not None and str(page).strip():
+                    location_parts.append(f"Page {str(page).strip()}")
+
+            line_range = _format_range(
+                data.get("line_start"),
+                data.get("line_end"),
+                singular="Line",
+                plural="Lines",
+            )
+            if line_range:
+                location_parts.append(line_range)
+            else:
+                line = data.get("line")
+                if line is not None and str(line).strip():
+                    location_parts.append(f"Line {str(line).strip()}")
+
+            timestamp_range = _format_range(
+                data.get("start_time") or data.get("time_start"),
+                data.get("end_time") or data.get("time_end"),
+                singular="Timestamp",
+                plural="Timestamps",
+            )
+            if timestamp_range:
+                location_parts.append(timestamp_range)
+            else:
+                timestamp = (
+                    data.get("timestamp")
+                    or data.get("time")
+                    or data.get("timecode")
+                    or data.get("locator")
+                )
+                if timestamp is not None and str(timestamp).strip():
+                    location_parts.append(f"Timestamp {str(timestamp).strip()}")
+
+            section = data.get("section") or data.get("heading")
+            if section is not None and str(section).strip():
+                location_parts.append(str(section).strip())
+
+            location_text = ", ".join(location_parts)
+
+            snippet_text: str | None = None
+            snippet_candidates = (
+                data.get("snippet_html"),
+                data.get("snippet"),
+                data.get("highlight"),
+                data.get("preview"),
+                data.get("text"),
+                data.get("content"),
+            )
+            for candidate in snippet_candidates:
+                if candidate:
+                    snippet_text = ExportService._strip_html(str(candidate))
+                    if snippet_text:
+                        break
+            if snippet_text:
+                snippet_text = snippet_text.strip()
+
+            metadata_text = data.get("metadata_text")
+            if metadata_text:
+                metadata_text = ExportService._strip_html(str(metadata_text)).strip()
+            else:
+                metadata = data.get("metadata")
+                if isinstance(metadata, dict):
+                    pairs: list[str] = []
+                    for key, value in metadata.items():
+                        if value is None:
+                            continue
+                        key_text = str(key).strip()
+                        value_text = str(value).strip()
+                        if key_text and value_text:
+                            pairs.append(f"{key_text}: {value_text}")
+                    metadata_text = "; ".join(pairs)
+                elif isinstance(metadata, Iterable) and not isinstance(metadata, (str, bytes, dict)):
+                    metadata_text = ", ".join(str(item).strip() for item in metadata if str(item).strip())
+                elif metadata is not None:
+                    metadata_text = ExportService._strip_html(str(metadata)).strip()
+
+            parts = [
+                label or "Reference",
+                location_text,
+                metadata_text or "",
+            ]
+            info = " · ".join(part for part in parts if part)
+            if snippet_text:
+                return f"{info} — {snippet_text}" if info else snippet_text
+            return info or "Reference"
         return str(citation)
 
     @staticmethod

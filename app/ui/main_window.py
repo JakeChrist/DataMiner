@@ -1559,45 +1559,54 @@ class MainWindow(QMainWindow):
         extra_options = self._build_extra_request_options(
             question, retrieval_documents=retrieval_documents or None
         )
-        try:
-            turn = self._conversation_manager.ask(
-                question,
-                context_snippets=context_snippets or None,
-                reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
-                response_mode=self.conversation_settings.response_mode,
-                preset=self.conversation_settings.answer_length,
-                extra_options=extra_options or None,
-                context_provider=step_context_provider,
-            )
-        except LMStudioError as exc:
+        def _handle_error(exc: LMStudioError) -> None:
             self.progress_service.finish("chat-send", "Send failed")
             self.progress_service.notify(str(exc) or "Failed to contact LMStudio", level="error")
             self.question_input.set_busy(False)
             self._update_question_prerequisites(self._conversation_manager.connection_state)
-            return
 
-        answered_at = datetime.now()
-        turn.asked_at = asked_at
-        turn.answered_at = answered_at
-        turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
-        turn.token_usage = self._extract_token_usage(turn)
-        review = getattr(turn, "adversarial_review", None)
-        if review and getattr(review, "revised", False):
-            self._show_toast(
-                "Answer revised for accuracy/clarity.",
-                level="info",
-                duration_ms=3500,
-            )
-        self._turns.append(turn)
-        self._update_session(turns=list(self._turns))
-        card = self.answer_view.add_turn(turn)
-        self._active_card = card
-        self._update_evidence_panel(turn)
-        self._update_export_actions()
-        finish_message = "Evidence refreshed" if triggered_by_scope else "Answer received"
-        self.progress_service.finish("chat-send", finish_message)
-        self.question_input.set_busy(False)
-        self._update_question_prerequisites(self._conversation_manager.connection_state)
+        def _handle_success(turn: ConversationTurn, answered_at: datetime) -> None:
+            turn.asked_at = asked_at
+            turn.answered_at = answered_at
+            turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
+            turn.token_usage = self._extract_token_usage(turn)
+            review = getattr(turn, "adversarial_review", None)
+            if review and getattr(review, "revised", False):
+                self._show_toast(
+                    "Answer revised for accuracy/clarity.",
+                    level="info",
+                    duration_ms=3500,
+                )
+            self._turns.append(turn)
+            self._update_session(turns=list(self._turns))
+            card = self.answer_view.add_turn(turn)
+            self._active_card = card
+            self._update_evidence_panel(turn)
+            self._update_export_actions()
+            finish_message = "Evidence refreshed" if triggered_by_scope else "Answer received"
+            self.progress_service.finish("chat-send", finish_message)
+            self.question_input.set_busy(False)
+            self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+        def worker() -> None:
+            try:
+                turn = self._conversation_manager.ask(
+                    question,
+                    context_snippets=context_snippets or None,
+                    reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
+                    response_mode=self.conversation_settings.response_mode,
+                    preset=self.conversation_settings.answer_length,
+                    extra_options=extra_options or None,
+                    context_provider=step_context_provider,
+                )
+            except LMStudioError as exc:
+                QTimer.singleShot(0, partial(_handle_error, exc))
+                return
+
+            answered_at = datetime.now()
+            QTimer.singleShot(0, partial(_handle_success, turn, answered_at))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _build_extra_request_options(
         self,

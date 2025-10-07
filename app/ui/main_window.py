@@ -65,13 +65,14 @@ from ..services.progress_service import ProgressService, ProgressUpdate
 from ..services.project_service import ProjectRecord, ProjectService
 from ..services.backup_service import BackupService
 from ..services.export_service import ExportService
-from ..services.settings_service import SettingsService
+from ..services.settings_service import SettingsService, ChatStyleSettings
 from ..storage import DatabaseError
 from ..logging import get_log_file_path
-from .answer_view import AnswerView, TurnCardWidget
+from .answer_view import AnswerView, ChatTurnWidget
 from .evidence_panel import EvidencePanel
 from .question_input_widget import QuestionInputWidget
 from .log_viewer_dialog import LogViewerDialog
+from .settings_dialog import SettingsDialog
 
 
 LOGGER = logging.getLogger(__name__)
@@ -181,7 +182,7 @@ class MainWindow(QMainWindow):
         )
         self._current_retrieval_scope: dict[str, list[str]] = {"include": [], "exclude": []}
         self._last_question: str | None = None
-        self._active_card: TurnCardWidget | None = None
+        self._active_card: ChatTurnWidget | None = None
         self._has_documents: bool = False
         self._toast = ToastWidget(self)
         self._rescan_button: QPushButton | None = None
@@ -445,6 +446,7 @@ class MainWindow(QMainWindow):
             parent=chat_panel,
         )
         self.answer_view.setObjectName("answerView")
+        self.answer_view.apply_colors(self.settings_service.chat_style)
         self.answer_view.citation_activated.connect(self._on_card_citation)
         chat_layout.addWidget(self.answer_view, 1)
 
@@ -1426,6 +1428,7 @@ class MainWindow(QMainWindow):
         self.settings_service.theme_changed.connect(self._apply_theme)
         self.settings_service.font_scale_changed.connect(self._apply_font_scale)
         self.settings_service.density_changed.connect(self._apply_density)
+        self.settings_service.chat_style_changed.connect(self._on_chat_style_changed)
         self.progress_service.progress_started.connect(self._on_progress_started)
         self.progress_service.progress_updated.connect(self._on_progress_updated)
         self.progress_service.progress_finished.connect(self._on_progress_finished)
@@ -1444,6 +1447,9 @@ class MainWindow(QMainWindow):
             self._on_answer_length_changed
         )
         self.conversation_settings.model_changed.connect(self._on_model_changed)
+
+    def _on_chat_style_changed(self, style: ChatStyleSettings) -> None:
+        self.answer_view.apply_colors(style)
 
     def _on_reasoning_verbosity_changed(self, index: int) -> None:
         data = self._verbosity_combo.itemData(index)
@@ -1784,7 +1790,7 @@ class MainWindow(QMainWindow):
         self._update_scope_chip()
         self.answer_view.highlight_citation(self._active_card, None)
 
-    def _on_card_citation(self, card: TurnCardWidget, index: int) -> None:
+    def _on_card_citation(self, card: ChatTurnWidget, index: int) -> None:
         if card is not self._active_card:
             self._active_card = card
             self._evidence_panel.set_evidence(card.turn.citations)
@@ -1836,7 +1842,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _open_settings(self) -> None:
-        QMessageBox.information(self, "Settings", "Settings dialog coming soon.")
+        dialog = SettingsDialog(settings_service=self.settings_service, parent=self)
+        dialog.exec()
 
     def _open_help(self) -> None:
         QMessageBox.information(self, "Help", "Visit the documentation for assistance.")

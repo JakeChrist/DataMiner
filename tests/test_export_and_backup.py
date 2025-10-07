@@ -107,6 +107,30 @@ def test_export_service_formats_rich_citations() -> None:
     assert "Confidence: Medium; Reviewer: Alice" in html
 
 
+def test_export_service_links_citations_inline() -> None:
+    export = ExportService()
+    citation = {
+        "source": "Doc A",
+        "snippet": "Finding",
+        "url": "https://example.com/doc",
+    }
+    turn = ConversationTurn(
+        question="Where is the detail?",
+        answer="Look at the document [1] and note NASA [NASA].",
+        citations=[citation],
+    )
+
+    markdown = export.conversation_to_markdown([turn])
+    assert "[1](https://example.com/doc)" in markdown
+    assert "<a id=\"citation-1\"></a>Doc A" in markdown
+    assert "[NASA]" in markdown
+
+    html = export.conversation_to_html([turn])
+    assert "<a href=\"https://example.com/doc\" class='citation-ref'>[1]</a>" in html
+    assert "<li id='citation-1'" in html
+    assert "[NASA]" in html
+
+
 def test_project_service_lifecycle_and_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     service = build_project_service(tmp_path)

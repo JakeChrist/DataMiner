@@ -169,10 +169,20 @@ class DatabaseManager:
 
     def export_database(self, destination: str | Path) -> Path:
         """Create a consistent snapshot of the database at ``destination``."""
+
         destination_path = Path(destination)
-        if destination_path.is_dir():
+
+        if destination_path.exists() and destination_path.is_dir():
+            target_directory = destination_path
+        elif not destination_path.exists() and not destination_path.suffix:
+            destination_path.mkdir(parents=True, exist_ok=True)
+            target_directory = destination_path
+        else:
+            target_directory = None
+
+        if target_directory is not None:
             timestamp = _dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            destination_path = destination_path / f"{self.path.stem}-backup-{timestamp}.db"
+            destination_path = target_directory / f"{self.path.stem}-backup-{timestamp}.db"
         if not destination_path.parent.exists():
             destination_path.parent.mkdir(parents=True, exist_ok=True)
         connection = self.connect()

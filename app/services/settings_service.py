@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 from typing import Any, Iterable
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -29,6 +29,35 @@ def _clamp(value: float, *, low: float, high: float) -> float:
     return float(min(high, max(low, value)))
 
 
+def _normalize_color(value: Any, *, fallback: str) -> str:
+    """Return a normalized hex color string or the fallback if invalid."""
+
+    if isinstance(value, str):
+        candidate = QColor(value)
+    elif isinstance(value, (tuple, list)) and len(value) >= 3:
+        candidate = QColor(*value)
+    else:
+        candidate = QColor()
+    if not candidate.isValid():
+        candidate = QColor(fallback)
+    if not candidate.isValid():
+        candidate = QColor("#000000")
+    return candidate.name()
+
+
+@dataclass(slots=True)
+class ChatStyleSettings:
+    """Themeable colors used by the chat style answer view."""
+
+    ai_bubble_color: str = "#315389"
+    user_bubble_color: str = "#ffffff"
+    code_block_background: str = "#1f2530"
+    citation_accent: str = "#d8893a"
+
+    def as_dict(self) -> dict[str, str]:
+        return asdict(self)  # type: ignore[return-value]
+
+
 @dataclass(slots=True)
 class UISettings:
     """Container for persisted UI settings."""
@@ -39,6 +68,7 @@ class UISettings:
     splitter_sizes: tuple[int, int, int] = DEFAULT_SPLITTER_SIZES
     show_corpus_panel: bool = True
     show_evidence_panel: bool = True
+    chat_style: ChatStyleSettings = field(default_factory=ChatStyleSettings)
 
 
 class SettingsService(QObject):
@@ -47,6 +77,7 @@ class SettingsService(QObject):
     theme_changed = pyqtSignal(str)
     font_scale_changed = pyqtSignal(float)
     density_changed = pyqtSignal(str)
+    chat_style_changed = pyqtSignal(object)
 
     @log_call(logger=logger)
     def __init__(self, config_manager: ConfigManager | None = None) -> None:
@@ -91,6 +122,24 @@ class SettingsService(QObject):
             splitter_sizes = DEFAULT_SPLITTER_SIZES
         show_corpus = bool(ui_settings.get("show_corpus_panel", True))
         show_evidence = bool(ui_settings.get("show_evidence_panel", True))
+        chat_data = ui_settings.get("chat_style", {})
+        if not isinstance(chat_data, dict):
+            chat_data = {}
+        defaults = ChatStyleSettings()
+        chat_style = ChatStyleSettings(
+            ai_bubble_color=_normalize_color(
+                chat_data.get("ai_bubble"), fallback=defaults.ai_bubble_color
+            ),
+            user_bubble_color=_normalize_color(
+                chat_data.get("user_bubble"), fallback=defaults.user_bubble_color
+            ),
+            code_block_background=_normalize_color(
+                chat_data.get("code_background"), fallback=defaults.code_block_background
+            ),
+            citation_accent=_normalize_color(
+                chat_data.get("citation_accent"), fallback=defaults.citation_accent
+            ),
+        )
         self._settings = UISettings(
             theme=theme,
             font_scale=font_scale,
@@ -98,6 +147,7 @@ class SettingsService(QObject):
             splitter_sizes=splitter_sizes,
             show_corpus_panel=show_corpus,
             show_evidence_panel=show_evidence,
+            chat_style=chat_style,
         )
         self._base_font_point_size = None
 
@@ -119,6 +169,7 @@ class SettingsService(QObject):
                 "splitter_sizes": list(self._settings.splitter_sizes),
                 "show_corpus_panel": self._settings.show_corpus_panel,
                 "show_evidence_panel": self._settings.show_evidence_panel,
+                "chat_style": self._settings.chat_style.as_dict(),
             }
         )
         data["ui"] = ui_data
@@ -149,6 +200,16 @@ class SettingsService(QObject):
     @property
     def show_evidence_panel(self) -> bool:
         return self._settings.show_evidence_panel
+
+    @property
+    def chat_style(self) -> ChatStyleSettings:
+        style = self._settings.chat_style
+        return ChatStyleSettings(
+            ai_bubble_color=style.ai_bubble_color,
+            user_bubble_color=style.user_bubble_color,
+            code_block_background=style.code_block_background,
+            citation_accent=style.citation_accent,
+        )
 
     # ------------------------------------------------------------------
     # Mutators
@@ -218,6 +279,36 @@ class SettingsService(QObject):
         self._settings.show_evidence_panel = value
         self.save()
 
+    @log_call(logger=logger)
+    def set_chat_style(
+        self,
+        *,
+        ai_bubble_color: str | None = None,
+        user_bubble_color: str | None = None,
+        code_block_background: str | None = None,
+        citation_accent: str | None = None,
+    ) -> None:
+        current = self._settings.chat_style
+        updated = ChatStyleSettings(
+            ai_bubble_color=_normalize_color(
+                ai_bubble_color, fallback=current.ai_bubble_color
+            ),
+            user_bubble_color=_normalize_color(
+                user_bubble_color, fallback=current.user_bubble_color
+            ),
+            code_block_background=_normalize_color(
+                code_block_background, fallback=current.code_block_background
+            ),
+            citation_accent=_normalize_color(
+                citation_accent, fallback=current.citation_accent
+            ),
+        )
+        if updated == current:
+            return
+        self._settings.chat_style = updated
+        self.save()
+        self.chat_style_changed.emit(self.chat_style)
+
     # ------------------------------------------------------------------
     # Application helpers
     def apply_theme(self, app: QApplication | None = None) -> None:
@@ -285,24 +376,43 @@ class SettingsService(QObject):
                 background-color: {window_hex};
                 color: {text_hex};
             }}
-            QFrame#turnCard {{
-                background-color: {surface_hex};
-                border-radius: 12px;
+            QFrame#chatBubble_user, QFrame#chatBubble_assistant {{
                 border: 1px solid {border_hex};
             }}
-            QFrame#turnCard QLabel#turnMetadata {{
+            QLabel#bubbleMeta, QLabel#typingIndicator {{
                 color: {muted_hex};
             }}
-            QTextBrowser {{
+            QFrame#planSection {{
                 background-color: {surface_hex};
                 border-radius: 10px;
                 border: 1px solid {border_hex};
-                padding: 8px;
+                padding: 8px 12px;
+            }}
+            QToolButton#planChip {{
+                background-color: {surface_hex};
+                border-radius: 14px;
+                border: 1px solid {border_hex};
+                padding: 2px 10px;
+            }}
+            QToolButton#planChip:checked {{
+                background-color: {accent_hex};
+                color: #0b0d11;
+                border-color: {accent_hex};
+            }}
+            QFrame#codeBlock {{
+                border: 1px solid {border_hex};
+            }}
+            QPlainTextEdit#codeEditor {{
+                color: {text_hex};
+            }}
+            QTextBrowser {{
+                background-color: transparent;
+                border: none;
             }}
             QPushButton, QToolButton {{
                 background-color: {surface_hex};
                 border: 1px solid {border_hex};
-                border-radius: 18px;
+                border-radius: 16px;
                 padding: 4px 12px;
             }}
             QPushButton:disabled, QToolButton:disabled {{
@@ -351,17 +461,6 @@ class SettingsService(QObject):
                 background-color: {error_hex};
                 color: #0b0d11;
                 border-color: {error_hex};
-            }}
-            QListWidget#evidenceList {{
-                background-color: {surface_hex};
-                border-radius: 12px;
-                border: 1px solid {border_hex};
-                padding: 4px;
-            }}
-            QTreeWidget#corpusSelector {{
-                background-color: {surface_hex};
-                border-radius: 12px;
-                border: 1px solid {border_hex};
             }}
         """
         app.setStyleSheet(stylesheet)

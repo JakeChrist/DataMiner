@@ -887,6 +887,11 @@ class AnswerView(QScrollArea):
     def turns(self) -> list[ChatTurnWidget]:
         return list(self._turns)
 
+    @property
+    def cards(self) -> list[ChatTurnWidget]:
+        """Compatibility alias for legacy code that expects chat cards."""
+        return self.turns
+
     def clear(self) -> None:
         for turn in self._turns:
             turn.setParent(None)

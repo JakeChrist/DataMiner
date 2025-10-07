@@ -2500,7 +2500,7 @@ class ConversationManager:
         if not answer or not citations:
             return answer
 
-        if ConversationManager._CITATION_PATTERN.search(answer):
+        if ConversationManager._NUMERIC_CITATION_PATTERN.search(answer):
             return answer
 
         fragments: list[dict[str, Any]] = []
@@ -2806,6 +2806,7 @@ class ConversationManager:
         }
         return sorted(indexes)
 
+    _NUMERIC_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
     _DOC_REFERENCE_PAREN_PATTERN = re.compile(r"\(([^()]*)\)")
     _SENTENCE_FRAGMENT_PATTERN = re.compile(r"[^.!?\n]+[.!?]?")

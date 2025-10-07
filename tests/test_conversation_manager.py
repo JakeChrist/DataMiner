@@ -77,6 +77,22 @@ def test_ensure_answer_citation_markers_handles_bullet_lists():
     assert cited == "- First finding [1]\n- Second finding [2]"
 
 
+def test_ensure_answer_citation_markers_ignores_bracketed_words() -> None:
+    answer = "Key point references NASA [NASA]."
+    citations = [
+        {
+            "id": "doc-1",
+            "snippet": "<mark>Key point references NASA</mark> with context.",
+        }
+    ]
+
+    cited = ConversationManager._ensure_answer_citation_markers(answer, citations)
+
+    assert cited.endswith("[1]")
+    assert cited.count("[1]") == 1
+    assert "[NASA]" in cited
+
+
 def test_strip_citation_markers_removes_doc_and_requirement_references() -> None:
     text = "Handles example (DOC23 chunk 1, DOC21 R-021)."
 

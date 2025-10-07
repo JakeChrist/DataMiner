@@ -8,7 +8,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from PyQt6.QtCore import (
     QAbstractAnimation,
@@ -21,8 +21,9 @@ from PyQt6.QtCore import (
     Qt,
     QTimer,
     pyqtSignal,
+    QUrl,
 )
-from PyQt6.QtGui import QColor, QCursor, QTextOption, QWheelEvent
+from PyQt6.QtGui import QColor, QCursor, QTextOption, QWheelEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractScrollArea,
     QApplication,
@@ -159,7 +160,13 @@ def _forward_wheel_event_to_scroll_parent(widget: QWidget, event: QWheelEvent) -
     return False
 
 
-def _render_inline_html(text: str, *, highlight: int | None, accent: str) -> tuple[str, bool]:
+def _render_inline_html(
+    text: str,
+    *,
+    highlight: int | None,
+    accent: str,
+    href_lookup: Callable[[int], str | None] | None = None,
+) -> tuple[str, bool]:
     """Return HTML for a paragraph/list item with inline styling."""
 
     fragments: list[str] = []
@@ -182,9 +189,18 @@ def _render_inline_html(text: str, *, highlight: int | None, accent: str) -> tup
         if highlight == index:
             classes.append("selected")
         joined = " ".join(classes)
+        title_attr = ""
+        if href_lookup:
+            try:
+                target = href_lookup(index)
+            except Exception:  # pragma: no cover - defensive
+                target = None
+            if target:
+                escaped_target = html.escape(target, quote=True)
+                title_attr = f" title='{escaped_target}' data-href='{escaped_target}'"
         return (
             f"<a href='cite-{index}' class='{joined}' data-citation='{index}' "
-            f"style='color:{accent};text-decoration:none;'>[{index}]</a>"
+            f"style='color:{accent};text-decoration:none;'{title_attr}>[{index}]</a>"
         )
 
     html_text = _CITATION_RE.sub(_replace, escaped)
@@ -246,6 +262,7 @@ class TextBlockWidget(QTextBrowser):
         accent: str,
         text_color: str | None = None,
         highlight: int | None = None,
+        citation_href_lookup: Callable[[int], str | None] | None = None,
     ) -> None:
         super().__init__()
         self.setReadOnly(True)
@@ -263,6 +280,7 @@ class TextBlockWidget(QTextBrowser):
         self._text_color = text_color
         self._has_citation = False
         self._sources_only = False
+        self._citation_href_lookup = citation_href_lookup
         self.anchorClicked.connect(self._on_anchor)
         self.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -301,7 +319,10 @@ class TextBlockWidget(QTextBrowser):
 
     def _render(self) -> None:
         html_text, has_citation = _render_inline_html(
-            self._raw_text, highlight=self._highlight, accent=self._accent
+            self._raw_text,
+            highlight=self._highlight,
+            accent=self._accent,
+            href_lookup=self._citation_href_lookup,
         )
         self._has_citation = has_citation
         style_attr = f" style='color:{self._text_color};'" if self._text_color else ""
@@ -321,6 +342,15 @@ class TextBlockWidget(QTextBrowser):
             except (ValueError, IndexError):
                 return
             self.citation_activated.emit(index)
+            if self._citation_href_lookup:
+                try:
+                    href = self._citation_href_lookup(index)
+                except Exception:  # pragma: no cover - defensive
+                    href = None
+                if href:
+                    resolved = QUrl.fromUserInput(href)
+                    if resolved.isValid():
+                        QDesktopServices.openUrl(resolved)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # pragma: no cover - UI interaction
         if _forward_wheel_event_to_scroll_parent(self, event):
@@ -956,7 +986,12 @@ class AssistantBubbleWidget(ChatBubbleWidget):
                 container.setContentsMargins(0, 0, 0, 0)
                 container.setSpacing(4)
                 for item in block.items:
-                    text_widget = TextBlockWidget(item, accent=accent, text_color=text_color)
+                    text_widget = TextBlockWidget(
+                        item,
+                        accent=accent,
+                        text_color=text_color,
+                        citation_href_lookup=self._citation_href,
+                    )
                     text_widget.citation_activated.connect(self._on_citation_activated)
                     self._text_blocks.append(text_widget)
                     container.addWidget(text_widget)
@@ -965,7 +1000,12 @@ class AssistantBubbleWidget(ChatBubbleWidget):
                 wrapper.setObjectName("listWrapper")
                 self.add_widget(wrapper)
             else:
-                text_widget = TextBlockWidget(block.text, accent=accent, text_color=text_color)
+                text_widget = TextBlockWidget(
+                    block.text,
+                    accent=accent,
+                    text_color=text_color,
+                    citation_href_lookup=self._citation_href,
+                )
                 text_widget.citation_activated.connect(self._on_citation_activated)
                 self._text_blocks.append(text_widget)
                 self.add_widget(text_widget)
@@ -1266,6 +1306,11 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         should_show = self._plan_has_rows or visible_assumptions
         self._plan_section.setVisible(should_show)
 
+    def _citation_href(self, index: int) -> str | None:
+        if index < 1 or index > len(self.turn.citations):
+            return None
+        return _extract_citation_link(self.turn.citations[index - 1])
+
 
 def _describe_citation(citation: Any) -> tuple[str, str]:
     if isinstance(citation, dict):
@@ -1279,6 +1324,18 @@ def _describe_citation(citation: Any) -> tuple[str, str]:
         snippet = str(citation.get("snippet") or citation.get("preview") or "")
         return title, snippet
     return str(citation), ""
+
+
+def _extract_citation_link(citation: Any) -> str | None:
+    if isinstance(citation, dict):
+        for key in ("url", "href", "link"):
+            value = citation.get(key)
+            if value:
+                return str(value)
+        nested = citation.get("citation")
+        if isinstance(nested, dict):
+            return _extract_citation_link(nested)
+    return None
 
 
 class ChatTurnWidget(QFrame):

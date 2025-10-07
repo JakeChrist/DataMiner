@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import textwrap
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -1437,6 +1438,7 @@ class ConversationManager:
         self._judge = _AdversarialJudge()
         self._plan_critic = _PlanCritic()
         self._judge_log: deque[dict[str, Any]] = deque(maxlen=50)
+        self._lock = threading.RLock()
 
     def add_connection_listener(
         self, listener: Callable[[ConnectionState], None]
@@ -1484,36 +1486,46 @@ class ConversationManager:
     ) -> ConversationTurn:
         """Send ``question`` to LMStudio and append the resulting turn."""
 
-        sanitized_question = question.strip()
-        preview = sanitized_question[:120]
-        logger.info(
-            "Received question",
-            extra={
-                "question_preview": preview,
-                "preset": preset.value,
-                "response_mode": response_mode.value,
-                "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
-                "context_snippet_count": len(context_snippets or []),
-                "planning_enabled": context_provider is not None,
-            },
-        )
+        with self._lock:
+            sanitized_question = question.strip()
+            preview = sanitized_question[:120]
+            logger.info(
+                "Received question",
+                extra={
+                    "question_preview": preview,
+                    "preset": preset.value,
+                    "response_mode": response_mode.value,
+                    "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
+                    "context_snippet_count": len(context_snippets or []),
+                    "planning_enabled": context_provider is not None,
+                },
+            )
 
-        if not self._connected:
-            message = self._connection_error or "LMStudio is disconnected."
-            raise LMStudioConnectionError(message)
+            if not self._connected:
+                message = self._connection_error or "LMStudio is disconnected."
+                raise LMStudioConnectionError(message)
 
-        if context_provider is not None:
-            try:
-                turn = self._ask_with_plan(
-                    question,
-                    context_snippets=context_snippets,
-                    preset=preset,
-                    reasoning_verbosity=reasoning_verbosity,
-                    response_mode=response_mode,
-                    extra_options=extra_options,
-                    context_provider=context_provider,
-                )
-            except DynamicPlanningError:
+            if context_provider is not None:
+                try:
+                    turn = self._ask_with_plan(
+                        question,
+                        context_snippets=context_snippets,
+                        preset=preset,
+                        reasoning_verbosity=reasoning_verbosity,
+                        response_mode=response_mode,
+                        extra_options=extra_options,
+                        context_provider=context_provider,
+                    )
+                except DynamicPlanningError:
+                    turn = self._ask_single_shot(
+                        question,
+                        context_snippets=context_snippets,
+                        preset=preset,
+                        reasoning_verbosity=reasoning_verbosity,
+                        response_mode=response_mode,
+                        extra_options=extra_options,
+                    )
+            else:
                 turn = self._ask_single_shot(
                     question,
                     context_snippets=context_snippets,
@@ -1522,26 +1534,17 @@ class ConversationManager:
                     response_mode=response_mode,
                     extra_options=extra_options,
                 )
-        else:
-            turn = self._ask_single_shot(
-                question,
-                context_snippets=context_snippets,
-                preset=preset,
-                reasoning_verbosity=reasoning_verbosity,
-                response_mode=response_mode,
-                extra_options=extra_options,
+            logger.info(
+                "Completed question",
+                extra={
+                    "question_preview": preview,
+                    "response_mode": response_mode.value,
+                    "plan_step_count": len(turn.plan),
+                    "step_result_count": len(getattr(turn, "step_results", [])),
+                    "citation_count": len(turn.citations),
+                },
             )
-        logger.info(
-            "Completed question",
-            extra={
-                "question_preview": preview,
-                "response_mode": response_mode.value,
-                "plan_step_count": len(turn.plan),
-                "step_result_count": len(getattr(turn, "step_results", [])),
-                "citation_count": len(turn.citations),
-            },
-        )
-        return turn
+            return turn
 
     @log_call(logger=logger, level=logging.DEBUG, include_args=False)
     def _ask_single_shot(

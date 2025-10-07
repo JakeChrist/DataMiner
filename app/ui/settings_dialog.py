@@ -63,7 +63,9 @@ class SettingsDialog(QDialog):
 
     _CHAT_CONTROLS = (
         _ColorControl("AI bubble", "ai_bubble_color"),
+        _ColorControl("AI text", "ai_text_color"),
         _ColorControl("User bubble", "user_bubble_color"),
+        _ColorControl("User text", "user_text_color"),
         _ColorControl("Code background", "code_block_background"),
         _ColorControl("Citation accent", "citation_accent"),
     )

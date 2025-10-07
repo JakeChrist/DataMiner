@@ -20,7 +20,6 @@ from PyQt6.QtCore import (
     QSize,
     Qt,
     QTimer,
-    QWIDGETSIZE_MAX,
     pyqtSignal,
 )
 from PyQt6.QtGui import QColor, QCursor, QTextOption, QWheelEvent
@@ -38,6 +37,7 @@ from PyQt6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWIDGETSIZE_MAX,
 )
 
 from ..services.conversation_manager import ConversationTurn

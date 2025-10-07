@@ -24,6 +24,9 @@ MIN_FONT_SCALE = 0.5
 MAX_FONT_SCALE = 2.5
 
 
+_UNSET = object()
+
+
 @log_call(logger=logger, include_result=True)
 def _clamp(value: float, *, low: float, high: float) -> float:
     return float(min(high, max(low, value)))
@@ -64,6 +67,8 @@ class UISettings:
 
     theme: str = DEFAULT_THEME
     font_scale: float = 1.0
+    font_family: str | None = None
+    font_point_size: float | None = None
     density: str = DEFAULT_DENSITY
     splitter_sizes: tuple[int, int, int] = DEFAULT_SPLITTER_SIZES
     show_corpus_panel: bool = True
@@ -76,6 +81,8 @@ class SettingsService(QObject):
 
     theme_changed = pyqtSignal(str)
     font_scale_changed = pyqtSignal(float)
+    font_family_changed = pyqtSignal(object)
+    font_point_size_changed = pyqtSignal(object)
     density_changed = pyqtSignal(str)
     chat_style_changed = pyqtSignal(object)
 
@@ -122,6 +129,20 @@ class SettingsService(QObject):
             splitter_sizes = DEFAULT_SPLITTER_SIZES
         show_corpus = bool(ui_settings.get("show_corpus_panel", True))
         show_evidence = bool(ui_settings.get("show_evidence_panel", True))
+        family_value = ui_settings.get("font_family")
+        if isinstance(family_value, str):
+            normalized_family = family_value.strip()
+            font_family = normalized_family or None
+        else:
+            font_family = None
+        size_value = ui_settings.get("font_point_size")
+        font_point_size: float | None
+        try:
+            font_point_size = float(size_value)
+        except (TypeError, ValueError):
+            font_point_size = None
+        if font_point_size is not None and font_point_size <= 0:
+            font_point_size = None
         chat_data = ui_settings.get("chat_style", {})
         if not isinstance(chat_data, dict):
             chat_data = {}
@@ -143,6 +164,8 @@ class SettingsService(QObject):
         self._settings = UISettings(
             theme=theme,
             font_scale=font_scale,
+            font_family=font_family,
+            font_point_size=font_point_size,
             density=density,
             splitter_sizes=splitter_sizes,
             show_corpus_panel=show_corpus,
@@ -165,6 +188,8 @@ class SettingsService(QObject):
             {
                 "theme": self._settings.theme,
                 "font_scale": self._settings.font_scale,
+                "font_family": self._settings.font_family,
+                "font_point_size": self._settings.font_point_size,
                 "density": self._settings.density,
                 "splitter_sizes": list(self._settings.splitter_sizes),
                 "show_corpus_panel": self._settings.show_corpus_panel,
@@ -184,6 +209,14 @@ class SettingsService(QObject):
     @property
     def font_scale(self) -> float:
         return self._settings.font_scale
+
+    @property
+    def font_family(self) -> str | None:
+        return self._settings.font_family
+
+    @property
+    def font_point_size(self) -> float | None:
+        return self._settings.font_point_size
 
     @property
     def density(self) -> str:
@@ -240,6 +273,57 @@ class SettingsService(QObject):
         self.save()
         logger.info("Font scale changed", extra={"font_scale": value})
         self.font_scale_changed.emit(value)
+        self.apply_font_preferences()
+
+    @log_call(logger=logger)
+    def set_font_preferences(
+        self,
+        *,
+        family: str | None | object = _UNSET,
+        point_size: float | None | object = _UNSET,
+    ) -> None:
+        self._ensure_base_font_point_size()
+        current_family = self._settings.font_family
+        current_size = self._settings.font_point_size
+        new_family = current_family
+        new_size = current_size
+
+        if family is not _UNSET:
+            if isinstance(family, QFont):
+                normalized_family = family.family().strip() or None
+            elif isinstance(family, str):
+                normalized_family = family.strip() or None
+            elif family is None:
+                normalized_family = None
+            else:
+                normalized_family = None
+            new_family = normalized_family
+
+        if point_size is not _UNSET:
+            if point_size is None:
+                normalized_size = None
+            else:
+                try:
+                    numeric = float(point_size)
+                except (TypeError, ValueError):
+                    return
+                if numeric <= 0:
+                    normalized_size = None
+                else:
+                    normalized_size = numeric
+            new_size = normalized_size
+
+        if new_family == current_family and new_size == current_size:
+            return
+
+        self._settings.font_family = new_family
+        self._settings.font_point_size = new_size
+        self.save()
+        if new_family != current_family:
+            self.font_family_changed.emit(new_family)
+        if new_size != current_size:
+            self.font_point_size_changed.emit(new_size)
+        self.apply_font_preferences()
 
     @log_call(logger=logger)
     def set_density(self, density: str) -> None:
@@ -465,20 +549,52 @@ class SettingsService(QObject):
         """
         app.setStyleSheet(stylesheet)
 
-    def apply_font_scale(self, app: QApplication | None = None) -> None:
-        """Scale the application's default font according to settings."""
+    def apply_font_preferences(self, app: QApplication | None = None) -> None:
+        """Apply the configured font family and size to the application."""
 
         app = app or QApplication.instance()
         if app is None:
             return
         default_font = QFont(app.font())
-        if self._base_font_point_size is None:
+        if self._settings.font_family:
+            default_font.setFamily(self._settings.font_family)
+
+        base_point_size = self._settings.font_point_size
+        if base_point_size is None:
+            self._ensure_base_font_point_size(default_font)
             point_size = default_font.pointSizeF()
             if point_size <= 0:
                 point_size = float(default_font.pointSize())
-            self._base_font_point_size = point_size or 10.0
-        default_font.setPointSizeF(self._base_font_point_size * self._settings.font_scale)
+            if point_size <= 0:
+                point_size = 10.0
+            self._base_font_point_size = self._base_font_point_size or point_size
+            base_point_size = self._base_font_point_size
+        else:
+            base_point_size = float(base_point_size)
+
+        default_font.setPointSizeF(base_point_size * self._settings.font_scale)
         app.setFont(default_font)
+
+    def apply_font_scale(self, app: QApplication | None = None) -> None:
+        """Backward compatible wrapper to apply font preferences."""
+
+        self.apply_font_preferences(app)
+
+    def _ensure_base_font_point_size(self, font: QFont | None = None) -> None:
+        if self._base_font_point_size is not None:
+            return
+        if font is None:
+            app = QApplication.instance()
+            if app is not None:
+                font = QFont(app.font())
+            else:
+                font = QFont()
+        point_size = font.pointSizeF()
+        if point_size <= 0:
+            point_size = float(font.pointSize())
+        if point_size <= 0:
+            point_size = 10.0
+        self._base_font_point_size = point_size
 
 
 __all__ = ["SettingsService", "UISettings", "DEFAULT_THEME"]

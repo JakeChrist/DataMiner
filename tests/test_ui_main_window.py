@@ -14,6 +14,7 @@ pytest.importorskip(
 )
 
 from PyQt6.QtCore import QUrl
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QApplication, QSplitter, QPushButton
 
 from app.config import ConfigManager
@@ -198,10 +199,14 @@ def test_settings_persist_theme_and_font(tmp_path, monkeypatch):
     settings_service = build_settings_service(tmp_path, monkeypatch)
     settings_service.set_theme("dark")
     settings_service.set_font_scale(1.5)
+    default_family = QFont().defaultFamily()
+    settings_service.set_font_preferences(family=default_family, point_size=14.0)
 
     reloaded = build_settings_service(tmp_path, monkeypatch)
     assert reloaded.theme == "dark"
     assert reloaded.font_scale == pytest.approx(1.5)
+    assert reloaded.font_family == default_family
+    assert reloaded.font_point_size == pytest.approx(14.0)
 
 
 def test_submission_flow_and_controls(qt_app, tmp_path, monkeypatch, project_service):

@@ -12,15 +12,18 @@ from typing import Any, Iterable
 
 from PyQt6.QtCore import (
     QAbstractAnimation,
+    QEvent,
     QEasingCurve,
     QPoint,
+    QPointF,
     QPropertyAnimation,
     Qt,
     QTimer,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QCursor, QTextOption
+from PyQt6.QtGui import QColor, QCursor, QTextOption, QWheelEvent
 from PyQt6.QtWidgets import (
+    QAbstractScrollArea,
     QApplication,
     QFrame,
     QHBoxLayout,
@@ -124,6 +127,34 @@ def _parse_blocks(text: str) -> list[MessageBlock]:
             index += 1
         blocks.append(MessageBlock(type="paragraph", text="\n".join(paragraph_lines)))
     return blocks
+
+
+def _forward_wheel_event_to_scroll_parent(widget: QWidget, event: QWheelEvent) -> bool:
+    """Forward wheel events to the nearest ancestor scroll area."""
+
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QAbstractScrollArea):
+            viewport = parent.viewport()
+            if viewport is None:
+                break
+            mapped_pos = viewport.mapFromGlobal(event.globalPosition().toPoint())
+            forwarded = QWheelEvent(
+                QPointF(mapped_pos),
+                event.globalPosition(),
+                event.pixelDelta(),
+                event.angleDelta(),
+                event.buttons(),
+                event.modifiers(),
+                event.phase(),
+                event.inverted(),
+            )
+            QApplication.sendEvent(viewport, forwarded)
+            if forwarded.isAccepted():
+                event.accept()
+                return True
+        parent = parent.parentWidget()
+    return False
 
 
 def _render_inline_html(text: str, *, highlight: int | None, accent: str) -> tuple[str, bool]:
@@ -233,6 +264,7 @@ class TextBlockWidget(QTextBrowser):
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
+        self.viewport().installEventFilter(self)
         self._render()
 
     @property
@@ -278,6 +310,17 @@ class TextBlockWidget(QTextBrowser):
             except (ValueError, IndexError):
                 return
             self.citation_activated.emit(index)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # pragma: no cover - UI interaction
+        if _forward_wheel_event_to_scroll_parent(self, event):
+            return
+        super().wheelEvent(event)
+
+    def eventFilter(self, obj, event):  # pragma: no cover - UI interaction
+        if obj is self.viewport() and event.type() == QEvent.Type.Wheel:
+            if _forward_wheel_event_to_scroll_parent(self, event):
+                return True
+        return super().eventFilter(obj, event)
 
 
 class CodeBlockWidget(QFrame):
@@ -326,6 +369,7 @@ class CodeBlockWidget(QFrame):
         self._editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self._editor.viewport().installEventFilter(self)
         layout.addWidget(self._editor)
 
         self._apply_background()
@@ -383,6 +427,12 @@ class CodeBlockWidget(QFrame):
 
     def _copy_code(self) -> None:  # pragma: no cover - clipboard access
         QApplication.clipboard().setText(self._code)
+
+    def eventFilter(self, obj, event):  # pragma: no cover - UI interaction
+        if obj is self._editor.viewport() and event.type() == QEvent.Type.Wheel:
+            if _forward_wheel_event_to_scroll_parent(self, event):
+                return True
+        return super().eventFilter(obj, event)
 
 
 class CollapsibleSection(QFrame):

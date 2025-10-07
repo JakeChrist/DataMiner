@@ -18,6 +18,8 @@ from PyQt6.QtCore import (
     Qt,
     QTimer,
     QUrl,
+    Q_ARG,
+    pyqtSlot,
 )
 from PyQt6.QtGui import (
     QAction,
@@ -1609,19 +1611,31 @@ class MainWindow(QMainWindow):
             except LMStudioError as exc:
                 QMetaObject.invokeMethod(
                     self,
-                    lambda exc=exc: _handle_error(exc),
+                    "_invoke_on_ui",
                     Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(object, lambda exc=exc: _handle_error(exc)),
                 )
                 return
 
             answered_at = datetime.now()
             QMetaObject.invokeMethod(
                 self,
-                lambda turn=turn, answered_at=answered_at: _handle_success(turn, answered_at),
+                "_invoke_on_ui",
                 Qt.ConnectionType.QueuedConnection,
+                Q_ARG(
+                    object,
+                    lambda turn=turn, answered_at=answered_at: _handle_success(
+                        turn, answered_at
+                    ),
+                ),
             )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    @pyqtSlot(object)
+    def _invoke_on_ui(self, callback: object) -> None:
+        if callable(callback):
+            callback()
 
     def _build_extra_request_options(
         self,

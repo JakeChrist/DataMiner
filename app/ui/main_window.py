@@ -1428,6 +1428,8 @@ class MainWindow(QMainWindow):
     def _connect_services(self) -> None:
         self.settings_service.theme_changed.connect(self._apply_theme)
         self.settings_service.font_scale_changed.connect(self._apply_font_scale)
+        self.settings_service.font_family_changed.connect(self._apply_font_scale)
+        self.settings_service.font_point_size_changed.connect(self._apply_font_scale)
         self.settings_service.density_changed.connect(self._apply_density)
         self.settings_service.chat_style_changed.connect(self._on_chat_style_changed)
         self.progress_service.progress_started.connect(self._on_progress_started)
@@ -1874,7 +1876,7 @@ class MainWindow(QMainWindow):
         self.settings_service.apply_theme()
         self._show_toast(f"Theme set to {theme.title()}.", level="info", duration_ms=1500)
 
-    def _apply_font_scale(self, _scale: float) -> None:
+    def _apply_font_scale(self, *_args: object) -> None:
         self.settings_service.apply_font_scale()
 
     def _on_model_changed(self, name: str) -> None:

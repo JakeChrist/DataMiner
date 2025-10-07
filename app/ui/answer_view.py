@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from datetime import datetime
 from typing import Any, Callable, Iterable
 
@@ -45,14 +46,151 @@ from ..services.conversation_manager import ConversationTurn
 from ..services.conversation_settings import ConversationSettings
 from ..services.progress_service import ProgressService
 from ..services.settings_service import ChatStyleSettings
+from markdown import markdown as _markdown_to_html
 
 
 logger = logging.getLogger(__name__)
 
-_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _CITATION_RE = re.compile(r'\[(\d+)\](?!\()')
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
 _CODE_FENCE_RE = re.compile(r"^```(.*)$")
+_MARKDOWN_EXTENSIONS = ["extra", "sane_lists", "nl2br"]
+
+
+class _RichTextHtmlParser(HTMLParser):
+    """HTML transformer that injects inline styling and citation anchors."""
+
+    def __init__(
+        self,
+        *,
+        highlight: int | None,
+        accent: str,
+        href_lookup: Callable[[int], str | None] | None,
+    ) -> None:
+        super().__init__(convert_charrefs=False)
+        self._highlight = highlight
+        self._accent = accent
+        self._href_lookup = href_lookup
+        self._parts: list[str] = []
+        self._has_citation = False
+        self._pre_depth = 0
+
+    @property
+    def has_citation(self) -> bool:
+        return self._has_citation
+
+    def result(self) -> str:
+        return "".join(self._parts)
+
+    # HTMLParser callbacks -------------------------------------------------
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "pre":
+            self._pre_depth += 1
+        attrs = self._maybe_add_inline_code_class(tag, attrs)
+        self._parts.append(self._serialize_start_tag(tag, attrs))
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs = self._maybe_add_inline_code_class(tag, attrs)
+        self._parts.append(self._serialize_start_tag(tag, attrs, self_closing=True))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "pre" and self._pre_depth > 0:
+            self._pre_depth -= 1
+        self._parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        replaced = _CITATION_RE.sub(self._replace_citation, data)
+        self._parts.append(replaced)
+
+    def handle_comment(self, data: str) -> None:  # pragma: no cover - formatting preservation
+        self._parts.append(f"<!--{data}-->")
+
+    def handle_entityref(self, name: str) -> None:  # pragma: no cover - formatting preservation
+        self._parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:  # pragma: no cover - formatting preservation
+        self._parts.append(f"&#{name};")
+
+    def handle_decl(self, decl: str) -> None:  # pragma: no cover - formatting preservation
+        self._parts.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:  # pragma: no cover - formatting preservation
+        self._parts.append(f"<?{data}>")
+
+    # Internal helpers -----------------------------------------------------
+    def _maybe_add_inline_code_class(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> list[tuple[str, str | None]]:
+        if tag != "code" or self._pre_depth > 0:
+            return attrs
+        updated: list[tuple[str, str | None]] = []
+        class_applied = False
+        for name, value in attrs:
+            if name == "class":
+                class_applied = True
+                if value:
+                    classes = value.split()
+                    if "inline" not in classes:
+                        value = value + " inline"
+                else:
+                    value = "inline"
+            updated.append((name, value))
+        if not class_applied:
+            updated.append(("class", "inline"))
+        return updated
+
+    def _serialize_start_tag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+        self_closing: bool = False,
+    ) -> str:
+        attr_parts: list[str] = []
+        for name, value in attrs:
+            if value is None:
+                attr_parts.append(name)
+            else:
+                escaped = html.escape(value, quote=True)
+                attr_parts.append(f'{name}="{escaped}"')
+        joined = " " + " ".join(attr_parts) if attr_parts else ""
+        if self_closing:
+            return f"<{tag}{joined} />"
+        return f"<{tag}{joined}>"
+
+    def _replace_citation(self, match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        self._has_citation = True
+        classes = ["citation"]
+        if self._highlight == index:
+            classes.append("selected")
+        joined_classes = " ".join(classes)
+        title_attr = ""
+        if self._href_lookup:
+            try:
+                target = self._href_lookup(index)
+            except Exception:  # pragma: no cover - defensive
+                target = None
+            if target:
+                escaped_target = html.escape(target, quote=True)
+                title_attr = (
+                    f" title='{escaped_target}' data-href='{escaped_target}'"
+                )
+        return (
+            f"<a href='cite-{index}' class='{joined_classes}' data-citation='{index}' "
+            f"style='color:{self._accent};text-decoration:none;'{title_attr}>[{index}]</a>"
+        )
+
+
+def _convert_markdown(text: str) -> str:
+    """Convert Markdown/HTML content into HTML fragments."""
+
+    if not text:
+        return ""
+    return _markdown_to_html(
+        text,
+        extensions=_MARKDOWN_EXTENSIONS,
+        output_format="html5",
+    )
 
 
 @dataclass(slots=True)
@@ -169,43 +307,15 @@ def _render_inline_html(
 ) -> tuple[str, bool]:
     """Return HTML for a paragraph/list item with inline styling."""
 
-    fragments: list[str] = []
-    last_index = 0
-    has_citation = False
-    for match in _INLINE_CODE_RE.finditer(text):
-        fragments.append(html.escape(text[last_index:match.start()]))
-        fragments.append(
-            f"<code class='inline'>{html.escape(match.group(1))}</code>"
-        )
-        last_index = match.end()
-    fragments.append(html.escape(text[last_index:]))
-    escaped = "".join(fragments)
-
-    def _replace(match: re.Match[str]) -> str:
-        nonlocal has_citation
-        index = int(match.group(1))
-        has_citation = True
-        classes = ["citation"]
-        if highlight == index:
-            classes.append("selected")
-        joined = " ".join(classes)
-        title_attr = ""
-        if href_lookup:
-            try:
-                target = href_lookup(index)
-            except Exception:  # pragma: no cover - defensive
-                target = None
-            if target:
-                escaped_target = html.escape(target, quote=True)
-                title_attr = f" title='{escaped_target}' data-href='{escaped_target}'"
-        return (
-            f"<a href='cite-{index}' class='{joined}' data-citation='{index}' "
-            f"style='color:{accent};text-decoration:none;'{title_attr}>[{index}]</a>"
-        )
-
-    html_text = _CITATION_RE.sub(_replace, escaped)
-    html_text = html_text.replace("\n", "<br/>")
-    return html_text, has_citation
+    rich_html = _convert_markdown(text)
+    parser = _RichTextHtmlParser(
+        highlight=highlight,
+        accent=accent,
+        href_lookup=href_lookup,
+    )
+    parser.feed(rich_html)
+    parser.close()
+    return parser.result(), parser.has_citation
 
 
 class CitationPopover(QFrame):

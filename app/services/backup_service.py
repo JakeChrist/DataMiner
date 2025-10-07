@@ -31,9 +31,18 @@ class BackupService:
     @log_call(logger=logger, include_result=True)
     def create_backup(self, destination: str | Path) -> Path:
         destination_path = Path(destination)
-        if destination_path.is_dir():
+
+        if destination_path.exists() and destination_path.is_dir():
+            target_directory = destination_path
+        elif not destination_path.exists() and not destination_path.suffix:
+            destination_path.mkdir(parents=True, exist_ok=True)
+            target_directory = destination_path
+        else:
+            target_directory = None
+
+        if target_directory is not None:
             timestamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%d-%H%M%S")
-            destination_path = destination_path / f"dataminer-backup-{timestamp}.zip"
+            destination_path = target_directory / f"dataminer-backup-{timestamp}.zip"
         if not destination_path.parent.exists():
             destination_path.parent.mkdir(parents=True, exist_ok=True)
 

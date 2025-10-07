@@ -6,9 +6,13 @@ import datetime as _dt
 import html
 import json
 import logging
+import re
 import textwrap
 from pathlib import Path
 from typing import Iterable, Sequence
+
+
+_CITATION_MARKER_RE = re.compile(r"\[(\d+)\](?!\()")
 
 from .conversation_manager import ConversationTurn
 from ..logging import log_call
@@ -149,6 +153,8 @@ class ExportService:
         answered = turn.answered_at.isoformat() if turn.answered_at else "—"
         latency = f"{turn.latency_ms} ms" if turn.latency_ms is not None else "—"
         token_json = json.dumps(turn.token_usage or {}, indent=2, sort_keys=True)
+        answer_text = (turn.answer or "—").strip()
+        answer_text = self._linkify_markdown(answer_text, turn.citations)
         lines = [
             "",
             f"## Turn {index}",
@@ -157,7 +163,7 @@ class ExportService:
             "",
             "**Answer:**",
             "",
-            textwrap.indent((turn.answer or "—").strip(), "> "),
+            textwrap.indent(answer_text, "> "),
             "",
             f"*Asked:* {asked}  ",
             f"*Answered:* {answered}  ",
@@ -167,7 +173,8 @@ class ExportService:
         ]
         if turn.citations:
             for idx, citation in enumerate(turn.citations, start=1):
-                lines.append(f"{idx}. {self._format_citation_text(citation)}")
+                text = self._format_citation_text(citation)
+                lines.append(f"{idx}. <a id=\"citation-{idx}\"></a>{text}")
         else:
             lines.append("No citations available.")
         reasoning = self._format_reasoning_markdown(turn)
@@ -182,11 +189,11 @@ class ExportService:
         asked = html.escape(turn.asked_at.isoformat()) if turn.asked_at else "—"
         answered = html.escape(turn.answered_at.isoformat()) if turn.answered_at else "—"
         latency = f"{turn.latency_ms} ms" if turn.latency_ms is not None else "—"
-        answer = html.escape(turn.answer or "—").replace("\n", "<br/>")
+        answer = self._linkify_html(turn.answer or "—", turn.citations, preserve_breaks=True)
         question = html.escape(turn.question or "—")
         citations = "".join(
-            f"<li>{html.escape(self._format_citation_text(citation))}</li>"
-            for citation in turn.citations or []
+            f"<li id='citation-{index}'>{html.escape(self._format_citation_text(citation))}</li>"
+            for index, citation in enumerate(turn.citations or [], start=1)
         )
         if not citations:
             citations = "<li>No citations available.</li>"
@@ -212,68 +219,96 @@ class ExportService:
         if turn.reasoning_bullets:
             lines.extend(["", "### Reasoning", ""])
             for bullet in turn.reasoning_bullets:
-                lines.append(f"- {bullet}")
+                lines.append(f"- {self._linkify_markdown(bullet, turn.citations)}")
         if turn.plan:
             lines.extend(["", "### Plan", ""])
             for idx, item in enumerate(turn.plan, start=1):
                 status = item.status.replace("_", " ") if item.status else "pending"
-                lines.append(f"{idx}. {item.description} [{status}]")
+                description = self._linkify_markdown(item.description, turn.citations)
+                lines.append(f"{idx}. {description} [{status}]")
         if turn.assumptions or turn.assumption_decision is not None:
             lines.extend(["", "### Assumptions", ""])
             for assumption in turn.assumptions:
-                lines.append(f"- {assumption}")
+                lines.append(f"- {self._linkify_markdown(assumption, turn.citations)}")
             decision = turn.assumption_decision
             if decision:
                 detail = [f"Decision: {decision.mode.title()}"]
                 if decision.rationale:
-                    detail.append(f"Rationale: {decision.rationale}")
+                    detail.append(
+                        f"Rationale: {self._linkify_markdown(decision.rationale, turn.citations)}"
+                    )
                 if decision.clarifying_question:
-                    detail.append(f"Follow-up: {decision.clarifying_question}")
+                    detail.append(
+                        f"Follow-up: {self._linkify_markdown(decision.clarifying_question, turn.citations)}"
+                    )
                 lines.append("- " + " | ".join(detail))
         if turn.self_check is not None:
             self_check = turn.self_check
             lines.extend(["", "### Self-check", ""])
             lines.append("- Status: " + ("Passed" if self_check.passed else "Flagged"))
             for flag in self_check.flags:
-                lines.append(f"- Flag: {flag}")
+                lines.append(f"- Flag: {self._linkify_markdown(flag, turn.citations)}")
             if self_check.notes:
-                lines.append(f"- Notes: {self_check.notes}")
+                lines.append(
+                    f"- Notes: {self._linkify_markdown(self_check.notes, turn.citations)}"
+                )
         return lines
 
     @log_call(logger=logger, include_result=True)
     def _format_reasoning_html(self, turn: ConversationTurn) -> str:
         sections: list[str] = []
         if turn.reasoning_bullets:
-            bullets = "".join(f"<li>{html.escape(item)}</li>" for item in turn.reasoning_bullets)
+            bullets = "".join(
+                f"<li>{self._linkify_html(item, turn.citations)}</li>"
+                for item in turn.reasoning_bullets
+            )
             sections.append(
                 f"<div class='section'><h3>Reasoning</h3><ul>{bullets}</ul></div>"
             )
         if turn.plan:
             items = "".join(
-                f"<li>{html.escape(item.description)} <em>[{html.escape(item.status or 'pending')}]</em></li>"
+                "".join(
+                    [
+                        "<li>",
+                        self._linkify_html(item.description, turn.citations),
+                        " <em>[",
+                        html.escape(item.status or "pending"),
+                        "]</em></li>",
+                    ]
+                )
                 for item in turn.plan
             )
             sections.append(f"<div class='section'><h3>Plan</h3><ol>{items}</ol></div>")
         if turn.assumptions or turn.assumption_decision is not None:
             assumptions = "".join(
-                f"<li>{html.escape(text)}</li>" for text in turn.assumptions
+                f"<li>{self._linkify_html(text, turn.citations)}</li>" for text in turn.assumptions
             )
             extras: list[str] = []
             decision = turn.assumption_decision
             if decision:
                 detail = [f"Decision: {decision.mode.title()}"]
                 if decision.rationale:
-                    detail.append(f"Rationale: {decision.rationale}")
+                    detail.append(
+                        f"Rationale: {self._linkify_html(decision.rationale, turn.citations)}"
+                    )
                 if decision.clarifying_question:
-                    detail.append(f"Follow-up: {decision.clarifying_question}")
-                extras.append(" | ".join(html.escape(part) for part in detail))
+                    detail.append(
+                        f"Follow-up: {self._linkify_html(decision.clarifying_question, turn.citations)}"
+                    )
+                extras.append(" | ".join(self._linkify_html(part, turn.citations) for part in detail))
             if extras:
                 assumptions += "".join(f"<li>{extra}</li>" for extra in extras)
             sections.append(f"<div class='section'><h3>Assumptions</h3><ul>{assumptions or '<li>None</li>'}</ul></div>")
         if turn.self_check is not None:
             self_check = turn.self_check
-            flags = "".join(f"<li>{html.escape(flag)}</li>" for flag in self_check.flags)
-            extra = f"<p>Notes: {html.escape(self_check.notes)}</p>" if self_check.notes else ""
+            flags = "".join(
+                f"<li>{self._linkify_html(flag, turn.citations)}</li>" for flag in self_check.flags
+            )
+            extra = (
+                f"<p>Notes: {self._linkify_html(self_check.notes, turn.citations, preserve_breaks=True)}</p>"
+                if self_check.notes
+                else ""
+            )
             sections.append(
                 "".join(
                     [
@@ -454,6 +489,72 @@ class ExportService:
                 return f"{info} — {snippet_text}" if info else snippet_text
             return info or "Reference"
         return str(citation)
+
+    @staticmethod
+    def _extract_citation_link(citation: object) -> str | None:
+        if isinstance(citation, dict):
+            for key in ("url", "href", "link"):
+                value = citation.get(key)
+                if value:
+                    return str(value)
+            nested = citation.get("citation")
+            if isinstance(nested, dict):
+                return ExportService._extract_citation_link(nested)
+        return None
+
+    def _linkify_markdown(
+        self, text: str | None, citations: Sequence[object] | None
+    ) -> str:
+        if not text:
+            return ""
+        citations = tuple(citations or ())
+
+        def _replacement(match: re.Match[str]) -> str:
+            index = int(match.group(1))
+            href = self._citation_href(index, citations)
+            return f"[{index}]({self._escape_markdown_link(href)})"
+
+        return _CITATION_MARKER_RE.sub(_replacement, text)
+
+    def _linkify_html(
+        self,
+        text: str | None,
+        citations: Sequence[object] | None,
+        *,
+        preserve_breaks: bool = False,
+    ) -> str:
+        if text is None:
+            return ""
+        if text == "":
+            return ""
+        citations = tuple(citations or ())
+        parts: list[str] = []
+        last = 0
+        for match in _CITATION_MARKER_RE.finditer(text):
+            parts.append(html.escape(text[last:match.start()]))
+            index = int(match.group(1))
+            href = html.escape(self._citation_href(index, citations), quote=True)
+            parts.append(
+                f"<a href=\"{href}\" class='citation-ref'>[{index}]</a>"
+            )
+            last = match.end()
+        parts.append(html.escape(text[last:]))
+        result = "".join(parts)
+        if preserve_breaks:
+            result = result.replace("\n", "<br/>")
+        return result
+
+    @staticmethod
+    def _citation_href(index: int, citations: Sequence[object]) -> str:
+        if 1 <= index <= len(citations):
+            link = ExportService._extract_citation_link(citations[index - 1])
+            if link:
+                return link
+        return f"#citation-{index}"
+
+    @staticmethod
+    def _escape_markdown_link(target: str) -> str:
+        return target.replace("(", r"\(").replace(")", r"\)")
 
     @staticmethod
     @log_call(logger=logger, include_result=True)

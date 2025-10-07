@@ -1606,6 +1606,7 @@ class ConversationManager:
         scope: dict[str, Any] | None,
         preset: AnswerLength,
         response_mode: ResponseMode,
+        step_results: Sequence["StepResult"] | None = None,
     ) -> tuple[ConsolidationOutput, list[Any], dict[int, int], JudgeReport]:
         original_consolidation = copy.deepcopy(consolidation)
         cycles = 0
@@ -1616,6 +1617,7 @@ class ConversationManager:
             index: index for index in range(1, len(citations) + 1)
         }
         last_verdict: _JudgeVerdict | None = None
+        attempted_replan_fix = False
 
         while True:
             cycles += 1
@@ -1656,8 +1658,20 @@ class ConversationManager:
                 revisions = True
                 break
             if verdict.decision == "replan":
+                if attempted_replan_fix or not step_results:
+                    revisions = True
+                    break
+                fallback = self._build_fallback_consolidation_from_steps(
+                    step_results,
+                    citations,
+                )
+                if fallback is None:
+                    revisions = True
+                    break
+                consolidation, citations, mapping_overall = fallback
+                attempted_replan_fix = True
                 revisions = True
-                break
+                continue
             if cycles >= self._judge.max_cycles:
                 metrics = verdict.metrics if verdict else {}
                 sanitized = self._judge._sanitize_consolidation_without_citations(
@@ -2090,6 +2104,7 @@ class ConversationManager:
             scope=retrieval_scope,
             preset=preset,
             response_mode=response_mode,
+            step_results=step_results,
         )
         logger.info(
             "Adversarial review completed",
@@ -2231,6 +2246,7 @@ class ConversationManager:
 
         actions = self._split_question_into_actions(normalized)
         plan: list[PlanItem] = []
+        fallback_target = self._derive_fallback_target(normalized)
 
         keyword_list = self._extract_plan_keywords(normalized)
         if keyword_list:
@@ -2272,25 +2288,13 @@ class ConversationManager:
             )
 
         if not plan:
-            fallback_target = self._derive_fallback_target(normalized)
-            plan = [
-                self._build_structured_plan_item(
-                    input_hint="Corpus context",
-                    action=self._compose_action(
-                        "collect", f"baseline references on {fallback_target}"
-                    ),
-                    output_hint="Background reference list with citation-ready document locations",
-                ),
-                self._build_structured_plan_item(
-                    input_hint="Evidence snippets from the background reference step",
-                    action=self._compose_action(
-                        "analyze", f"key aspects of {fallback_target}"
-                    ),
-                    output_hint="Summary table capturing cited evidence for each aspect",
-                ),
-            ]
+            plan = self._build_resilient_plan(fallback_target)
 
-        self._plan_critic.ensure(plan)
+        plan = self._ensure_resilient_plan(
+            plan,
+            fallback_target,
+            normalized[:120],
+        )
         logger.info(
             "Generated plan",
             extra={
@@ -2300,6 +2304,65 @@ class ConversationManager:
             },
         )
         return plan
+
+    def _ensure_resilient_plan(
+        self,
+        plan: list[PlanItem],
+        fallback_target: str,
+        question_preview: str,
+    ) -> list[PlanItem]:
+        approved, reasons = self._plan_critic.review(plan)
+        if approved:
+            return plan
+
+        logger.warning(
+            "Plan critic rejected generated plan; attempting fallback",
+            extra={
+                "question_preview": question_preview,
+                "rejection_reasons": list(reasons),
+            },
+        )
+
+        fallback_plan = self._build_resilient_plan(fallback_target)
+        approved_fallback, fallback_reasons = self._plan_critic.review(fallback_plan)
+        if not approved_fallback:
+            logger.error(
+                "Fallback plan also rejected by critic; proceeding with best-effort plan",
+                extra={
+                    "question_preview": question_preview,
+                    "rejection_reasons": list(fallback_reasons),
+                },
+            )
+        return fallback_plan
+
+    def _build_resilient_plan(self, target: str) -> list[PlanItem]:
+        topic = (target or "the topic").strip()
+        if not topic:
+            topic = "the topic"
+
+        return [
+            self._build_structured_plan_item(
+                input_hint="Corpus context (retrieved corpus snippets with chunk IDs)",
+                action=self._compose_action(
+                    "collect", f"background references on {topic}"
+                ),
+                output_hint="Background reference list capturing document citations and snippet notes",
+            ),
+            self._build_structured_plan_item(
+                input_hint="Evidence snippets from Step 1 output",
+                action=self._compose_action(
+                    "analyze", f"key findings related to {topic}"
+                ),
+                output_hint="Summary table aligning findings to document citations",
+            ),
+            self._build_structured_plan_item(
+                input_hint="Findings table from Step 2 output",
+                action=self._compose_action(
+                    "map", f"answer requirements to cited evidence about {topic}"
+                ),
+                output_hint="Answer outline highlighting document citations for each requirement",
+            ),
+        ]
 
     @staticmethod
     def _compose_action(verb: str, target: str) -> str:
@@ -3281,6 +3344,80 @@ class ConversationManager:
 
         parts = [part for part in sections_text + conflict_note_text if part]
         return "\n\n".join(parts).strip()
+
+    @staticmethod
+    def _build_fallback_consolidation_from_steps(
+        step_results: Sequence["StepResult"],
+        citations: Sequence[Any],
+    ) -> tuple[ConsolidationOutput, list[Any], dict[int, int]] | None:
+        usable: list[tuple[str, list[int]]] = []
+        for result in step_results:
+            answer_text = (result.answer or "").strip()
+            if result.insufficient or not answer_text:
+                continue
+            indexes = [
+                index
+                for index in result.citation_indexes
+                if 1 <= index <= len(citations)
+            ]
+            if not indexes:
+                continue
+            polished = ConversationManager._polish_sentence(answer_text)
+            usable.append((polished, indexes))
+
+        if not usable:
+            return None
+
+        ordered_indexes: list[int] = []
+        for _, indexes in usable:
+            for index in indexes:
+                if index not in ordered_indexes:
+                    ordered_indexes.append(index)
+
+        remapped_citations: list[Any] = []
+        mapping: dict[int, int] = {}
+        for new_index, original_index in enumerate(ordered_indexes, start=1):
+            if original_index < 1 or original_index > len(citations):
+                continue
+            mapping[original_index] = new_index
+            remapped_citations.append(copy.deepcopy(citations[original_index - 1]))
+
+        if not remapped_citations or not mapping:
+            return None
+
+        section_sentences: list[str] = []
+        section_indexes: set[int] = set()
+        for text, indexes in usable:
+            remapped = [mapping[index] for index in indexes if index in mapping]
+            if not remapped:
+                continue
+            sentence = text.strip()
+            if sentence and sentence[-1] not in ".!?":
+                sentence = f"{sentence.rstrip('.')}.".strip()
+            markers = "".join(f"[{index}]" for index in remapped)
+            sentence = f"{sentence} {markers}".strip()
+            section_sentences.append(sentence)
+            section_indexes.update(remapped)
+
+        if not section_sentences:
+            return None
+
+        section = ConsolidatedSection(
+            title="Findings",
+            sentences=section_sentences,
+            citation_indexes=sorted(section_indexes),
+        )
+        section_usage: dict[int, set[str]] = {
+            index: {section.title} for index in section.citation_indexes if index > 0
+        }
+        text = ConversationManager._assemble_answer_text([section], [])
+        consolidation = ConsolidationOutput(
+            text=text,
+            sections=[section],
+            conflicts=[],
+            section_usage=section_usage,
+        )
+        return consolidation, remapped_citations, mapping
 
     @staticmethod
     def _fallback_citations_from_contexts(

@@ -1123,8 +1123,8 @@ class ChatTurnWidget(QFrame):
             accent=colors.citation_accent,
             progress=progress,
         )
-        user_row.addWidget(self.user_bubble, alignment=Qt.AlignmentFlag.AlignLeft)
         user_row.addStretch(1)
+        user_row.addWidget(self.user_bubble, alignment=Qt.AlignmentFlag.AlignRight)
         layout.addLayout(user_row)
 
         assistant_row = QHBoxLayout()
@@ -1139,8 +1139,8 @@ class ChatTurnWidget(QFrame):
             progress=progress,
         )
         self.assistant_bubble.citation_activated.connect(self.citation_activated.emit)
+        assistant_row.addWidget(self.assistant_bubble, alignment=Qt.AlignmentFlag.AlignLeft)
         assistant_row.addStretch(1)
-        assistant_row.addWidget(self.assistant_bubble, alignment=Qt.AlignmentFlag.AlignRight)
         layout.addLayout(assistant_row)
 
     def to_plain_text(self) -> str:

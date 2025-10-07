@@ -1563,11 +1563,10 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        step_context_provider = self._build_step_context_provider(question)
-        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
-        extra_options = self._build_extra_request_options(
-            question, retrieval_documents=retrieval_documents or None
-        )
+        scope_snapshot = {
+            "include": list(self._current_retrieval_scope.get("include", [])),
+            "exclude": list(self._current_retrieval_scope.get("exclude", [])),
+        }
         def _handle_error(exc: LMStudioError) -> None:
             self.progress_service.finish("chat-send", "Send failed")
             self.progress_service.notify(str(exc) or "Failed to contact LMStudio", level="error")
@@ -1599,6 +1598,17 @@ class MainWindow(QMainWindow):
 
         def worker() -> None:
             try:
+                context_snippets, retrieval_documents = self._prepare_retrieval_context(
+                    question, scope=scope_snapshot
+                )
+                step_context_provider = self._build_step_context_provider(
+                    question, scope=scope_snapshot
+                )
+                extra_options = self._build_extra_request_options(
+                    question,
+                    retrieval_documents=retrieval_documents or None,
+                    scope=scope_snapshot,
+                )
                 turn = self._conversation_manager.ask(
                     question,
                     context_snippets=context_snippets or None,
@@ -1642,11 +1652,12 @@ class MainWindow(QMainWindow):
         question: str | None = None,
         *,
         retrieval_documents: list[dict[str, Any]] | None = None,
+        scope: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {}
-        scope = self._current_retrieval_scope
-        include = list(scope.get("include", [])) if scope else []
-        exclude = list(scope.get("exclude", [])) if scope else []
+        scope_data = scope or self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope_data.get("include", []))
+        exclude = list(scope_data.get("exclude", []))
         retrieval: dict[str, Any] = {}
         if question and question.strip():
             retrieval["query"] = question.strip()
@@ -1661,7 +1672,9 @@ class MainWindow(QMainWindow):
         return options
 
     def _build_step_context_provider(
-        self, question: str
+        self,
+        question: str,
+        scope: dict[str, list[str]] | None = None,
     ) -> Callable[[PlanItem, int, int], Iterable[StepContextBatch]]:
         normalized = question.strip()
         try:
@@ -1669,9 +1682,9 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             return lambda *_args, **_kwargs: []
 
-        scope = self._current_retrieval_scope or {"include": [], "exclude": []}
-        include = list(scope.get("include") or [])
-        exclude = list(scope.get("exclude") or [])
+        scope_data = scope or self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope_data.get("include") or [])
+        exclude = list(scope_data.get("exclude") or [])
         chunk_size = 3
         limit = 9
 
@@ -1701,7 +1714,7 @@ class MainWindow(QMainWindow):
         return provider
 
     def _prepare_retrieval_context(
-        self, question: str
+        self, question: str, scope: dict[str, list[str]] | None = None
     ) -> tuple[list[str], list[dict[str, Any]]]:
         if not question.strip():
             return [], []
@@ -1709,9 +1722,9 @@ class MainWindow(QMainWindow):
             project_id = self.project_service.active_project_id
         except RuntimeError:
             return [], []
-        scope = self._current_retrieval_scope or {"include": [], "exclude": []}
-        include = scope.get("include") or []
-        exclude = scope.get("exclude") or []
+        scope_data = scope or self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope_data.get("include") or [])
+        exclude = list(scope_data.get("exclude") or [])
         records = self.search_service.collect_context_records(
             question,
             project_id=project_id,

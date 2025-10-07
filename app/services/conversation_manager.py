@@ -2259,8 +2259,36 @@ class ConversationManager:
 
         if len(plan) > 8:
             plan = plan[:8]
+
+        if len(plan) == 1:
+            plan.append(
+                self._build_structured_plan_item(
+                    input_hint="Evidence snippets and notes from completed steps",
+                    action=self._compose_action(
+                        "analyze", "evidence patterns to map answer requirements"
+                    ),
+                    output_hint="Summary table aligning requirements to cited evidence snippets",
+                )
+            )
+
         if not plan:
-            plan = [PlanItem(description=normalized, status="queued")]
+            fallback_target = self._derive_fallback_target(normalized)
+            plan = [
+                self._build_structured_plan_item(
+                    input_hint="Corpus context",
+                    action=self._compose_action(
+                        "collect", f"baseline references on {fallback_target}"
+                    ),
+                    output_hint="Background reference list with citation-ready document locations",
+                ),
+                self._build_structured_plan_item(
+                    input_hint="Evidence snippets from the background reference step",
+                    action=self._compose_action(
+                        "analyze", f"key aspects of {fallback_target}"
+                    ),
+                    output_hint="Summary table capturing cited evidence for each aspect",
+                ),
+            ]
 
         self._plan_critic.ensure(plan)
         logger.info(
@@ -2279,6 +2307,17 @@ class ConversationManager:
         if not cleaned_target:
             return verb.capitalize()
         return f"{verb.capitalize()} {cleaned_target}"
+
+    def _derive_fallback_target(self, text: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", text)
+        filtered = [
+            token
+            for token in tokens
+            if token.lower() not in self._PLAN_STOPWORDS and len(token) > 2
+        ]
+        if not filtered:
+            return "the topic"
+        return " ".join(filtered[:3])
 
     def _normalize_plan_action(self, action: str) -> tuple[str, str] | None:
         text = action.strip()

@@ -10,7 +10,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
 
-from PyQt6.QtCore import QPoint, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QColor, QCursor, QTextOption
 from PyQt6.QtWidgets import (
     QApplication,
@@ -162,23 +170,30 @@ class CitationPopover(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-        self._title_button = QPushButton("", self)
-        self._title_button.setFlat(True)
-        self._title_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._title_button.clicked.connect(self.title_clicked)
-        self._title_button.setStyleSheet("text-align: left;")
+        self._title_label = QLabel("", self)
+        self._title_label.setWordWrap(True)
+        self._title_label.setObjectName("citationTitle")
         self._snippet_label = QLabel("", self)
         self._snippet_label.setWordWrap(True)
-        layout.addWidget(self._title_button)
+        self._snippet_label.setObjectName("citationSnippet")
+        self._action_button = QPushButton("View in Evidence", self)
+        self._action_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._action_button.clicked.connect(self.title_clicked)
+        self._action_button.setDefault(False)
+        self._action_button.setAutoDefault(False)
+        layout.addWidget(self._title_label)
         layout.addWidget(self._snippet_label)
+        layout.addWidget(self._action_button)
         self._timer = QTimer(self)
         self._timer.setInterval(4500)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.hide)
 
     def show_payload(self, title: str, snippet: str, *, position: QPoint) -> None:
-        self._title_button.setText(title or "Open source")
-        self._snippet_label.setText(snippet or "No preview available.")
+        header = title or "Source"
+        self._title_label.setText(header)
+        body = snippet or "No preview available."
+        self._snippet_label.setText(body)
         self.adjustSize()
         self.move(position)
         self.show()
@@ -370,20 +385,151 @@ class CodeBlockWidget(QFrame):
         QApplication.clipboard().setText(self._code)
 
 
-class PlanSection(QFrame):
-    """Accordion-style section controlled by a chip button."""
+class CollapsibleSection(QFrame):
+    """Disclosure component with an animated body and header chevron."""
 
-    def __init__(self, title: str, rows: list[str]) -> None:
+    toggled = pyqtSignal(bool)
+    user_toggled = pyqtSignal(bool, bool)
+
+    def __init__(self, title: str, *, accent: str, expanded: bool = False) -> None:
         super().__init__()
-        self.setObjectName("planSection")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        for row in rows:
-            label = QLabel(row, self)
-            label.setWordWrap(True)
-            layout.addWidget(label)
-        self.setVisible(False)
+        self.setObjectName("collapsibleSection")
+        self._title = title
+        self._accent = accent
+        self._expanded = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._toggle_button = QToolButton(self)
+        self._toggle_button.setObjectName("sectionHeaderButton")
+        self._toggle_button.setCheckable(True)
+        self._toggle_button.setChecked(False)
+        self._toggle_button.setText(title)
+        self._toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle_button.setArrowType(Qt.ArrowType.RightArrow)
+        self._toggle_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._toggle_button.clicked.connect(self._handle_clicked)
+        outer.addWidget(self._toggle_button)
+
+        self._content = QFrame(self)
+        self._content.setObjectName("sectionBody")
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(12, 6, 12, 10)
+        self._content_layout.setSpacing(6)
+        outer.addWidget(self._content)
+
+        self._animation = QPropertyAnimation(self._content, b"maximumHeight", self)
+        self._animation.setDuration(180)
+        self._animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        self._content.setMaximumHeight(0)
+        self._content.setVisible(False)
+
+        self._apply_accent()
+        self.set_expanded(expanded, animate=False)
+
+    # -----------------------------------------------------------------
+    def _apply_accent(self) -> None:
+        self._toggle_button.setStyleSheet(
+            "QToolButton#sectionHeaderButton {"
+            "  border: none;"
+            "  text-align: left;"
+            "  padding: 6px 4px;"
+            f"  color: {self._accent};"
+            "  font-weight: 600;"
+            "}"
+        )
+        self._content.setStyleSheet(
+            "QFrame#sectionBody { border: none; }"
+        )
+
+    def _handle_clicked(self, checked: bool) -> None:  # pragma: no cover - UI
+        modifiers = QApplication.keyboardModifiers()
+        shift_pressed = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        self._apply_expanded_state(checked, animate=True)
+        self.user_toggled.emit(checked, shift_pressed)
+
+    def _apply_expanded_state(self, expanded: bool, *, animate: bool) -> None:
+        if expanded == self._expanded and self._animation.state() == QAbstractAnimation.State.Stopped:
+            return
+        self._expanded = expanded
+        self._toggle_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._animation.stop()
+        try:
+            self._animation.finished.disconnect(self._on_animation_finished)
+        except TypeError:
+            pass
+        if animate:
+            start = self._content.maximumHeight()
+            if expanded:
+                self._content.setVisible(True)
+                target = self._content.sizeHint().height()
+                self._animation.setStartValue(start)
+                self._animation.setEndValue(target)
+            else:
+                target = 0
+                if start == 0:
+                    start = self._content.sizeHint().height()
+                self._animation.setStartValue(start)
+                self._animation.setEndValue(target)
+                self._animation.finished.connect(self._on_animation_finished)
+            self._animation.start()
+        else:
+            if expanded:
+                self._content.setVisible(True)
+                self._content.setMaximumHeight(self._content.sizeHint().height())
+            else:
+                self._content.setMaximumHeight(0)
+                self._content.setVisible(False)
+        self.toggled.emit(self._expanded)
+
+    def _on_animation_finished(self) -> None:  # pragma: no cover - animation
+        if not self._expanded:
+            self._content.setVisible(False)
+
+    # -----------------------------------------------------------------
+    def add_text(self, text: str) -> QLabel:
+        label = QLabel(text, self._content)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._content_layout.addWidget(label)
+        self._refresh_height()
+        return label
+
+    def add_widget(self, widget: QWidget) -> None:
+        self._content_layout.addWidget(widget)
+        self._refresh_height()
+
+    def add_spacing(self, pixels: int) -> None:
+        spacer = QFrame(self._content)
+        spacer.setFixedHeight(max(0, pixels))
+        self._content_layout.addWidget(spacer)
+        self._refresh_height()
+
+    def _refresh_height(self) -> None:
+        if self._expanded:
+            self._content.setMaximumHeight(self._content.sizeHint().height())
+
+    def set_accent(self, color: str) -> None:
+        if color == self._accent:
+            return
+        self._accent = color
+        self._apply_accent()
+
+    def set_expanded(self, expanded: bool, *, animate: bool = False) -> None:
+        if expanded == self._expanded and self._animation.state() == QAbstractAnimation.State.Stopped:
+            return
+        self._toggle_button.blockSignals(True)
+        self._toggle_button.setChecked(expanded)
+        self._toggle_button.blockSignals(False)
+        self._apply_expanded_state(expanded, animate=animate)
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
 
 
 class ChatBubbleWidget(QFrame):
@@ -449,12 +595,13 @@ class ChatBubbleWidget(QFrame):
     def set_metadata_visible(self, visible: bool) -> None:
         self._meta_label.setVisible(visible)
 
-    def add_action(self, label: str, callback) -> None:
+    def add_action(self, label: str, callback) -> QPushButton:
         button = QPushButton(label, self)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.clicked.connect(callback)
         self._actions_bar.addWidget(button)
         self._hover_actions.append(button)
+        return button
 
     def set_typing(self, active: bool) -> None:
         self._typing_label.setVisible(active)
@@ -547,7 +694,18 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         self._sources_only = settings.sources_only_mode
         self._code_blocks: list[CodeBlockWidget] = []
         self._text_blocks: list[TextBlockWidget] = []
-        self._plan_sections: dict[str, tuple[QToolButton, PlanSection]] = {}
+        self._sections: dict[str, CollapsibleSection] = {}
+        self._section_order: list[CollapsibleSection] = []
+        self._assumption_widgets: list[QWidget] = []
+        self._citation_entries: list[QToolButton] = []
+        self._expand_controls: QFrame | None = None
+        self._expand_all_button: QToolButton | None = None
+        self._collapse_all_button: QToolButton | None = None
+        self._hover_expand_button: QPushButton | None = None
+        self._hover_jump_button: QPushButton | None = None
+        self._plan_section: CollapsibleSection | None = None
+        self._plan_has_rows = False
+        self._plan_has_assumptions = False
         self._popover = CitationPopover(self)
         self._popover.title_clicked.connect(self._emit_current_citation)
 
@@ -579,54 +737,38 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         for block in self._text_blocks:
             block.set_sources_only(self._sources_only)
 
-        self._create_plan_sections()
+        self._build_sections()
 
-        metadata = [
-            f"Model: {turn.model_name or '—'}",
-            f"Asked: {_format_timestamp(turn.asked_at)}",
-            f"Answered: {_format_timestamp(turn.answered_at)}",
-            f"Latency: {turn.latency_ms or '—'} ms",
-            _format_token_usage(turn.token_usage),
-        ]
-        self.set_metadata(" | ".join(metadata))
-
-        self.add_action("Copy", self._copy_answer)
-        self.add_action("Expand code", self._expand_all_code)
-        self.add_action("Toggle plan", self._toggle_plan_sections)
-        self.add_action("Info", self._toggle_metadata)
+        copy_button = self.add_action("Copy message", self._copy_answer)
+        copy_button.setObjectName("bubbleActionCopy")
+        self._hover_expand_button = self.add_action("Expand all", self._expand_all_sections)
+        self._hover_expand_button.setObjectName("bubbleActionExpand")
+        self._hover_jump_button = self.add_action("Jump to Evidence", self._jump_to_evidence_panel)
+        self._hover_jump_button.setObjectName("bubbleActionEvidence")
+        if not self.turn.citations:
+            self._hover_jump_button.setEnabled(False)
 
         self._settings.sources_only_mode_changed.connect(self._on_sources_only_changed)
         self._settings.show_assumptions_changed.connect(self._on_assumptions_toggle)
 
-    def _create_plan_sections(self) -> None:
-        chips = QHBoxLayout()
-        chips.setContentsMargins(0, 0, 0, 0)
-        chips.setSpacing(6)
-        chip_wrapper = QFrame(self)
-        chip_wrapper.setLayout(chips)
-        has_chip = False
+        self._update_expand_control_state()
+        self._update_citation_entry_highlight(None)
 
-        def _add_chip(label: str, section: PlanSection) -> None:
-            nonlocal has_chip
-            button = QToolButton(self)
-            button.setText(label)
-            button.setCheckable(True)
-            button.setChecked(False)
-            button.toggled.connect(section.setVisible)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setObjectName("planChip")
-            chips.addWidget(button)
-            has_chip = True
-            self._plan_sections[label] = (button, section)
+    def _build_sections(self) -> None:
+        accent = self.accent
+        metadata_lines = [
+            f"Model: {self.turn.model_name or '—'}",
+            f"Asked: {_format_timestamp(self.turn.asked_at)}",
+            f"Answered: {_format_timestamp(self.turn.answered_at)}",
+            f"Latency: {self.turn.latency_ms or '—'} ms",
+            _format_token_usage(self.turn.token_usage),
+        ]
 
         plan_rows: list[str] = []
         for index, item in enumerate(self.turn.plan, start=1):
-            status = item.status.replace("_", " ") if item.status else "pending"
+            status = (item.status or "pending").replace("_", " ")
             plan_rows.append(f"{index}. {item.description} [{status}]")
-        if plan_rows:
-            section = PlanSection("Plan", plan_rows)
-            _add_chip("Plan", section)
-            self.add_widget(section)
+        self._plan_has_rows = bool(plan_rows)
 
         assumptions: list[str] = list(self.turn.assumptions)
         decision = self.turn.assumption_decision
@@ -637,21 +779,27 @@ class AssistantBubbleWidget(ChatBubbleWidget):
             if decision.clarifying_question:
                 decision_parts.append(f"Follow-up: {decision.clarifying_question}")
             assumptions.append(" | ".join(decision_parts))
-        if assumptions and self._settings.show_assumptions:
-            section = PlanSection("Assumptions", assumptions)
-            _add_chip("Assumptions", section)
-            self.add_widget(section)
+        self._plan_has_assumptions = bool(assumptions)
 
-        evidence_rows: list[str] = []
-        for result in self.turn.step_results:
-            prefix = f"{result.index}. {result.description.strip() or 'Step'}"
-            summary = result.answer.strip() or "No summary recorded"
-            markers = " ".join(f"[{idx}]" for idx in result.citation_indexes)
-            evidence_rows.append(f"{prefix}\n    {summary} {markers}".strip())
-        if evidence_rows:
-            section = PlanSection("Evidence Map", evidence_rows)
-            _add_chip("Evidence Map", section)
-            self.add_widget(section)
+        if plan_rows or assumptions:
+            section = CollapsibleSection("Plan", accent=accent, expanded=self._settings.show_plan)
+            for row in plan_rows:
+                section.add_text(row)
+            if assumptions:
+                if plan_rows:
+                    section.add_spacing(4)
+                header = QLabel("Assumptions", section)
+                header.setObjectName("sectionSubheading")
+                header.setWordWrap(True)
+                section.add_widget(header)
+                self._assumption_widgets.append(header)
+                for assumption in assumptions:
+                    widget = section.add_text(f"• {assumption}")
+                    self._assumption_widgets.append(widget)
+            self._register_section("Plan", section)
+            self._plan_section = section
+            self._update_assumptions_visibility(self._settings.show_assumptions)
+            self._refresh_plan_section_visibility()
 
         critiques: list[str] = []
         if self.turn.self_check:
@@ -666,46 +814,141 @@ class AssistantBubbleWidget(ChatBubbleWidget):
             for reason in self.turn.adversarial_review.reasons:
                 critiques.append(f"• {reason}")
         if critiques:
-            section = PlanSection("Critiques", critiques)
-            _add_chip("Critiques", section)
+            section = CollapsibleSection("Critiques", accent=accent, expanded=False)
+            for row in critiques:
+                section.add_text(row)
+            self._register_section("Critiques", section)
+
+        logs_section = CollapsibleSection("Logs", accent=accent, expanded=False)
+        for line in metadata_lines:
+            logs_section.add_text(line)
+        if self.turn.step_results:
+            logs_section.add_spacing(4)
+        for result in self.turn.step_results:
+            prefix = f"{result.index}. {result.description.strip() or 'Step'}"
+            summary = result.answer.strip() or "No summary recorded"
+            markers = " ".join(f"[{idx}]" for idx in result.citation_indexes)
+            text = f"{prefix}\n{summary} {markers}".strip()
+            logs_section.add_text(text)
+        self._register_section("Logs", logs_section)
+
+        if self.turn.citations:
+            section = CollapsibleSection(
+                f"Citations ({len(self.turn.citations)})",
+                accent=accent,
+                expanded=False,
+            )
+            self._citation_entries.clear()
+            for display_index, citation in enumerate(self.turn.citations, start=1):
+                title, snippet = _describe_citation(citation)
+                entry = QFrame(section)
+                entry_layout = QVBoxLayout(entry)
+                entry_layout.setContentsMargins(0, 0, 0, 6)
+                entry_layout.setSpacing(2)
+                button = QToolButton(entry)
+                button.setObjectName("citationEntryButton")
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.setCheckable(True)
+                button.setText(f"[{display_index}] {title}")
+                button.clicked.connect(lambda _checked=False, idx=display_index: self._on_citation_list_clicked(idx))
+                entry_layout.addWidget(button)
+                if snippet:
+                    snippet_label = QLabel(snippet, entry)
+                    snippet_label.setObjectName("citationEntrySnippet")
+                    snippet_label.setWordWrap(True)
+                    snippet_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                    entry_layout.addWidget(snippet_label)
+                section.add_widget(entry)
+                self._citation_entries.append(button)
+            self._register_section("Citations", section)
+
+    def _ensure_expand_controls(self) -> None:
+        if self._expand_controls is not None:
+            return
+        controls = QFrame(self)
+        controls.setObjectName("sectionControls")
+        layout = QHBoxLayout(controls)
+        layout.setContentsMargins(12, 0, 12, 4)
+        layout.setSpacing(4)
+        layout.addStretch(1)
+        self._expand_all_button = QToolButton(controls)
+        self._expand_all_button.setText("Expand all")
+        self._expand_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._expand_all_button.clicked.connect(self._expand_all_sections)
+        layout.addWidget(self._expand_all_button)
+        self._collapse_all_button = QToolButton(controls)
+        self._collapse_all_button.setText("Collapse all")
+        self._collapse_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._collapse_all_button.clicked.connect(self._collapse_all_sections)
+        layout.addWidget(self._collapse_all_button)
+        self._expand_controls = controls
+        self.add_widget(controls)
+
+    def _register_section(self, key: str, section: CollapsibleSection) -> None:
+        if key not in self._sections:
+            self._ensure_expand_controls()
+            self._sections[key] = section
+            self._section_order.append(section)
+            section.user_toggled.connect(
+                lambda expanded, shift, sec=section: self._on_section_user_toggled(sec, expanded, shift)
+            )
+            section.toggled.connect(lambda _expanded, sec=section: self._update_expand_control_buttons())
             self.add_widget(section)
 
-        if has_chip:
-            self.layout().insertWidget(0, chip_wrapper)
+    def _on_section_user_toggled(
+        self, section: CollapsibleSection, expanded: bool, shift: bool
+    ) -> None:
+        if shift and len(self._section_order) > 1:
+            QTimer.singleShot(0, lambda: self._set_all_sections(expanded))
         else:
-            chip_wrapper.deleteLater()
+            self._update_expand_control_buttons()
+
+    def _set_all_sections(self, expanded: bool) -> None:
+        for section in self._section_order:
+            section.set_expanded(expanded, animate=True)
+        self._update_expand_control_buttons()
+
+    def _expand_all_sections(self) -> None:
+        self._set_all_sections(True)
+        for block in self._code_blocks:
+            block.expand()
+
+    def _collapse_all_sections(self) -> None:
+        self._set_all_sections(False)
+
+    def _update_expand_control_buttons(self) -> None:
+        total = len(self._section_order)
+        expanded = sum(1 for section in self._section_order if section.expanded)
+        if self._expand_all_button:
+            self._expand_all_button.setEnabled(total > 0 and expanded < total)
+        if self._collapse_all_button:
+            self._collapse_all_button.setEnabled(expanded > 0)
+        if self._hover_expand_button:
+            self._hover_expand_button.setEnabled(total > 0 and expanded < total)
+
+    def _update_expand_control_state(self) -> None:
+        has_sections = bool(self._section_order)
+        if self._expand_controls:
+            self._expand_controls.setVisible(has_sections)
+        if self._hover_expand_button:
+            self._hover_expand_button.setEnabled(has_sections)
+        self._update_expand_control_buttons()
 
     def _on_sources_only_changed(self, enabled: bool) -> None:
         self._sources_only = enabled
         for block in self._text_blocks:
             block.set_sources_only(enabled)
 
-    def _toggle_plan_sections(self) -> None:
-        if not self._plan_sections:
-            return
-        expanded = any(section.isVisible() for _button, section in self._plan_sections.values())
-        target = not expanded
-        for button, section in self._plan_sections.values():
-            button.blockSignals(True)
-            button.setChecked(target)
-            section.setVisible(target)
-            button.blockSignals(False)
-
-    def _toggle_metadata(self) -> None:
-        self.set_metadata_visible(not self._meta_label.isVisible())
-
     def _copy_answer(self) -> None:  # pragma: no cover - clipboard
         QApplication.clipboard().setText(self.turn.answer or "")
         self.notify_copy("Answer copied")
-
-    def _expand_all_code(self) -> None:
-        for block in self._code_blocks:
-            block.expand()
 
     def _on_citation_activated(self, index: int) -> None:
         self._selected_citation = index
         for block in self._text_blocks:
             block.set_highlight(index)
+        self._update_citation_entry_highlight(index)
         self._show_citation_preview(index)
         self.citation_activated.emit(index)
 
@@ -723,19 +966,40 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         pos = QCursor.pos()
         self._popover.show_payload(title, snippet, position=pos + QPoint(12, 12))
 
+    def _on_citation_list_clicked(self, index: int) -> None:
+        self._selected_citation = index
+        for block in self._text_blocks:
+            block.set_highlight(index)
+        self._update_citation_entry_highlight(index)
+        self.citation_activated.emit(index)
+        self._show_citation_preview(index)
+
+    def _jump_to_evidence_panel(self) -> None:
+        if not self.turn.citations:
+            return
+        target = self._selected_citation or 1
+        self._selected_citation = target
+        self.citation_activated.emit(target)
+
+    def _update_citation_entry_highlight(self, index: int | None) -> None:
+        for position, button in enumerate(self._citation_entries, start=1):
+            button.blockSignals(True)
+            button.setChecked(position == index)
+            button.blockSignals(False)
+
     def set_selected_citation(self, index: int | None) -> None:
         self._selected_citation = index
         for block in self._text_blocks:
             block.set_highlight(index)
+        self._update_citation_entry_highlight(index)
         if index is None:
             self._popover.hide()
 
     def set_plan_expanded(self, expanded: bool) -> None:
-        for button, section in self._plan_sections.values():
-            button.blockSignals(True)
-            button.setChecked(expanded)
-            section.setVisible(expanded)
-            button.blockSignals(False)
+        section = self._sections.get("Plan")
+        if section:
+            section.set_expanded(expanded, animate=False)
+        self._update_expand_control_buttons()
 
     def set_background_colors(
         self, *, background: str, code_background: str, accent: str
@@ -746,20 +1010,23 @@ class AssistantBubbleWidget(ChatBubbleWidget):
             block.set_accent(accent)
         for code_block in self._code_blocks:
             code_block.set_background(code_background)
+        for section in self._section_order:
+            section.set_accent(accent)
+
+    def _update_assumptions_visibility(self, enabled: bool) -> None:
+        for widget in self._assumption_widgets:
+            widget.setVisible(enabled)
+        self._refresh_plan_section_visibility()
 
     def _on_assumptions_toggle(self, enabled: bool) -> None:
-        entry = self._plan_sections.get("Assumptions")
-        if not entry:
+        self._update_assumptions_visibility(enabled)
+
+    def _refresh_plan_section_visibility(self) -> None:
+        if not self._plan_section:
             return
-        button, section = entry
-        button.setVisible(enabled)
-        if not enabled:
-            button.blockSignals(True)
-            button.setChecked(False)
-            button.blockSignals(False)
-            section.setVisible(False)
-        else:
-            section.setVisible(button.isChecked())
+        visible_assumptions = self._plan_has_assumptions and self._settings.show_assumptions
+        should_show = self._plan_has_rows or visible_assumptions
+        self._plan_section.setVisible(should_show)
 
 
 def _describe_citation(citation: Any) -> tuple[str, str]:

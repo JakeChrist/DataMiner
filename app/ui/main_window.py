@@ -347,7 +347,6 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._project_combo)
         toolbar.addSeparator()
         toolbar.addAction(self.new_project_action)
-        toolbar.addAction(self.add_folder_action)
         toolbar.addAction(self.backup_action)
         self.addToolBar(toolbar)
 
@@ -401,7 +400,9 @@ class MainWindow(QMainWindow):
         controls_header.addWidget(collapse_left)
         controls_layout.addLayout(controls_header)
 
-        add_folder_button = QPushButton("Index Folder…", controls_frame)
+        add_folder_button = QPushButton(
+            self.add_folder_action.text(), controls_frame
+        )
         add_folder_button.setObjectName("indexFolderButton")
         add_folder_button.clicked.connect(
             lambda _checked=False: self.add_folder_action.trigger()

@@ -289,7 +289,6 @@
         toolbar<span style="color: #666666">.</span>addWidget(<span style="color: #008000">self</span><span style="color: #666666">.</span>_project_combo)
         toolbar<span style="color: #666666">.</span>addSeparator()
         toolbar<span style="color: #666666">.</span>addAction(<span style="color: #008000">self</span><span style="color: #666666">.</span>new_project_action)
-        toolbar<span style="color: #666666">.</span>addAction(<span style="color: #008000">self</span><span style="color: #666666">.</span>add_folder_action)
         toolbar<span style="color: #666666">.</span>addAction(<span style="color: #008000">self</span><span style="color: #666666">.</span>backup_action)
         <span style="color: #008000">self</span><span style="color: #666666">.</span>addToolBar(toolbar)
 </code></pre>
@@ -347,7 +346,9 @@
         controls_header<span style="color: #666666">.</span>addWidget(collapse_left)
         controls_layout<span style="color: #666666">.</span>addLayout(controls_header)
 
-        add_folder_button <span style="color: #666666">=</span> QPushButton(<span style="color: #BA2121">&quot;Index Folder…&quot;</span>, controls_frame)
+        add_folder_button <span style="color: #666666">=</span> QPushButton(
+            <span style="color: #008000">self</span><span style="color: #666666">.</span>add_folder_action<span style="color: #666666">.</span>text(), controls_frame
+        )
         add_folder_button<span style="color: #666666">.</span>setObjectName(<span style="color: #BA2121">&quot;indexFolderButton&quot;</span>)
         add_folder_button<span style="color: #666666">.</span>clicked<span style="color: #666666">.</span>connect(
             <span style="color: #008000; font-weight: bold">lambda</span> _checked<span style="color: #666666">=</span><span style="color: #008000; font-weight: bold">False</span>: <span style="color: #008000">self</span><span style="color: #666666">.</span>add_folder_action<span style="color: #666666">.</span>trigger()

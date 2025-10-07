@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import socket
@@ -218,9 +219,17 @@ class LMStudioClient:
         if not body:
             raise LMStudioResponseError("Empty response from LMStudio")
         try:
-            return json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            text = body.decode("utf-8")
+        except UnicodeDecodeError as exc:  # pragma: no cover - defensive
             raise LMStudioResponseError("Invalid JSON from LMStudio") from exc
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            fallback = self._coalesce_streamed_response(text)
+            if fallback is not None:
+                return fallback
+            raise LMStudioResponseError("Invalid JSON from LMStudio") from None
 
     @staticmethod
     @log_call(logger=logger, include_result=True)
@@ -254,6 +263,148 @@ class LMStudioClient:
             reasoning=reasoning,
             raw_response=data,
         )
+
+    @staticmethod
+    def _coalesce_streamed_response(payload: str) -> dict[str, Any] | None:
+        """Merge Server-Sent Event chunks into a standard chat payload."""
+
+        events: list[dict[str, Any]] = []
+        for block in payload.split("\n\n"):
+            if not block.strip():
+                continue
+            for line in block.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith(":"):
+                    continue
+                if not stripped.startswith("data:"):
+                    continue
+                data = stripped[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    events.append(json.loads(data))
+                except json.JSONDecodeError:  # pragma: no cover - defensive
+                    return None
+
+        if not events:
+            return None
+
+        return LMStudioClient._merge_sse_events(events)
+
+    @staticmethod
+    def _merge_sse_events(events: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+        choices: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] | None = None
+        meta: dict[str, Any] = {}
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_usage = event.get("usage")
+            if isinstance(event_usage, dict):
+                usage = event_usage
+            for key in ("id", "object", "model", "created"):
+                value = event.get(key)
+                if value is not None:
+                    meta[key] = value
+
+            raw_choices = event.get("choices")
+            if not isinstance(raw_choices, Iterable):
+                continue
+            for choice in raw_choices:
+                if not isinstance(choice, dict):
+                    continue
+                index_raw = choice.get("index", 0)
+                try:
+                    index = int(index_raw)
+                except (TypeError, ValueError):
+                    index = 0
+                entry = choices.setdefault(
+                    index,
+                    {"index": index, "message": {"role": "assistant", "content": ""}},
+                )
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None:
+                    entry["finish_reason"] = finish_reason
+                logprobs = choice.get("logprobs")
+                if isinstance(logprobs, dict):
+                    entry["logprobs"] = copy.deepcopy(logprobs)
+
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    message = entry.setdefault("message", {"role": "assistant", "content": ""})
+                    LMStudioClient._merge_choice_delta(message, delta)
+
+                message_block = choice.get("message")
+                if isinstance(message_block, dict):
+                    message = entry.setdefault("message", {"role": "assistant", "content": ""})
+                    LMStudioClient._deep_merge_dicts(message, message_block)
+
+        if not choices:
+            return None
+
+        aggregated: dict[str, Any] = dict(meta)
+        aggregated["choices"] = [choices[index] for index in sorted(choices)]
+        if usage is not None:
+            aggregated["usage"] = usage
+        return aggregated
+
+    @staticmethod
+    def _merge_choice_delta(message: dict[str, Any], delta: dict[str, Any]) -> None:
+        for key, value in delta.items():
+            if key == "content":
+                if isinstance(value, str):
+                    existing = message.get("content", "")
+                    if not isinstance(existing, str):
+                        existing = LMStudioClient._normalize_message_content(existing)
+                    message["content"] = f"{existing}{value}"
+                elif isinstance(value, Iterable):
+                    normalized = LMStudioClient._normalize_message_content(value)
+                    existing = message.get("content", "")
+                    if not isinstance(existing, str):
+                        existing = LMStudioClient._normalize_message_content(existing)
+                    message["content"] = f"{existing}{normalized}"
+            elif key == "role":
+                if isinstance(value, str):
+                    message["role"] = value
+            elif isinstance(value, dict):
+                target = message.get(key)
+                if isinstance(target, dict):
+                    LMStudioClient._deep_merge_dicts(target, value)
+                else:
+                    message[key] = copy.deepcopy(value)
+            elif isinstance(value, list):
+                target_list = message.get(key)
+                if isinstance(target_list, list):
+                    target_list.extend(copy.deepcopy(value))
+                else:
+                    message[key] = copy.deepcopy(value)
+            else:
+                message[key] = value
+
+    @staticmethod
+    def _deep_merge_dicts(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, dict):
+                current = target.get(key)
+                if isinstance(current, dict):
+                    LMStudioClient._deep_merge_dicts(current, value)
+                else:
+                    target[key] = copy.deepcopy(value)
+            elif isinstance(value, list):
+                current_list = target.get(key)
+                if isinstance(current_list, list):
+                    current_list.extend(copy.deepcopy(value))
+                else:
+                    target[key] = copy.deepcopy(value)
+            elif key == "content" and isinstance(value, str):
+                existing = target.get(key)
+                if isinstance(existing, str) and existing:
+                    target[key] = existing + value
+                else:
+                    target[key] = value
+            else:
+                target[key] = copy.deepcopy(value)
 
     @staticmethod
     def _normalize_message_content(content: Any) -> str:

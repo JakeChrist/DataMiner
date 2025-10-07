@@ -257,10 +257,19 @@ def _make_handler(state: dict[str, object]) -> type[BaseHTTPRequestHandler]:
 
             status = int(current.get("status", 200))
             body = current.get("body", {})
+            headers = current.get("headers")
             if not isinstance(body, (bytes, bytearray)):
                 body = json.dumps(body).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            content_type_set = False
+            if isinstance(headers, dict):
+                for key, value in headers.items():
+                    header_name = str(key)
+                    if header_name.lower() == "content-type":
+                        content_type_set = True
+                    self.send_header(header_name, str(value))
+            if not content_type_set:
+                self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
 
@@ -437,6 +446,30 @@ def test_lmstudio_client_reports_timeout_without_deadline(
 
     assert calls == 1
     assert "timed out" in str(excinfo.value).lower()
+
+
+def test_lmstudio_client_merges_streaming_response(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    state["responses"] = [
+        {
+            "status": 200,
+            "headers": {"Content-Type": "text/event-stream"},
+            "body": (
+                "data: {\"id\": \"chatcmpl-stream\", \"object\": \"chat.completion.chunk\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Hello\"}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \" world\"}}, {\"index\": 1, \"delta\": {\"content\": \"ignored\"}}], \"usage\": {\"prompt_tokens\": 5, \"completion_tokens\": 2, \"total_tokens\": 7}}\n\n"
+                "data: [DONE]\n\n"
+            ).encode("utf-8"),
+        }
+    ]
+
+    client = LMStudioClient(base_url=base_url)
+    message = client.chat([{"role": "user", "content": "Stream please"}])
+
+    assert message.content == "Hello world"
+    assert message.raw_response.get("usage", {}).get("total_tokens") == 7
 
 
 def test_conversation_manager_handles_failures_and_recovers(

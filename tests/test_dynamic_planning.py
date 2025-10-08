@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
 from typing import Iterable
 
@@ -23,7 +24,12 @@ class StubLMStudioClient:
     def chat(self, messages, *, preset, extra_options=None) -> ChatMessage:  # type: ignore[override]
         index = len(self.requests) + 1
         self.requests.append({"messages": list(messages), "options": extra_options})
-        content = f"Step {index} finding"
+        context = ""
+        if messages:
+            context = str(messages[-1].get("content") or "")
+        match = re.search(r"\[([^\]]+)\]", context)
+        reference = match.group(1) if match else f"doc-{index}"
+        content = f"Step {index} finding ({reference})"
         citations = [
             {
                 "id": f"doc-{index}",
@@ -44,10 +50,12 @@ def _provider_for_steps(
 ) -> Iterable[StepContextBatch]:
     batches: list[StepContextBatch] = []
     for text in texts:
+        identifier = text.lower().replace(" ", "-")
+        snippet = f"[{identifier}] {text}"
         batches.append(
             StepContextBatch(
-                snippets=[text],
-                documents=[{"id": text.lower().replace(" ", "-"), "source": text, "text": text}],
+                snippets=[snippet],
+                documents=[{"id": identifier, "source": text, "text": text}],
             )
         )
     return batches
@@ -89,13 +97,15 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert "Context & Background" in turn.citations[0].get("tag_names", [])
     assert turn.step_results[0].citation_indexes == [1]
     assert turn.reasoning is not None
-    assert turn.reasoning.get("final_sections") == [
-        {
-            "title": "Context & Background",
-            "sentences": ["Finding. [1][2][3]"],
-            "citations": [1, 2, 3],
-        }
+    final_sections = turn.reasoning.get("final_sections")
+    assert final_sections is not None
+    assert [section["title"] for section in final_sections] == [
+        "Context & Background",
+        "Comparisons & Trends",
+        "Evidence & Findings",
     ]
+    assert [section["citations"] for section in final_sections] == [[1], [2], [3]]
+    assert all("(evidence-" in section["sentences"][0] for section in final_sections)
     assert not turn.reasoning.get("conflicts")
 
 

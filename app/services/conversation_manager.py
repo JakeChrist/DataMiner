@@ -2113,6 +2113,48 @@ class ConversationManager:
             plan_item.status = "done"
             combined_answer = "\n\n".join(answer_parts).strip()
             insufficient = self._text_declares_insufficient_evidence(combined_answer)
+            context_references = self._references_from_contexts(used_contexts)
+            if not insufficient and context_references:
+                answer_references = self._references_from_answer(combined_answer)
+                if not answer_references:
+                    message = (
+                        "INSUFFICIENT_EVIDENCE: Step "
+                        f"{index} did not cite any provided snippets."
+                    )
+                    combined_answer = message
+                    insufficient = True
+                    citations = []
+                    assumptions.append(message)
+                    logger.info(
+                        "Plan step missing citations",
+                        extra={
+                            "step_index": index,
+                            "description": plan_item.description,
+                        },
+                    )
+                else:
+                    unknown_references = sorted(answer_references - context_references)
+                    if unknown_references:
+                        preview = ", ".join(unknown_references[:3])
+                        if len(unknown_references) > 3:
+                            preview = f"{preview}, ..."
+                        message = (
+                            "INSUFFICIENT_EVIDENCE: Step "
+                            f"{index} cited snippets outside the retrieved context "
+                            f"({preview})."
+                        )
+                        combined_answer = message
+                        insufficient = True
+                        citations = []
+                        assumptions.append(message)
+                        logger.info(
+                            "Plan step cited unknown snippets",
+                            extra={
+                                "step_index": index,
+                                "description": plan_item.description,
+                                "unknown_references": unknown_references,
+                            },
+                        )
             result = StepResult(
                 index=index,
                 description=plan_item.description,
@@ -2135,22 +2177,21 @@ class ConversationManager:
                     },
                 )
             elif not result.citations:
-                inferred = self._fallback_citations_from_contexts(used_contexts)
-                if inferred:
-                    result.citations = inferred
-                else:
-                    note = (
-                        f"No citations available for step {index}: {plan_item.description}"
-                    )
-                    assumptions.append(note)
-                    step_assumptions.append(note)
-                    logger.info(
-                        "Recorded citation assumption",
-                        extra={
-                            "step_index": index,
-                            "description": plan_item.description,
-                        },
-                    )
+                note = (
+                    "INSUFFICIENT_EVIDENCE: Step "
+                    f"{index} ({plan_item.description}) returned no supported citations."
+                )
+                result.answer = note
+                result.insufficient = True
+                assumptions.append(note)
+                step_assumptions.append(note)
+                logger.info(
+                    "Marked plan step as unsupported due to missing citations",
+                    extra={
+                        "step_index": index,
+                        "description": plan_item.description,
+                    },
+                )
             step_results.append(result)
 
             evidence_log_entries.append(
@@ -3302,6 +3343,7 @@ class ConversationManager:
     _NUMERIC_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
     _DOC_REFERENCE_PAREN_PATTERN = re.compile(r"\(([^()]*)\)")
+    _SNIPPET_IDENTIFIER_PATTERN = re.compile(r"\[([^\]]+)\]")
     _SENTENCE_FRAGMENT_PATTERN = re.compile(r"[^.!?\n]+[.!?]?")
     _STEP_PREFIX_PATTERN = re.compile(
         r"""
@@ -3358,6 +3400,40 @@ class ConversationManager:
         stripped = ConversationManager._strip_citation_markers(text).strip()
         normalized = ConversationManager._remove_step_prefix(stripped)
         return normalized.upper().startswith("INSUFFICIENT_EVIDENCE")
+
+    @staticmethod
+    def _normalize_reference_label(label: str) -> str:
+        cleaned = re.sub(r"[\[\]()]+", " ", str(label or ""))
+        cleaned = re.sub(r"[^0-9a-zA-Z]+", " ", cleaned)
+        normalized = " ".join(cleaned.lower().split())
+        return normalized
+
+    @classmethod
+    def _references_from_answer(cls, answer: str) -> set[str]:
+        references: set[str] = set()
+        for match in cls._DOC_REFERENCE_PAREN_PATTERN.finditer(answer or ""):
+            content = match.group(1)
+            if not content:
+                continue
+            parts = re.split(r"[,;/]|\band\b|\bor\b|&", content, flags=re.IGNORECASE)
+            for part in parts:
+                normalized = cls._normalize_reference_label(part)
+                if normalized:
+                    references.add(normalized)
+        return references
+
+    @classmethod
+    def _references_from_contexts(
+        cls, contexts: Sequence[StepContextBatch]
+    ) -> set[str]:
+        references: set[str] = set()
+        for batch in contexts:
+            for snippet in batch.snippets:
+                for match in cls._SNIPPET_IDENTIFIER_PATTERN.finditer(snippet or ""):
+                    normalized = cls._normalize_reference_label(match.group(1))
+                    if normalized:
+                        references.add(normalized)
+        return references
 
     @staticmethod
     def _normalize_answer_text(text: str) -> str:

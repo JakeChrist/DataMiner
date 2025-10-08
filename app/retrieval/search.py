@@ -72,13 +72,15 @@ class SearchService:
         results: list[dict[str, Any]] = []
         for record in self._search_with_fallback(query, limit=limit * 6):
             doc_payload = record.get("document") or {}
-            path = record.get("path") or doc_payload.get("path")
-            if not path:
-                continue
-            document = documents_by_path.get(self._normalize_path(path))
+            document = self._resolve_record_document(
+                record, documents_by_path, project_id
+            )
             if document is None:
                 continue
-            doc_id = int(document.get("id"))
+            try:
+                doc_id = int(document.get("id"))
+            except (TypeError, ValueError):
+                doc_id = hash(document.get("id"))
             if doc_id in seen_documents:
                 continue
             seen_documents.add(doc_id)
@@ -159,10 +161,9 @@ class SearchService:
         seen_chunks: set[int] = set()
         for record in self._search_with_fallback(query, limit=limit * 6):
             doc_payload = record.get("document") or {}
-            path = record.get("path") or doc_payload.get("path")
-            if not path:
-                continue
-            document = documents_by_path.get(self._normalize_path(path))
+            document = self._resolve_record_document(
+                record, documents_by_path, project_id
+            )
             if document is None:
                 continue
             identifiers = self._document_identifiers(document)
@@ -252,6 +253,35 @@ class SearchService:
             },
         )
         return snippets
+
+    def _resolve_record_document(
+        self,
+        record: dict[str, Any],
+        documents_by_path: dict[str, dict[str, Any]],
+        project_id: int,
+    ) -> dict[str, Any] | None:
+        doc_payload = record.get("document") or {}
+        path = record.get("path") or doc_payload.get("path")
+        if not path:
+            return None
+        normalized_path = self._normalize_path(path)
+        if normalized_path:
+            document = documents_by_path.get(normalized_path)
+            if document is not None:
+                return document
+        document = documents_by_path.get(str(path))
+        if document is not None:
+            return document
+        if documents_by_path:
+            logger.debug(
+                "Skipping ingest result without project document",
+                extra={
+                    "project_id": project_id,
+                    "path": str(path),
+                    "available_documents": len(documents_by_path),
+                },
+            )
+        return None
 
     def _resolve_scope(
         self,

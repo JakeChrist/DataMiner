@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from urllib import error, request
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from app.services import (
     AnswerLength,
@@ -91,6 +97,33 @@ def _default_chat_response(payload: dict[str, object]) -> dict[str, object]:
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+def test_lmstudio_client_formats_model_crash_error_json() -> None:
+    payload = {
+        "error": {
+            "code": "model_crash",
+            "message": "Model crash error code: 18446744072635812000",
+        }
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    message = LMStudioClient._build_http_error_message(500, body)
+
+    assert "model crashed" in message.lower()
+    assert "-1073739616" in message
+    assert "0xFFFFFFFFC00008A0" in message
+    assert "18446744072635812000" not in message
+
+
+def test_lmstudio_client_formats_model_crash_error_text() -> None:
+    body = "Model crash error code: 18446744072635812000"
+
+    message = LMStudioClient._build_http_error_message(500, body)
+
+    assert "model crashed" in message.lower()
+    assert "-1073739616" in message
+    assert "0xFFFFFFFFC00008A0" in message
 
 
 def test_lmstudio_client_parses_structured_content() -> None:

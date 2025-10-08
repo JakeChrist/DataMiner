@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import socket
 import time
 from collections.abc import Iterable, Sequence
@@ -171,14 +172,12 @@ class LMStudioClient:
                     status = response.getcode()
                     body = response.read()
                 if status >= 400:
-                    message = body.decode("utf-8", errors="replace") if body else ""
-                    raise LMStudioResponseError(
-                        f"LMStudio returned HTTP {status}: {message.strip()}"
-                    )
+                    message = self._build_http_error_message(status, body)
+                    raise LMStudioResponseError(message)
                 return body
             except error.HTTPError as exc:
                 body = exc.read() if hasattr(exc, "read") else b""
-                message = body.decode("utf-8", errors="replace") if body else str(exc)
+                message = self._build_http_error_message(getattr(exc, "code", None), body)
                 last_error = LMStudioResponseError(message)
                 if not self._should_retry(exc.code):
                     break
@@ -263,6 +262,155 @@ class LMStudioClient:
             reasoning=reasoning,
             raw_response=data,
         )
+
+    @staticmethod
+    def _build_http_error_message(
+        status: int | None, body: bytes | str | None
+    ) -> str:
+        summary = LMStudioClient._summarize_error_body(body)
+        if status is not None:
+            if summary:
+                return f"LMStudio returned HTTP {status}: {summary}"
+            return f"LMStudio returned HTTP {status}"
+        return summary or "LMStudio request failed"
+
+    @staticmethod
+    def _summarize_error_body(body: bytes | str | None) -> str:
+        if body is None:
+            return ""
+        if isinstance(body, bytes):
+            text = body.decode("utf-8", errors="replace")
+        else:
+            text = str(body)
+        text = text.strip()
+        if not text:
+            return ""
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return LMStudioClient._normalize_error_message(text)
+        if isinstance(data, dict):
+            buckets: list[dict[str, Any]] = []
+            error_payload = data.get("error")
+            if isinstance(error_payload, dict):
+                buckets.append(error_payload)
+            buckets.append(data)
+            for bucket in buckets:
+                if not isinstance(bucket, dict):
+                    continue
+                message = bucket.get("message") or bucket.get("detail") or ""
+                if not isinstance(message, str):
+                    message = str(message)
+                hints = [
+                    str(bucket[key]).strip()
+                    for key in ("hint", "help")
+                    if isinstance(bucket.get(key), str) and str(bucket[key]).strip()
+                ]
+                normalized = LMStudioClient._normalize_error_message(
+                    message,
+                    code=bucket.get("code"),
+                    hints=hints,
+                )
+                if normalized:
+                    return normalized
+        return LMStudioClient._normalize_error_message(text)
+
+    @staticmethod
+    def _normalize_error_message(
+        message: str, *, code: Any = None, hints: Sequence[str] | None = None
+    ) -> str:
+        clean = " ".join(str(message or "").split())
+        hint_text = ""
+        if hints:
+            parts = [" ".join(str(hint).split()) for hint in hints if str(hint).strip()]
+            hint_text = " ".join(parts).strip()
+        crash_message = LMStudioClient._humanize_model_crash(clean, code=code)
+        if crash_message:
+            if hint_text:
+                return f"{crash_message} Details: {hint_text}"
+            return crash_message
+        if hint_text:
+            if clean:
+                return f"{clean} ({hint_text})"
+            return hint_text
+        return clean
+
+    @staticmethod
+    def _humanize_model_crash(message: str, *, code: Any = None) -> str | None:
+        crash_hint = False
+        numeric_code = LMStudioClient._coerce_int(code)
+        if numeric_code is None:
+            numeric_code = LMStudioClient._extract_large_number(message)
+        elif numeric_code >= 1 << 31:
+            crash_hint = True
+        normalized_message = message.strip()
+        lower = normalized_message.lower()
+        if "model crash" in lower or "model crashed" in lower:
+            crash_hint = True
+        if isinstance(code, str) and code.lower() == "model_crash":
+            crash_hint = True
+        if numeric_code is not None and numeric_code >= 1 << 31:
+            crash_hint = True
+        if not crash_hint:
+            return None
+        formatted_code = None
+        if numeric_code is not None and numeric_code >= 1 << 31:
+            formatted_code = LMStudioClient._format_crash_code(numeric_code)
+        details = normalized_message
+        if formatted_code and numeric_code is not None and details:
+            digits = str(numeric_code)
+            if digits in details:
+                details = details.replace(digits, formatted_code)
+        details = details.strip(" .")
+        friendly = "LMStudio reported that the model crashed"
+        if formatted_code:
+            friendly += f" (error {formatted_code})"
+        friendly += ". Restart the model in LMStudio and try again."
+        if details and details.lower() not in {"model crash", "model crash error"}:
+            friendly += f" Details: {details}"
+        return friendly
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            try:
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return int(stripped)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _extract_large_number(text: str) -> int | None:
+        for match in re.finditer(r"\d{9,}", text):
+            try:
+                value = int(match.group(0))
+            except ValueError:
+                continue
+            if value >= 1 << 31:
+                return value
+        return None
+
+    @staticmethod
+    def _format_crash_code(value: int) -> str:
+        if value >= 1 << 63:
+            signed = value - (1 << 64)
+            hex_value = f"0x{value & ((1 << 64) - 1):016X}"
+        else:
+            signed = value - (1 << 32)
+            hex_value = f"0x{value & ((1 << 32) - 1):08X}"
+        return f"{signed} / {hex_value}"
 
     @staticmethod
     def _coalesce_streamed_response(payload: str) -> dict[str, Any] | None:

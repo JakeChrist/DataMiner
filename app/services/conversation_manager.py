@@ -2310,15 +2310,15 @@ class ConversationManager:
                     if citation_index <= 0 or citation_index > len(aggregated):
                         continue
                     citation = aggregated[citation_index - 1]
-                if isinstance(citation, dict):
-                    citation["conflict_summary"] = note.summary
-                    citation["conflicts"] = [
-                        {
-                            "text": variant["text"],
-                            "citations": variant["citations"],
-                        }
-                        for variant in note.variants
-                    ]
+                    if isinstance(citation, dict):
+                        citation["conflict_summary"] = note.summary
+                        citation["conflicts"] = [
+                            {
+                                "text": variant["text"],
+                                "citations": variant["citations"],
+                            }
+                            for variant in note.variants
+                        ]
         if task_charter is not None:
             reasoning_payload["task_charter"] = asdict(task_charter)
         if finalized_digest_entries:

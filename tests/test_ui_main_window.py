@@ -360,11 +360,11 @@ def test_question_includes_retrieval_context(
     context_path.write_text(context_text, encoding="utf-8")
 
     class RecordingConversationManager:
-        def __init__(self, _client) -> None:
+        def __init__(self, _client, *, working_memory=None, **_kwargs) -> None:
             self.turns: list[ConversationTurn] = []
             self.last_call: dict[str, object] | None = None
             self._state = ConnectionState(True, None)
-
+            
         def add_connection_listener(self, _listener):
             return lambda: None
 

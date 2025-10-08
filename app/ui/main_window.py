@@ -75,6 +75,7 @@ from ..services.project_service import ProjectRecord, ProjectService
 from ..services.backup_service import BackupService
 from ..services.export_service import ExportService
 from ..services.settings_service import SettingsService, ChatStyleSettings
+from ..services.working_memory import WorkingMemoryService
 from ..storage import DatabaseError
 from ..logging import get_log_file_path
 from .answer_view import AnswerView, ChatTurnWidget
@@ -176,7 +177,11 @@ class MainWindow(QMainWindow):
         self._create_menus_and_toolbar()
         self._create_status_bar()
         self.conversation_settings = ConversationSettings()
-        self._conversation_manager = ConversationManager(self.lmstudio_client)
+        self.working_memory_service = WorkingMemoryService(project_service.working_memory)
+        self._conversation_manager = ConversationManager(
+            self.lmstudio_client,
+            working_memory=self.working_memory_service,
+        )
         self.search_service = SearchService(
             project_service.ingest,
             project_service.documents,
@@ -1609,6 +1614,10 @@ class MainWindow(QMainWindow):
                     retrieval_documents=retrieval_documents or None,
                     scope=scope_snapshot,
                 )
+                try:
+                    active_project_id = self.project_service.active_project_id
+                except RuntimeError:
+                    active_project_id = None
                 turn = self._conversation_manager.ask(
                     question,
                     context_snippets=context_snippets or None,
@@ -1617,6 +1626,7 @@ class MainWindow(QMainWindow):
                     preset=self.conversation_settings.answer_length,
                     extra_options=extra_options or None,
                     context_provider=step_context_provider,
+                    project_id=active_project_id,
                 )
             except LMStudioError as exc:
                 QMetaObject.invokeMethod(
@@ -1700,6 +1710,20 @@ class MainWindow(QMainWindow):
                 exclude_identifiers=exclude,
                 limit=limit,
             )
+            memory_records: list[dict[str, Any]] = []
+            try:
+                memory_records = self.working_memory_service.collect_context_records(
+                    combined_query,
+                    project_id=project_id,
+                    limit=max(3, limit // 3) or 3,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Working memory retrieval failed",
+                    extra={"project_id": project_id, "step_index": step_index},
+                )
+            if memory_records:
+                records.extend(memory_records)
             batches: list[StepContextBatch] = []
             for chunk in self._chunk_records(records, chunk_size):
                 snippets, documents = self._context_payload_from_records(
@@ -1731,6 +1755,20 @@ class MainWindow(QMainWindow):
             include_identifiers=include,
             exclude_identifiers=exclude,
         )
+        try:
+            memory_records = self.working_memory_service.collect_context_records(
+                question,
+                project_id=project_id,
+                limit=5,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Working memory retrieval failed",
+                extra={"project_id": project_id},
+            )
+            memory_records = []
+        if memory_records:
+            records.extend(memory_records)
         return self._context_payload_from_records(records, project_id)
 
     def _context_payload_from_records(

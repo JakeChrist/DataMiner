@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 from typing import Any, Literal
 
 from ..logging import log_call
+from .working_memory import WorkingMemoryService
 
 
 logger = logging.getLogger(__name__)
@@ -1481,6 +1482,7 @@ class ConversationManager:
         *,
         system_prompt: str | None = None,
         context_window: int = 4,
+        working_memory: WorkingMemoryService | None = None,
     ) -> None:
         self.client = client
         self.system_prompt = system_prompt
@@ -1494,6 +1496,7 @@ class ConversationManager:
         self._plan_critic = _PlanCritic()
         self._judge_log: deque[dict[str, Any]] = deque(maxlen=50)
         self._lock = threading.RLock()
+        self._working_memory = working_memory
 
     def add_connection_listener(
         self, listener: Callable[[ConnectionState], None]
@@ -1538,6 +1541,7 @@ class ConversationManager:
         response_mode: ResponseMode = ResponseMode.GENERATIVE,
         extra_options: dict[str, Any] | None = None,
         context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]] | None = None,
+        project_id: int | None = None,
     ) -> ConversationTurn:
         """Send ``question`` to LMStudio and append the resulting turn."""
 
@@ -1570,6 +1574,7 @@ class ConversationManager:
                         response_mode=response_mode,
                         extra_options=extra_options,
                         context_provider=context_provider,
+                        project_id=project_id,
                     )
                 except DynamicPlanningError:
                     turn = self._ask_single_shot(
@@ -1579,6 +1584,7 @@ class ConversationManager:
                         reasoning_verbosity=reasoning_verbosity,
                         response_mode=response_mode,
                         extra_options=extra_options,
+                        project_id=project_id,
                     )
             else:
                 turn = self._ask_single_shot(
@@ -1588,6 +1594,7 @@ class ConversationManager:
                     reasoning_verbosity=reasoning_verbosity,
                     response_mode=response_mode,
                     extra_options=extra_options,
+                    project_id=project_id,
                 )
             logger.info(
                 "Completed question",
@@ -1611,6 +1618,7 @@ class ConversationManager:
         reasoning_verbosity: ReasoningVerbosity | None,
         response_mode: ResponseMode,
         extra_options: dict[str, Any] | None,
+        project_id: int | None,
     ) -> ConversationTurn:
         question_preview = question.strip()[:120]
         messages = self._build_messages(question, context_snippets)
@@ -1641,7 +1649,25 @@ class ConversationManager:
             raise
 
         self._update_connection(True, None)
+        turn_id = len(self.turns) + 1
         turn = self._register_turn(question, response, response_mode, preset)
+        if self._working_memory and project_id is not None:
+            try:
+                self._working_memory.store_turn_memory(
+                    project_id=project_id,
+                    turn_index=turn_id,
+                    question=question,
+                    answer=turn.answer,
+                    plan=[],
+                    step_results=[],
+                    state_digest=turn.state_digest,
+                    evidence_log=turn.evidence_log,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist working memory for single-shot turn",
+                    extra={"project_id": project_id},
+                )
         logger.info(
             "Single-shot query completed",
             extra={
@@ -1956,6 +1982,7 @@ class ConversationManager:
         response_mode: ResponseMode,
         extra_options: dict[str, Any] | None,
         context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]],
+        project_id: int | None,
     ) -> ConversationTurn:
         normalized_question = question.strip()
         question_preview = normalized_question[:120]
@@ -2335,6 +2362,23 @@ class ConversationManager:
             adversarial_review=review_report,
         )
         self.turns.append(turn)
+        if self._working_memory and project_id is not None:
+            try:
+                self._working_memory.store_turn_memory(
+                    project_id=project_id,
+                    turn_index=turn_id,
+                    question=question,
+                    answer=answer,
+                    plan=executed_plan,
+                    step_results=step_results,
+                    state_digest=finalized_digest_entries,
+                    evidence_log=evidence_log_entries,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist working memory for dynamic plan",
+                    extra={"project_id": project_id},
+                )
         logger.info(
             "Dynamic plan completed",
             extra={

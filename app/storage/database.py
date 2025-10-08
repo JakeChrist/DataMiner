@@ -14,12 +14,12 @@ import threading
 from bisect import bisect_left
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:
     from app.ingest.parsers import DocumentSection, ParsedDocument
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA_FILENAME = "schema.sql"
 
 
@@ -1844,6 +1844,213 @@ class ChatRepository(BaseRepository):
         return record
 
 
+class WorkingMemoryRepository(BaseRepository):
+    """Persist and search working memory entries captured during conversations."""
+
+    _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
+
+    def add_entry(
+        self,
+        project_id: int,
+        turn_index: int,
+        *,
+        kind: str,
+        title: str | None = None,
+        summary: str | None = None,
+        content: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        step_index: int | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_title = title.strip() if isinstance(title, str) else None
+        normalized_summary = summary.strip() if isinstance(summary, str) else None
+        payload = json.dumps(metadata) if metadata is not None else None
+        content_parts: list[str] = []
+        for part in (content, normalized_summary, normalized_title):
+            if part:
+                content_parts.append(part)
+        if metadata is not None:
+            try:
+                content_parts.append(json.dumps(metadata, ensure_ascii=False))
+            except (TypeError, ValueError):
+                pass
+        fts_content = " ".join(part for part in content_parts if part)
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO working_memory_entries (
+                    project_id,
+                    turn_index,
+                    step_index,
+                    kind,
+                    title,
+                    summary,
+                    metadata
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    turn_index,
+                    step_index,
+                    kind,
+                    normalized_title,
+                    normalized_summary,
+                    payload,
+                ),
+            )
+            entry_id = cursor.lastrowid
+            connection.execute(
+                """
+                INSERT INTO working_memory_index (
+                    rowid,
+                    content,
+                    entry_id,
+                    project_id,
+                    turn_index,
+                    step_index,
+                    kind
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry_id,
+                    fts_content,
+                    entry_id,
+                    project_id,
+                    turn_index,
+                    step_index,
+                    kind,
+                ),
+            )
+        return self.get(entry_id)
+
+    def clear_turn(self, project_id: int, turn_index: int) -> None:
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT id FROM working_memory_entries WHERE project_id = ? AND turn_index = ?",
+                (project_id, turn_index),
+            ).fetchall()
+            if not rows:
+                return
+            entry_ids = [int(row["id"]) for row in rows]
+            connection.executemany(
+                "DELETE FROM working_memory_entries WHERE id = ?",
+                [(entry_id,) for entry_id in entry_ids],
+            )
+            connection.executemany(
+                "DELETE FROM working_memory_index WHERE entry_id = ?",
+                [(entry_id,) for entry_id in entry_ids],
+            )
+
+    def get(self, entry_id: int) -> dict[str, Any] | None:
+        row = self.db.connect().execute(
+            "SELECT * FROM working_memory_entries WHERE id = ?",
+            (entry_id,),
+        ).fetchone()
+        return self._decode_entry(row)
+
+    def list_for_project(
+        self,
+        project_id: int,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM working_memory_entries WHERE project_id = ? ORDER BY created_at DESC"
+        params: list[Any] = [project_id]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self.db.connect().execute(sql, params).fetchall()
+        return [entry for entry in (self._decode_entry(row) for row in rows) if entry]
+
+    def search(
+        self,
+        project_id: int,
+        query: str,
+        *,
+        limit: int = 5,
+        kinds: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized = (query or "").strip()
+        if not normalized:
+            return []
+        candidates = self._build_queries(normalized)
+        if not candidates:
+            candidates = [normalized]
+        connection = self.db.connect()
+        results: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        kind_clause = ""
+        params_extra: list[Any] = []
+        if kinds:
+            placeholders = ", ".join("?" for _ in kinds)
+            kind_clause = f" AND e.kind IN ({placeholders})"
+            params_extra.extend(kinds)
+        for candidate in candidates:
+            try:
+                rows = connection.execute(
+                    f"""
+                    SELECT
+                        e.*,
+                        snippet(working_memory_index, 0, '<mark>', '</mark>', '…', 96) AS highlight,
+                        bm25(working_memory_index) AS score
+                    FROM working_memory_index
+                    JOIN working_memory_entries AS e
+                      ON e.id = working_memory_index.rowid
+                    WHERE working_memory_index MATCH ?
+                      AND working_memory_index.project_id = ?
+                      {kind_clause}
+                    ORDER BY score ASC
+                    LIMIT ?
+                    """,
+                    [candidate, project_id, *params_extra, limit],
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for row in rows:
+                entry = self._decode_entry(row)
+                if not entry:
+                    continue
+                entry_id = int(entry["id"])
+                if entry_id in seen:
+                    continue
+                seen.add(entry_id)
+                entry["highlight"] = row["highlight"]
+                score = row["score"]
+                entry["score"] = float(score) if score is not None else None
+                results.append(entry)
+            if results:
+                break
+        return results
+
+    def _decode_entry(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        record = self._row_to_dict(row)
+        if record is None:
+            return None
+        metadata = record.get("metadata")
+        if isinstance(metadata, str) and metadata:
+            try:
+                record["metadata"] = json.loads(metadata)
+            except json.JSONDecodeError:
+                record["metadata"] = {}
+        elif metadata is None:
+            record["metadata"] = {}
+        return record
+
+    @classmethod
+    def _build_queries(cls, query: str) -> list[str]:
+        tokens = [match.group(0) for match in cls._TOKEN_PATTERN.finditer(query)]
+        if not tokens:
+            return []
+        queries: list[str] = []
+        queries.append(" ".join(tokens))
+        wildcard = [f"{token}*" for token in tokens]
+        queries.append(" ".join(wildcard))
+        if len(wildcard) > 1:
+            queries.append(" OR ".join(wildcard))
+        return queries
+
+
 class BackgroundTaskLogRepository(BaseRepository):
     """Persist and query background task execution metadata."""
 
@@ -1972,4 +2179,5 @@ __all__ = [
     "DocumentRepository",
     "ChatRepository",
     "BackgroundTaskLogRepository",
+    "WorkingMemoryRepository",
 ]

@@ -1621,7 +1621,11 @@ class ConversationManager:
         project_id: int | None,
     ) -> ConversationTurn:
         question_preview = question.strip()[:120]
-        messages = self._build_messages(question, context_snippets)
+        messages = self._build_messages(
+            question,
+            context_snippets,
+            extra_system_prompts=[CONSOLIDATION_SYSTEM_PROMPT],
+        )
         logger.info(
             "Dispatching single-shot query",
             extra={

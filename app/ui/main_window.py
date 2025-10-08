@@ -1826,32 +1826,53 @@ class MainWindow(QMainWindow):
                 payload["path"] = str(source_path)
             document_id = document.get("id")
             if document_id is not None:
-                payload["document_id"] = int(document_id)
+                self._store_numeric(payload, "document_id", document_id, fallback_to_string=True)
             chunk_id = chunk.get("id") if isinstance(chunk, dict) else None
             if chunk_id is not None:
-                payload["chunk_id"] = int(chunk_id)
+                self._store_numeric(payload, "chunk_id", chunk_id, fallback_to_string=True)
             chunk_index = chunk.get("index") if isinstance(chunk, dict) else None
             if chunk_index is not None:
-                payload["chunk_index"] = int(chunk_index)
+                self._store_numeric(payload, "chunk_index", chunk_index, fallback_to_string=True)
             start_offset = chunk.get("start_offset") if isinstance(chunk, dict) else None
             if start_offset is not None:
-                payload["start_offset"] = int(start_offset)
+                self._store_numeric(payload, "start_offset", start_offset)
             end_offset = chunk.get("end_offset") if isinstance(chunk, dict) else None
             if end_offset is not None:
-                payload["end_offset"] = int(end_offset)
+                self._store_numeric(payload, "end_offset", end_offset)
             highlight = record.get("highlight")
             if highlight:
                 payload["snippet"] = str(highlight)
             ingest_doc = record.get("ingest_document") or {}
             ingest_id = ingest_doc.get("id")
             if ingest_id is not None:
-                payload["ingest_document_id"] = int(ingest_id)
+                self._store_numeric(payload, "ingest_document_id", ingest_id)
             ingest_version = ingest_doc.get("version")
             if ingest_version is not None:
-                payload["ingest_version"] = int(ingest_version)
+                self._store_numeric(payload, "ingest_version", ingest_version)
             retrieval_documents.append(payload)
 
         return snippets, retrieval_documents
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _store_numeric(
+        payload: dict[str, Any],
+        key: str,
+        value: Any,
+        *,
+        fallback_to_string: bool = False,
+    ) -> None:
+        numeric = MainWindow._coerce_int(value)
+        if numeric is not None:
+            payload[key] = numeric
+        elif fallback_to_string:
+            payload[key] = str(value)
 
     @staticmethod
     def _chunk_records(

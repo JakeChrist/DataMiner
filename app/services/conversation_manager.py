@@ -12,7 +12,7 @@ import logging
 import re
 import textwrap
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from difflib import SequenceMatcher
 from enum import Enum
@@ -200,6 +200,9 @@ class ReasoningArtifacts:
     assumptions: list[str] = field(default_factory=list)
     assumption_decision: AssumptionDecision | None = None
     self_check: SelfCheckResult | None = None
+    task_charter: TaskCharter | None = None
+    state_digest: list[StateDigestEntry] = field(default_factory=list)
+    evidence_log: list[EvidenceRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -253,6 +256,24 @@ class ConversationTurn:
             return None
         return self.reasoning_artifacts.self_check
 
+    @property
+    def task_charter(self) -> TaskCharter | None:
+        if self.reasoning_artifacts is None:
+            return None
+        return self.reasoning_artifacts.task_charter
+
+    @property
+    def state_digest(self) -> list[StateDigestEntry]:
+        if self.reasoning_artifacts is None:
+            return []
+        return list(self.reasoning_artifacts.state_digest)
+
+    @property
+    def evidence_log(self) -> list[EvidenceRecord]:
+        if self.reasoning_artifacts is None:
+            return []
+        return list(self.reasoning_artifacts.evidence_log)
+
 
 @dataclass(frozen=True)
 class ConnectionState:
@@ -281,6 +302,40 @@ class StepResult:
     contexts: list[StepContextBatch] = field(default_factory=list)
     citation_indexes: list[int] = field(default_factory=list)
     insufficient: bool = False
+
+
+@dataclass
+class TaskCharter:
+    """Structured snapshot of the framed user task."""
+
+    goal: str
+    deliverable: str
+    audience: str
+    constraints: list[str] = field(default_factory=list)
+    success_criteria: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    clarifying_questions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StateDigestEntry:
+    """Condensed memory of a completed plan step."""
+
+    step_index: int
+    summary: str
+    citation_indexes: list[int] = field(default_factory=list)
+    pending_questions: list[str] = field(default_factory=list)
+    decisions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EvidenceRecord:
+    """Trace of retrieval intent and supporting documents for a step."""
+
+    step_index: int
+    intent: str
+    documents: list[dict[str, Any]] = field(default_factory=list)
+    snippets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1913,6 +1968,9 @@ class ConversationManager:
         self._ledger.clear_turn(turn_id)
         shared_context = "\n\n".join(context_snippets or [])
         base_options = copy.deepcopy(extra_options) if extra_options else {}
+        task_charter = self._frame_task(question)
+        state_digest_pairs: list[tuple[StepResult, StateDigestEntry]] = []
+        evidence_log_entries: list[EvidenceRecord] = []
         executed_plan: list[PlanItem] = [
             PlanItem(description=item.description, status="queued") for item in plan_items
         ]
@@ -1930,6 +1988,10 @@ class ConversationManager:
 
         for index, plan_item in enumerate(executed_plan, start=1):
             plan_item.status = "running"
+            intent_note = self._build_retrieval_intent(
+                plan_item.description, index, total_steps
+            )
+            step_assumptions: list[str] = []
             try:
                 batches = list(context_provider(plan_item, index, total_steps))
             except Exception as exc:  # pragma: no cover - fallback to single shot
@@ -2035,6 +2097,8 @@ class ConversationManager:
             if result.insufficient:
                 if combined_answer not in assumptions:
                     assumptions.append(combined_answer)
+                if combined_answer not in step_assumptions:
+                    step_assumptions.append(combined_answer)
                 result.citations = []
                 logger.info(
                     "Removed citations from insufficient step",
@@ -2048,9 +2112,11 @@ class ConversationManager:
                 if inferred:
                     result.citations = inferred
                 else:
-                    assumptions.append(
+                    note = (
                         f"No citations available for step {index}: {plan_item.description}"
                     )
+                    assumptions.append(note)
+                    step_assumptions.append(note)
                     logger.info(
                         "Recorded citation assumption",
                         extra={
@@ -2059,6 +2125,17 @@ class ConversationManager:
                         },
                     )
             step_results.append(result)
+
+            evidence_log_entries.append(
+                self._build_evidence_record(index, intent_note, used_contexts)
+            )
+            digest_entry = StateDigestEntry(
+                step_index=index,
+                summary=self._summarize_step_result(result),
+                pending_questions=list(step_assumptions),
+                decisions=[self._summarize_plan_decision(plan_item.description)],
+            )
+            state_digest_pairs.append((result, digest_entry))
 
             logger.info(
                 "Plan step completed",
@@ -2084,6 +2161,11 @@ class ConversationManager:
             result.citation_indexes = indexes
             if not result.insufficient:
                 self._ledger.record_step(turn_id, result)
+
+        finalized_digest_entries: list[StateDigestEntry] = []
+        for result, entry in state_digest_pairs:
+            entry.citation_indexes = list(result.citation_indexes)
+            finalized_digest_entries.append(entry)
 
         consolidation = self._compose_final_answer(
             step_results, ledger=self._ledger, turn_id=turn_id
@@ -2135,17 +2217,24 @@ class ConversationManager:
         ledger_snapshot = self._ledger.snapshot_for_turn(turn_id)
         answer = consolidation.text
         summary = f"Executed {total_steps} dynamic step{'s' if total_steps != 1 else ''}."
+        charter_assumptions = list(task_charter.assumptions) if task_charter else []
+        combined_assumptions = list(
+            dict.fromkeys(assumptions + charter_assumptions)
+        )
         artifacts = ReasoningArtifacts(
             summary_bullets=[summary],
             plan_items=executed_plan,
-            assumptions=assumptions,
+            assumptions=combined_assumptions,
+            task_charter=task_charter,
+            state_digest=finalized_digest_entries,
+            evidence_log=evidence_log_entries,
         )
         reasoning_payload = {
             "plan": [
                 {"description": item.description, "status": item.status}
                 for item in executed_plan
             ],
-            "assumptions": assumptions,
+            "assumptions": combined_assumptions,
             "steps": [
                 {
                     "index": result.index,
@@ -2194,21 +2283,41 @@ class ConversationManager:
                     if citation_index <= 0 or citation_index > len(aggregated):
                         continue
                     citation = aggregated[citation_index - 1]
-                    if isinstance(citation, dict):
-                        citation["conflict_summary"] = note.summary
-                        citation["conflicts"] = [
-                            {
-                                "text": variant["text"],
-                                "citations": variant["citations"],
-                            }
-                            for variant in note.variants
-                        ]
+                if isinstance(citation, dict):
+                    citation["conflict_summary"] = note.summary
+                    citation["conflicts"] = [
+                        {
+                            "text": variant["text"],
+                            "citations": variant["citations"],
+                        }
+                        for variant in note.variants
+                    ]
+        if task_charter is not None:
+            reasoning_payload["task_charter"] = asdict(task_charter)
+        if finalized_digest_entries:
+            reasoning_payload["state_digest"] = [
+                asdict(entry) for entry in finalized_digest_entries
+            ]
+        if evidence_log_entries:
+            reasoning_payload["evidence_log"] = [
+                asdict(record) for record in evidence_log_entries
+            ]
         raw_response = {
             "dynamic_plan": {
                 "steps": reasoning_payload["steps"],
                 "citations": aggregated,
             }
         }
+        if task_charter is not None:
+            raw_response["dynamic_plan"]["task_charter"] = asdict(task_charter)
+        if finalized_digest_entries:
+            raw_response["dynamic_plan"]["state_digest"] = [
+                asdict(entry) for entry in finalized_digest_entries
+            ]
+        if evidence_log_entries:
+            raw_response["dynamic_plan"]["evidence_log"] = [
+                asdict(record) for record in evidence_log_entries
+            ]
         if ledger_snapshot:
             raw_response["dynamic_plan"]["ledger"] = ledger_snapshot
         turn = ConversationTurn(
@@ -2569,6 +2678,241 @@ class ConversationManager:
             f"Output: {output_hint.strip()} (include chunk IDs used)"
         )
         return PlanItem(description=description, status="queued")
+
+    def _frame_task(self, question: str) -> TaskCharter:
+        text = " ".join((question or "").split())
+        if not text:
+            text = "Respond to the question"
+        goal = text.rstrip("? ") or "Respond to the question"
+        deliverable, deliverable_assumption = self._infer_deliverable(text)
+        audience, audience_assumption = self._infer_audience(text)
+        constraints = self._extract_constraints(text)
+        success = self._derive_success_criteria(text, deliverable, constraints)
+        clarifying_questions = self._suggest_clarifying_questions(
+            text, deliverable, deliverable_assumption, constraints
+        )
+        assumptions: list[str] = [
+            "Grounding the response strictly in retrieved corpus evidence.",
+        ]
+        if deliverable_assumption:
+            assumptions.append(deliverable_assumption)
+        if audience_assumption:
+            assumptions.append(audience_assumption)
+        assumptions = list(dict.fromkeys(filter(None, assumptions)))
+        clarifying_questions = clarifying_questions[:2]
+        return TaskCharter(
+            goal=goal,
+            deliverable=deliverable,
+            audience=audience,
+            constraints=constraints,
+            success_criteria=success,
+            assumptions=assumptions,
+            clarifying_questions=clarifying_questions,
+        )
+
+    def _infer_deliverable(self, text: str) -> tuple[str, str | None]:
+        lower = text.lower()
+        mappings: list[tuple[str, str]] = [
+            (r"\btimeline\b", "Chronological timeline"),
+            (r"\btable\b", "Comparative table"),
+            (r"\bcompare\b", "Comparative summary"),
+            (r"\brecommend", "Recommendation memo"),
+            (r"\boutline\b", "Structured outline"),
+            (r"\bplan\b", "Action plan"),
+            (r"\bsummary\b|\bsummarise\b|\bsummarize\b", "Executive summary"),
+            (r"\blist\b|\bbullet\b", "Bullet list of findings"),
+        ]
+        for pattern, label in mappings:
+            if re.search(pattern, lower):
+                return label, None
+        return (
+            "Structured narrative summary with citations",
+            "Assuming a narrative summary format is acceptable.",
+        )
+
+    def _infer_audience(self, text: str) -> tuple[str, str | None]:
+        lower = text.lower()
+        audience_map: list[tuple[str, str]] = [
+            (r"\bexecutive\b|c-suite|\bboard\b", "Executive stakeholders"),
+            (r"\bcto\b|\bcfo\b|\bcio\b", "C-suite stakeholders"),
+            (
+                r"\bengineer\b|\bdeveloper\b|\barchitect\b|\btechnical\b",
+                "Technical stakeholders",
+            ),
+            (r"\bclient\b|\bcustomer\b|\bend[- ]user\b", "Customer audience"),
+            (r"\bmarketing\b|\bsales\b|\bbusiness\b", "Business stakeholders"),
+        ]
+        for pattern, label in audience_map:
+            if re.search(pattern, lower):
+                return label, None
+        return (
+            "General knowledge worker",
+            "Assuming the response is for a general knowledge worker audience.",
+        )
+
+    def _extract_constraints(self, text: str) -> list[str]:
+        lower = text.lower()
+        constraints: list[str] = ["Ground the answer in retrieved corpus evidence."]
+        seen: set[str] = set(constraints)
+
+        def _add(item: str | None) -> None:
+            if not item:
+                return
+            if item not in seen:
+                constraints.append(item)
+                seen.add(item)
+
+        length_match = re.search(
+            r"(?:within|under|no more than)\s+(\d+)\s+(words?|sentences?|paragraphs?)",
+            lower,
+        )
+        if length_match:
+            amount, unit = length_match.groups()
+            _add(f"Limit the response to {amount} {unit}.")
+
+        if "bullet" in lower or "list" in lower:
+            _add("Use bullet list formatting for key points.")
+        if "table" in lower:
+            _add("Present the information in a clearly labeled table.")
+        if "timeline" in lower:
+            _add("Organize events in chronological order.")
+        if re.search(r"\bcite\b|\bcitation\b|\breference\b", lower):
+            _add("Include explicit citation markers for each claim.")
+
+        focus_match = re.search(r"focus on ([^.;,]+)", lower)
+        if focus_match:
+            target = focus_match.group(1).strip()
+            if target:
+                _add(f"Prioritize coverage of {target}.")
+
+        return constraints
+
+    def _derive_success_criteria(
+        self, text: str, deliverable: str, constraints: Sequence[str]
+    ) -> list[str]:
+        lower = text.lower()
+        criteria: list[str] = []
+        if "compare" in lower:
+            criteria.append("Surface key similarities and differences.")
+        if re.search(r"recommend|advise|suggest", lower):
+            criteria.append("Provide actionable recommendations tied to evidence.")
+        if re.search(r"summar", lower):
+            criteria.append("Highlight the most important insights succinctly.")
+        if re.search(r"analy|assess|evaluate", lower):
+            criteria.append("Explain the drivers or implications found in the evidence.")
+        if "timeline" in lower:
+            criteria.append("Capture major milestones with associated dates.")
+        if not criteria:
+            criteria.append(
+                f"Deliver a {deliverable.lower()} that directly resolves the stated goal."
+            )
+        if not any("citation" in item.lower() for item in criteria):
+            criteria.append("Cite supporting documents for each substantive claim.")
+        for constraint in constraints:
+            criteria.append(f"Honor constraint: {constraint}")
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(criteria))
+
+    def _suggest_clarifying_questions(
+        self,
+        text: str,
+        deliverable: str,
+        deliverable_assumption: str | None,
+        constraints: Sequence[str],
+    ) -> list[str]:
+        lower = text.lower()
+        questions: list[str] = []
+        if deliverable_assumption:
+            questions.append(
+                "Do you prefer the findings presented as a table, bullet list, or narrative paragraphs?"
+            )
+        if re.search(r"\brecent\b|\blast\b", lower) and not re.search(
+            r"last\s+\d+\s+(day|week|month|year)s?|20\d{2}", lower
+        ):
+            questions.append("What timeframe should 'recent' cover?")
+        if (
+            "Include explicit citation markers" not in " ".join(constraints)
+            and "citation" in lower
+        ):
+            questions.append("Do you require inline citation markers or a separate reference list?")
+        return questions[:2]
+
+    def _build_retrieval_intent(
+        self, description: str, index: int, total_steps: int
+    ) -> str:
+        normalized = description.strip()
+        match = _PlanCritic._STEP_PATTERN.match(normalized)
+        if match:
+            input_hint = match.group("input").strip()
+            action = match.group("action").strip().lower()
+            output = match.group("output").strip().lower()
+            return (
+                f"Step {index}/{total_steps}: use {input_hint.lower()} to {action} "
+                f"so we can deliver {output}."
+            )
+        return f"Step {index}/{total_steps}: gather evidence for '{normalized}'."
+
+    def _summarize_plan_decision(self, description: str) -> str:
+        normalized = description.strip()
+        match = _PlanCritic._STEP_PATTERN.match(normalized)
+        if match:
+            action = match.group("action").strip()
+            return f"Completed action: {action}"
+        return f"Completed step: {normalized}"
+
+    def _build_evidence_record(
+        self,
+        step_index: int,
+        intent: str,
+        contexts: Sequence[StepContextBatch],
+    ) -> EvidenceRecord:
+        documents: dict[str, dict[str, Any]] = {}
+        snippets: list[str] = []
+        for batch in contexts:
+            for snippet in batch.snippets:
+                cleaned = " ".join((snippet or "").split())
+                if cleaned and cleaned not in snippets:
+                    snippets.append(cleaned)
+            for doc in batch.documents:
+                doc_id_raw = (
+                    doc.get("id")
+                    or doc.get("document_id")
+                    or doc.get("source")
+                    or doc.get("title")
+                )
+                doc_id = str(doc_id_raw) if doc_id_raw is not None else None
+                if not doc_id:
+                    doc_id = f"step-{step_index}-doc-{len(documents) + 1}"
+                if doc_id not in documents:
+                    entry: dict[str, Any] = {"id": doc_id}
+                    source = doc.get("source") or doc.get("title")
+                    if source:
+                        entry["source"] = str(source)
+                    for key in ("chunk_id", "chunk", "page", "score"):
+                        value = doc.get(key)
+                        if value is not None:
+                            entry[key] = value
+                    documents[doc_id] = entry
+                else:
+                    existing = documents[doc_id]
+                    for key in ("chunk_id", "chunk", "page", "score"):
+                        if key not in existing and doc.get(key) is not None:
+                            existing[key] = doc.get(key)
+        return EvidenceRecord(
+            step_index=step_index,
+            intent=intent,
+            documents=list(documents.values()),
+            snippets=snippets,
+        )
+
+    def _summarize_step_result(self, result: StepResult) -> str:
+        stripped = self._strip_citation_markers(result.answer)
+        compact = " ".join(stripped.split())
+        if not compact:
+            return ""
+        if len(compact) <= 280:
+            return compact
+        return textwrap.shorten(compact, width=280, placeholder="…")
 
     def _register_turn(
         self,
@@ -3756,7 +4100,28 @@ class ConversationManager:
             notes = str(notes_raw).strip() if isinstance(notes_raw, str) else None
             self_check = SelfCheckResult(passed=passed, flags=flags, notes=notes)
 
-        if not any([summary_bullets, plan_items, assumptions_list, self_check, decision]):
+        task_charter = ConversationManager._parse_task_charter(
+            reasoning.get("task_charter") or reasoning.get("charter")
+        )
+        state_digest_entries = ConversationManager._parse_state_digest(
+            reasoning.get("state_digest") or reasoning.get("memory")
+        )
+        evidence_log = ConversationManager._parse_evidence_log(
+            reasoning.get("evidence_log") or reasoning.get("retrieval_log")
+        )
+
+        if not any(
+            [
+                summary_bullets,
+                plan_items,
+                assumptions_list,
+                self_check,
+                decision,
+                task_charter,
+                state_digest_entries,
+                evidence_log,
+            ]
+        ):
             return None
 
         return ReasoningArtifacts(
@@ -3765,6 +4130,9 @@ class ConversationManager:
             assumptions=assumptions_list,
             assumption_decision=decision,
             self_check=self_check,
+            task_charter=task_charter,
+            state_digest=state_digest_entries,
+            evidence_log=evidence_log,
         )
 
     @staticmethod
@@ -3791,6 +4159,117 @@ class ConversationManager:
                 seen.add(value)
                 ordered.append(value)
         return ordered
+
+    @staticmethod
+    def _parse_task_charter(data: Any) -> TaskCharter | None:
+        if not isinstance(data, dict):
+            return None
+        goal = str(data.get("goal") or "").strip() or "Respond to the question"
+        deliverable = (
+            str(data.get("deliverable") or "").strip()
+            or "Structured narrative summary with citations"
+        )
+        audience = (
+            str(data.get("audience") or "").strip() or "General knowledge worker"
+        )
+        constraints = ConversationManager._coerce_str_list(data.get("constraints"))
+        if not constraints:
+            constraints = ["Ground the answer in retrieved corpus evidence."]
+        success = ConversationManager._coerce_str_list(
+            data.get("success_criteria") or data.get("success")
+        )
+        if not success:
+            success = [
+                f"Deliver a {deliverable.lower()} that directly resolves the stated goal.",
+                "Cite supporting documents for each substantive claim.",
+            ]
+        assumptions = ConversationManager._coerce_str_list(data.get("assumptions"))
+        clarifying_questions = ConversationManager._coerce_str_list(
+            data.get("clarifying_questions") or data.get("questions")
+        )
+        return TaskCharter(
+            goal=goal,
+            deliverable=deliverable,
+            audience=audience,
+            constraints=constraints,
+            success_criteria=success,
+            assumptions=assumptions,
+            clarifying_questions=clarifying_questions,
+        )
+
+    @staticmethod
+    def _parse_state_digest(data: Any) -> list[StateDigestEntry]:
+        entries: list[StateDigestEntry] = []
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes, dict)):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                step_index_raw = item.get("step_index") or item.get("step")
+                try:
+                    step_index = int(step_index_raw)
+                except (TypeError, ValueError):
+                    continue
+                summary = str(item.get("summary") or "").strip()
+                citation_indexes_raw = item.get("citation_indexes") or item.get("citations")
+                citations: list[int] = []
+                if isinstance(citation_indexes_raw, Sequence) and not isinstance(
+                    citation_indexes_raw, (str, bytes, dict)
+                ):
+                    for value in citation_indexes_raw:
+                        try:
+                            citations.append(int(value))
+                        except (TypeError, ValueError):
+                            continue
+                pending = ConversationManager._coerce_str_list(
+                    item.get("pending_questions") or item.get("questions")
+                )
+                decisions = ConversationManager._coerce_str_list(
+                    item.get("decisions") or item.get("decision")
+                )
+                entries.append(
+                    StateDigestEntry(
+                        step_index=step_index,
+                        summary=summary,
+                        citation_indexes=citations,
+                        pending_questions=pending,
+                        decisions=decisions,
+                    )
+                )
+        return entries
+
+    @staticmethod
+    def _parse_evidence_log(data: Any) -> list[EvidenceRecord]:
+        records: list[EvidenceRecord] = []
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes, dict)):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                step_index_raw = item.get("step_index") or item.get("step")
+                try:
+                    step_index = int(step_index_raw)
+                except (TypeError, ValueError):
+                    continue
+                intent = str(item.get("intent") or "").strip()
+                documents_raw = item.get("documents")
+                documents: list[dict[str, Any]] = []
+                if isinstance(documents_raw, Sequence) and not isinstance(
+                    documents_raw, (str, bytes)
+                ):
+                    for doc in documents_raw:
+                        if isinstance(doc, dict):
+                            documents.append(dict(doc))
+                snippets = ConversationManager._coerce_str_list(
+                    item.get("snippets") or item.get("evidence")
+                )
+                records.append(
+                    EvidenceRecord(
+                        step_index=step_index,
+                        intent=intent,
+                        documents=documents,
+                        snippets=snippets,
+                    )
+                )
+        return records
 
     def _build_messages(
         self,

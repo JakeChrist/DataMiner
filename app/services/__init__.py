@@ -9,6 +9,7 @@ from .conversation_manager import (
     ConsolidatedSection,
     ConflictNote,
     ConsolidationOutput,
+    EvidenceRecord,
     DynamicPlanningError,
     JudgeReport,
     PlanItem,
@@ -16,8 +17,10 @@ from .conversation_manager import (
     ReasoningVerbosity,
     ResponseMode,
     SelfCheckResult,
+    StateDigestEntry,
     StepContextBatch,
     StepResult,
+    TaskCharter,
 )
 from .conversation_settings import ConversationSettings
 from .document_hierarchy import DocumentHierarchyService
@@ -41,6 +44,7 @@ __all__ = [
     "ConsolidatedSection",
     "ConflictNote",
     "ConsolidationOutput",
+    "EvidenceRecord",
     "DynamicPlanningError",
     "JudgeReport",
     "ExportService",
@@ -49,8 +53,10 @@ __all__ = [
     "ReasoningVerbosity",
     "ResponseMode",
     "SelfCheckResult",
+    "StateDigestEntry",
     "StepContextBatch",
     "StepResult",
+    "TaskCharter",
     "DocumentHierarchyService",
     "LMStudioClient",
     "LMStudioConnectionError",

@@ -362,10 +362,12 @@ class LMStudioClient:
             if digits in details:
                 details = details.replace(digits, formatted_code)
         details = details.strip(" .")
-        friendly = "LMStudio reported that the model crashed"
+        friendly = (
+            "The response generation process reported that the model crashed"
+        )
         if formatted_code:
             friendly += f" (error {formatted_code})"
-        friendly += ". Restart the model in LMStudio and try again."
+        friendly += ". Restart the model backend and try again."
         if details and details.lower() not in {"model crash", "model crash error"}:
             friendly += f" Details: {details}"
         return friendly
@@ -533,7 +535,16 @@ class LMStudioClient:
     @staticmethod
     def _deep_merge_dicts(target: dict[str, Any], source: dict[str, Any]) -> None:
         for key, value in source.items():
-            if isinstance(value, dict):
+            if key == "content":
+                normalized = value
+                if not isinstance(normalized, str):
+                    normalized = LMStudioClient._normalize_message_content(value)
+                existing = target.get(key)
+                if isinstance(existing, str) and existing:
+                    target[key] = existing + str(normalized)
+                else:
+                    target[key] = str(normalized)
+            elif isinstance(value, dict):
                 current = target.get(key)
                 if isinstance(current, dict):
                     LMStudioClient._deep_merge_dicts(current, value)
@@ -545,12 +556,6 @@ class LMStudioClient:
                     current_list.extend(copy.deepcopy(value))
                 else:
                     target[key] = copy.deepcopy(value)
-            elif key == "content" and isinstance(value, str):
-                existing = target.get(key)
-                if isinstance(existing, str) and existing:
-                    target[key] = existing + value
-                else:
-                    target[key] = value
             else:
                 target[key] = copy.deepcopy(value)
 
@@ -560,6 +565,35 @@ class LMStudioClient:
 
         if isinstance(content, str):
             return content
+        if isinstance(content, dict):
+            pieces: list[str] = []
+            text_value = content.get("text")
+            if isinstance(text_value, str):
+                pieces.append(text_value)
+            elif isinstance(text_value, Iterable) and not isinstance(
+                text_value, (str, bytes)
+            ):
+                pieces.append(LMStudioClient._normalize_message_content(text_value))
+            alt = content.get("content")
+            if isinstance(alt, str):
+                pieces.append(alt)
+            elif isinstance(alt, Iterable) and not isinstance(alt, (str, bytes)):
+                pieces.append(LMStudioClient._normalize_message_content(alt))
+            if pieces:
+                return "".join(pieces)
+            nested_parts: list[str] = []
+            for value in content.values():
+                if isinstance(value, str):
+                    nested_parts.append(value)
+                elif isinstance(value, Iterable) and not isinstance(
+                    value, (str, bytes)
+                ):
+                    nested_parts.append(
+                        LMStudioClient._normalize_message_content(value)
+                    )
+            if nested_parts:
+                return "".join(nested_parts)
+            return ""
         if isinstance(content, Iterable):
             parts: list[str] = []
             for item in content:

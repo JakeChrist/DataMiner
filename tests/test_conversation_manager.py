@@ -236,8 +236,9 @@ def test_conversation_manager_serializes_threaded_questions(monkeypatch) -> None
                     "snippet": doc_payload.get("snippet", snippet),
                 }
                 time.sleep(0.05)
+                doc_identifier = str(doc_payload.get("id", f"doc-{call_id}"))
                 return ChatMessage(
-                    content=f"Answer {call_id}: {snippet}",
+                    content=f"Answer {call_id}: {snippet} ({doc_identifier})",
                     citations=[citation],
                     reasoning={},
                     raw_response={"call_id": call_id, "preset": preset.value},

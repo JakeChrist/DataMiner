@@ -32,6 +32,11 @@
 | Phase 3: Feedback Loop | Weeks 5-6 | Introduce peer reviews, gather user feedback, adjust guidelines | QA Manager |
 | Phase 4: Optimization | Ongoing | Maintain knowledge base, refine metrics, highlight success stories | Program Manager |
 
+### Supporting Process Assets
+- **Response Generation Process:** The behavioral contract in `Docs/response_generation_process.md` governs intake, planning, execution, and publication steps so the team shares a consistent operating model.
+- **Response Template:** The structural outline in `Docs/response_template.md` ensures final outputs are comprehensive and scannable.
+- **Quality Assurance Workflow:** Peer review procedures in `Docs/quality_assurance_workflow.md` reinforce the standards above before delivery.
+
 ## Metrics for Success
 - Average response length increased by 25% within two months.
 - User satisfaction (CSAT) scores improved by 15% compared to baseline.

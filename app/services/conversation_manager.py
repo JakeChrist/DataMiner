@@ -2057,6 +2057,7 @@ class ConversationManager:
                     plan_item.description,
                     reasoning_verbosity,
                     response_mode,
+                    original_question=question,
                 )
                 logger.info(
                     "Dispatching plan step",
@@ -3250,12 +3251,33 @@ class ConversationManager:
         question: str,
         reasoning_verbosity: ReasoningVerbosity | None,
         response_mode: ResponseMode,
+        *,
+        original_question: str | None = None,
     ) -> dict[str, Any]:
         extra: dict[str, Any] = copy.deepcopy(base_options) if base_options else {}
+        retrieval = extra.setdefault("retrieval", {})
         if documents:
-            retrieval = extra.setdefault("retrieval", {})
             payload_docs = retrieval.setdefault("documents", [])
             payload_docs.extend(copy.deepcopy(list(documents)))
+
+        step_query = question.strip()
+        base_query = ""
+        base_retrieval = None
+        if base_options and isinstance(base_options.get("retrieval"), dict):
+            base_retrieval = base_options["retrieval"]
+        if isinstance(base_retrieval, dict):
+            base_query = str(base_retrieval.get("query") or "").strip()
+        if not base_query and original_question:
+            base_query = original_question.strip()
+
+        if step_query or base_query:
+            if base_query and step_query and step_query.lower() not in base_query.lower():
+                retrieval["query"] = f"{base_query}\n\nStep focus: {step_query}"
+            elif step_query:
+                retrieval["query"] = step_query
+            elif base_query:
+                retrieval["query"] = base_query
+
         merged = self._build_request_options(
             question,
             reasoning_verbosity,

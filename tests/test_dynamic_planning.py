@@ -109,6 +109,36 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert not turn.reasoning.get("conflicts")
 
 
+def test_dynamic_plan_updates_retrieval_query_per_step() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+
+    def provider(_item, step_index: int, _total: int) -> Iterable[StepContextBatch]:
+        return _provider_for_steps([f"Evidence {step_index}"])
+
+    question = "Summarize the quarterly revenue trends."
+    manager.ask(
+        question,
+        context_provider=provider,
+    )
+
+    queries: list[str] = []
+    for request in client.requests:
+        options = request.get("options") or {}
+        if not isinstance(options, dict):
+            continue
+        retrieval = options.get("retrieval") or {}
+        if not isinstance(retrieval, dict):
+            continue
+        query = retrieval.get("query")
+        if isinstance(query, str):
+            queries.append(query)
+
+    assert queries, "expected step retrieval queries to be dispatched"
+    assert all(query.strip().startswith(question) for query in queries)
+    assert all("Step focus:" in query for query in queries)
+
+
 def test_dynamic_plan_notes_missing_citations() -> None:
     class EmptyCitationClient(StubLMStudioClient):
         def chat(self, messages, *, preset, extra_options=None) -> ChatMessage:  # type: ignore[override]

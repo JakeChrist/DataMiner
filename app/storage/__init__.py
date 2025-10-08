@@ -9,6 +9,7 @@ from .database import (
     DocumentRepository,
     IngestDocumentRepository,
     ProjectRepository,
+    WorkingMemoryRepository,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "DocumentRepository",
     "IngestDocumentRepository",
     "ProjectRepository",
+    "WorkingMemoryRepository",
 ]

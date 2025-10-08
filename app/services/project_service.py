@@ -21,6 +21,7 @@ from ..storage import (
     DocumentRepository,
     IngestDocumentRepository,
     ProjectRepository,
+    WorkingMemoryRepository,
 )
 
 
@@ -66,6 +67,7 @@ class ProjectService(QObject):
         self.chats = ChatRepository(self._db)
         self.ingest = IngestDocumentRepository(self._db)
         self.background_tasks = BackgroundTaskLogRepository(self._db)
+        self.working_memory = WorkingMemoryRepository(self._db)
         self._lock = threading.RLock()
         self._active_project_id: int | None = None
         self._ensure_default_project()

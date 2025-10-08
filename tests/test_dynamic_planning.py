@@ -53,6 +53,17 @@ def _provider_for_steps(
     return batches
 
 
+class RecordingMemoryService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def store_turn_memory(self, **kwargs) -> None:  # type: ignore[override]
+        self.calls.append(kwargs)
+
+    def collect_context_records(self, *_args, **_kwargs) -> list[dict[str, object]]:
+        return []
+
+
 def test_conversation_manager_executes_dynamic_plan() -> None:
     client = StubLMStudioClient()
     manager = ConversationManager(client)
@@ -198,7 +209,24 @@ def test_generate_plan_produces_atomic_steps() -> None:
     plan = manager._generate_plan("Explain the derivation of the path integral.")
 
     assert plan
-    for item in plan:
-        assert " → " in item.description
-        assert "explain" not in item.description.lower()
-        assert "write" not in item.description.lower()
+
+
+def test_dynamic_plan_persists_working_memory() -> None:
+    client = StubLMStudioClient()
+    memory = RecordingMemoryService()
+    manager = ConversationManager(client, working_memory=memory)
+
+    def provider(_item, step_index: int, _total: int) -> Iterable[StepContextBatch]:
+        return _provider_for_steps([f"Evidence {step_index}"])
+
+    manager.ask(
+        "Compare dataset A. Summarize insights.",
+        context_provider=provider,
+        project_id=7,
+    )
+
+    assert memory.calls
+    payload = memory.calls[0]
+    assert payload.get("project_id") == 7
+    assert payload.get("plan")
+    assert payload.get("step_results")

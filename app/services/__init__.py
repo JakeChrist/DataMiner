@@ -32,6 +32,7 @@ from .lmstudio_client import (
     LMStudioError,
     LMStudioResponseError,
 )
+from .working_memory import WorkingMemoryService
 
 __all__ = [
     "AnswerLength",
@@ -57,6 +58,7 @@ __all__ = [
     "StepContextBatch",
     "StepResult",
     "TaskCharter",
+    "WorkingMemoryService",
     "DocumentHierarchyService",
     "LMStudioClient",
     "LMStudioConnectionError",

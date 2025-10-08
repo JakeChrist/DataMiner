@@ -123,6 +123,33 @@ CREATE TABLE IF NOT EXISTS reasoning_summaries (
     FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS working_memory_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL,
+    turn_index INTEGER NOT NULL,
+    step_index INTEGER,
+    kind TEXT NOT NULL,
+    title TEXT,
+    summary TEXT,
+    metadata TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_working_memory_project_turn
+ON working_memory_entries(project_id, turn_index);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS working_memory_index
+USING fts5(
+    content,
+    entry_id UNINDEXED,
+    project_id UNINDEXED,
+    turn_index UNINDEXED,
+    step_index UNINDEXED,
+    kind UNINDEXED,
+    tokenize='porter'
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT,

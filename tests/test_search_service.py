@@ -187,6 +187,50 @@ def test_collect_context_records_includes_metadata(
     assert first["chunk"]["id"]
 
 
+def test_collect_context_records_skips_missing_project_document(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    base = tmp_path / "corpus"
+    doc_path = base / "fallback.txt"
+    doc_path.parent.mkdir(parents=True, exist_ok=True)
+    doc_path.write_text("The fallback corpus entry mentions retrieval gaps.")
+
+    project = project_repo.create("Fallback Project")
+    _store_ingest_document(ingest_repo, doc_path, doc_path.read_text())
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    records = service.collect_context_records("retrieval", project_id=project["id"])
+
+    assert records == []
+
+
+def test_search_documents_requires_project_document(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    file_path = corpus_dir / "orphan.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("Orphaned document still supports retrieval.")
+
+    project = project_repo.create("Orphan Search")
+    _store_ingest_document(ingest_repo, file_path, file_path.read_text())
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    results = service.search_documents("retrieval", project_id=project["id"])
+
+    assert results == []
+
+
 def test_search_documents_handles_mixed_windows_paths(
     tmp_path: Path,
     project_repo: ProjectRepository,

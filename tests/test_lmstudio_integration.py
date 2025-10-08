@@ -505,6 +505,30 @@ def test_lmstudio_client_merges_streaming_response(
     assert message.raw_response.get("usage", {}).get("total_tokens") == 7
 
 
+def test_lmstudio_client_merges_streaming_response_with_dict_content(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    state["responses"] = [
+        {
+            "status": 200,
+            "headers": {"Content-Type": "text/event-stream"},
+            "body": (
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": {\"type\": \"output_text\", \"text\": \"Hello\"}}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"message\": {\"content\": {\"type\": \"output_text\", \"text\": \" world\"}}}], \"usage\": {\"prompt_tokens\": 2, \"completion_tokens\": 1, \"total_tokens\": 3}}\n\n"
+                "data: [DONE]\n\n"
+            ).encode("utf-8"),
+        }
+    ]
+
+    client = LMStudioClient(base_url=base_url)
+    message = client.chat([{"role": "user", "content": "Stream please"}])
+
+    assert message.content == "Hello world"
+    assert message.raw_response.get("usage", {}).get("total_tokens") == 3
+
+
 def test_conversation_manager_handles_failures_and_recovers(
     lmstudio_server: tuple[dict[str, object], str]
 ) -> None:

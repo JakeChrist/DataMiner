@@ -505,8 +505,9 @@ class SettingsService(QObject):
     def _build_standard_theme(
         self, app: QApplication, *, dark: bool
     ) -> tuple[QPalette, str]:
-        self._glass_translucent = False
         palette = QPalette()
+        translucent = _supports_translucency(app)
+        self._glass_translucent = translucent
         if dark:
             window = QColor("#10131a")
             surface = QColor("#1a1f29")
@@ -533,8 +534,6 @@ class SettingsService(QObject):
             window.setAlpha(170)
             surface = QColor(surface)
             surface.setAlpha(185)
-            chrome = QColor(chrome)
-            chrome.setAlpha(200)
             border = QColor(border)
             border.setAlpha(160)
         palette.setColor(QPalette.ColorRole.Window, window)

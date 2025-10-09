@@ -485,11 +485,31 @@ class SettingsService(QObject):
         success_hex = success.name()
         warning_hex = warning.name()
         error_hex = error.name()
+        tooltip_background_hex = (
+            surface.lighter(115).name()
+            if self._settings.theme == "dark"
+            else surface.darker(105).name()
+        )
+        tooltip_font = QFont(app.font())
+        tooltip_font_size = tooltip_font.pointSizeF()
+        if tooltip_font_size <= 0:
+            tooltip_font_size = float(tooltip_font.pointSize())
+        if tooltip_font_size <= 0:
+            tooltip_font_size = 10.0
+        tooltip_font_size_css = f"{tooltip_font_size:.1f}pt"
 
         stylesheet = f"""
             QWidget {{
                 background-color: {window_hex};
                 color: {text_hex};
+            }}
+            QToolTip {{
+                background-color: {tooltip_background_hex};
+                color: {text_hex};
+                border: 1px solid {border_hex};
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: {tooltip_font_size_css};
             }}
             QFrame#chatBubble_user, QFrame#chatBubble_assistant {{
                 border: 1px solid {border_hex};

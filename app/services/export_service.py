@@ -226,6 +226,9 @@ class ExportService:
                 status = item.status.replace("_", " ") if item.status else "pending"
                 description = self._linkify_markdown(item.description, turn.citations)
                 lines.append(f"{idx}. {description} [{status}]")
+                if item.rationale:
+                    rationale_text = self._linkify_markdown(item.rationale, turn.citations)
+                    lines.append(f"    ↳ {rationale_text}")
         if turn.assumptions or turn.assumption_decision is not None:
             lines.extend(["", "### Assumptions", ""])
             for assumption in turn.assumptions:
@@ -266,19 +269,21 @@ class ExportService:
                 f"<div class='section'><h3>Reasoning</h3><ul>{bullets}</ul></div>"
             )
         if turn.plan:
-            items = "".join(
-                "".join(
-                    [
-                        "<li>",
-                        self._linkify_html(item.description, turn.citations),
-                        " <em>[",
-                        html.escape(item.status or "pending"),
-                        "]</em></li>",
-                    ]
+            items: list[str] = []
+            for item in turn.plan:
+                description = self._linkify_html(item.description, turn.citations)
+                status = html.escape(item.status or "pending")
+                rationale_html = ""
+                if item.rationale:
+                    rationale_html = (
+                        f"<div class='plan-rationale'>{self._linkify_html(item.rationale, turn.citations)}</div>"
+                    )
+                items.append(
+                    f"<li>{description} <em>[{status}]</em>{rationale_html}</li>"
                 )
-                for item in turn.plan
+            sections.append(
+                f"<div class='section'><h3>Plan</h3><ol>{''.join(items)}</ol></div>"
             )
-            sections.append(f"<div class='section'><h3>Plan</h3><ol>{items}</ol></div>")
         if turn.assumptions or turn.assumption_decision is not None:
             assumptions = "".join(
                 f"<li>{self._linkify_html(text, turn.citations)}</li>" for text in turn.assumptions

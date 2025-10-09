@@ -166,6 +166,7 @@ class PlanItem:
 
     description: str
     status: str = "queued"
+    rationale: str | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -1897,7 +1898,12 @@ class ConversationManager:
         shared_context = "\n\n".join(context_snippets or [])
         base_options = copy.deepcopy(extra_options) if extra_options else {}
         executed_plan: list[PlanItem] = [
-            PlanItem(description=item.description, status="queued") for item in plan_items
+            PlanItem(
+                description=item.description,
+                status="queued",
+                rationale=item.rationale,
+            )
+            for item in plan_items
         ]
         step_results: list[StepResult] = []
         assumptions: list[str] = []
@@ -2124,7 +2130,11 @@ class ConversationManager:
         )
         reasoning_payload = {
             "plan": [
-                {"description": item.description, "status": item.status}
+                {
+                    "description": item.description,
+                    "status": item.status,
+                    **({"rationale": item.rationale} if item.rationale else {}),
+                }
                 for item in executed_plan
             ],
             "assumptions": assumptions,
@@ -2235,8 +2245,10 @@ class ConversationManager:
             plan.append(
                 self._build_structured_plan_item(
                     input_hint="Corpus context",
-                    action=self._compose_action("collect", f"background references on {keyword_text}"),
+                    verb="collect",
+                    target=f"background references on {keyword_text}",
                     output_hint="Background reference list (up to 5 entries) with source titles and citation-ready locations",
+                    rationale=self._compose_background_rationale(keyword_list),
                 )
             )
 
@@ -2249,7 +2261,8 @@ class ConversationManager:
             plan.append(
                 self._build_structured_plan_item(
                     input_hint=input_hint,
-                    action=self._compose_action(verb, target),
+                    verb=verb,
+                    target=target,
                     output_hint=self._describe_output_artifact(verb, target),
                 )
             )
@@ -2257,7 +2270,13 @@ class ConversationManager:
         if len(plan) > 8:
             plan = plan[:8]
         if not plan:
-            plan = [PlanItem(description=normalized, status="queued")]
+            plan = [
+                PlanItem(
+                    description=normalized,
+                    status="queued",
+                    rationale="Address the user's question directly using the available corpus context.",
+                )
+            ]
 
         self._plan_critic.ensure(plan)
         logger.info(
@@ -2454,16 +2473,89 @@ class ConversationManager:
                 break
         return keywords
 
-    @staticmethod
     def _build_structured_plan_item(
-        *, input_hint: str, action: str, output_hint: str
+        self,
+        *,
+        input_hint: str,
+        verb: str,
+        target: str,
+        output_hint: str,
+        rationale: str | None = None,
     ) -> PlanItem:
+        action = self._compose_action(verb, target)
         description = (
             f"Input: {input_hint.strip()} (retrieved corpus snippets with chunk IDs) → "
             f"Action: {action.strip()} grounded strictly in those snippets → "
             f"Output: {output_hint.strip()} (include chunk IDs used)"
         )
-        return PlanItem(description=description, status="queued")
+        rationale_text = rationale or self._compose_plan_rationale(
+            input_hint=input_hint,
+            verb=verb,
+            target=target,
+            output_hint=output_hint,
+        )
+        return PlanItem(description=description, status="queued", rationale=rationale_text)
+
+    def _compose_plan_rationale(
+        self,
+        *,
+        input_hint: str,
+        verb: str,
+        target: str,
+        output_hint: str,
+    ) -> str:
+        action_clause = self._normalize_plan_action_clause(verb, target)
+        input_clause = self._normalize_plan_input_hint(input_hint)
+        output_clause = self._normalize_plan_output_hint(output_hint)
+        return f"Use {input_clause} to {action_clause} so the final answer can deliver {output_clause}."
+
+    @staticmethod
+    def _compose_background_rationale(keywords: Sequence[str]) -> str:
+        cleaned = [token.strip() for token in keywords if token.strip()]
+        if not cleaned:
+            return (
+                "Collect background references so subsequent steps stay grounded in the corpus."
+            )
+        if len(cleaned) == 1:
+            topics = cleaned[0]
+        elif len(cleaned) == 2:
+            topics = " and ".join(cleaned)
+        else:
+            topics = ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+        return (
+            f"Collect background references on {topics} so later steps stay anchored to the key topics."
+        )
+
+    @staticmethod
+    def _normalize_plan_action_clause(verb: str, target: str) -> str:
+        verb_clean = re.sub(r"\s+", " ", (verb or "").strip()).lower()
+        target_clean = re.sub(r"\s+", " ", (target or "").strip())
+        if not verb_clean:
+            return target_clean.lower() or "address the request"
+        if not target_clean:
+            return f"{verb_clean} the requested details"
+        return f"{verb_clean} {target_clean}".strip()
+
+    @staticmethod
+    def _normalize_plan_input_hint(text: str) -> str:
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            return "the available corpus context"
+        lowered = cleaned[0].lower() + cleaned[1:]
+        if re.match(r"^(?:the|a|an|any|all)\b", lowered):
+            return lowered
+        return f"the {lowered}"
+
+    @staticmethod
+    def _normalize_plan_output_hint(text: str) -> str:
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            return "a grounded response"
+        lowered = cleaned[0].lower() + cleaned[1:]
+        if re.match(r"^(?:the|a|an)\b", lowered):
+            return lowered
+        article = "an" if re.match(r"^[aeiou]", lowered) else "a"
+        return f"{article} {lowered}"
 
     def _register_turn(
         self,
@@ -3508,13 +3600,22 @@ class ConversationManager:
                     )
                     if not status:
                         status = "pending"
+                    rationale_list: list[str] = []
+                    for key in ("rationale", "reason", "thought", "explanation", "why"):
+                        rationale_list.extend(
+                            ConversationManager._coerce_str_list(entry.get(key))
+                        )
+                    rationale = rationale_list[0] if rationale_list else None
                 elif isinstance(entry, str):
                     description = entry.strip()
                     status = "pending"
+                    rationale = None
                 else:
                     continue
                 if description:
-                    plan_items.append(PlanItem(description=description, status=status))
+                    plan_items.append(
+                        PlanItem(description=description, status=status, rationale=rationale)
+                    )
 
         assumptions_list: list[str] = []
         decision: AssumptionDecision | None = None

@@ -72,6 +72,7 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
         "Input: Corpus context (retrieved corpus snippets with chunk IDs) → Action: Collect background references on"
     )
     assert "document citations" in turn.plan[-1].description.lower()
+    assert all(item.rationale for item in turn.plan)
     assert turn.answer.startswith("Context & Background:")
     assert len(turn.citations) == 3
     assert turn.citations[0].get("steps") == [1]
@@ -202,3 +203,4 @@ def test_generate_plan_produces_atomic_steps() -> None:
         assert " → " in item.description
         assert "explain" not in item.description.lower()
         assert "write" not in item.description.lower()
+        assert item.rationale

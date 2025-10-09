@@ -187,6 +187,38 @@ def test_collect_context_records_includes_metadata(
     assert first["chunk"]["id"]
 
 
+def test_collect_context_records_preserves_case_sensitive_paths(
+    tmp_path: Path,
+    project_repo: ProjectRepository,
+    document_repo: DocumentRepository,
+    ingest_repo: IngestDocumentRepository,
+    chat_repo: ChatRepository,
+) -> None:
+    base = tmp_path / "case"
+    base.mkdir(parents=True)
+    upper_path = base / "Alpha.txt"
+    lower_path = base / "alpha.txt"
+    upper_path.write_text("Uppercase evidence snippet.")
+    lower_path.write_text("lowercase evidence snippet.")
+
+    project = project_repo.create("Case Sensitivity")
+    upper_doc = document_repo.create(project["id"], "Upper", source_path=upper_path)
+    lower_doc = document_repo.create(project["id"], "Lower", source_path=lower_path)
+
+    _store_ingest_document(ingest_repo, upper_path, upper_path.read_text())
+    _store_ingest_document(ingest_repo, lower_path, lower_path.read_text())
+
+    service = SearchService(ingest_repo, document_repo, chat_repo)
+
+    upper_records = service.collect_context_records("Uppercase", project_id=project["id"])
+    assert upper_records
+    assert upper_records[0]["document"]["id"] == upper_doc["id"]
+
+    lower_records = service.collect_context_records("lowercase", project_id=project["id"])
+    assert lower_records
+    assert lower_records[0]["document"]["id"] == lower_doc["id"]
+
+
 def test_search_documents_handles_mixed_windows_paths(
     tmp_path: Path,
     project_repo: ProjectRepository,

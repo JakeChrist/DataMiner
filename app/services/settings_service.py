@@ -98,6 +98,7 @@ class SettingsService(QObject):
         self._config = config_manager or ConfigManager()
         self._settings = UISettings()
         self._base_font_point_size: float | None = None
+        self._glass_translucent: bool = False
         self.reload()
         self._previous_standard_theme = (
             self._settings.standard_theme
@@ -250,6 +251,12 @@ class SettingsService(QObject):
     @property
     def theme(self) -> str:
         return self._settings.theme
+
+    @property
+    def glass_translucency_enabled(self) -> bool:
+        """Return ``True`` when the glass theme can render translucency."""
+
+        return self._glass_translucent
 
     @property
     def standard_theme(self) -> str:
@@ -498,6 +505,7 @@ class SettingsService(QObject):
     def _build_standard_theme(
         self, app: QApplication, *, dark: bool
     ) -> tuple[QPalette, str]:
+        self._glass_translucent = False
         palette = QPalette()
         if dark:
             window = QColor("#10131a")
@@ -702,17 +710,18 @@ class SettingsService(QObject):
         palette.setColor(QPalette.ColorRole.Shadow, QColor(0, 0, 0, 180))
 
         translucent = _supports_translucency(app)
+        self._glass_translucent = translucent
         glass_rgba = "rgba(18, 30, 49, 0.72)" if translucent else "#121e31"
         film_rgba = "rgba(18, 30, 49, 0.55)" if translucent else "#101a2b"
         chrome_rgba = "rgba(24, 38, 59, 0.92)" if translucent else chrome.name()
         toolbar_rgba = "rgba(8, 13, 22, 0.85)" if translucent else "#080d16"
+        window_rgba = "rgba(5, 7, 13, 0.55)" if translucent else window.name()
         selection_rgba = "rgba(82, 224, 255, 0.25)"
         chrome_hover_rgba = "rgba(28, 44, 66, 0.95)" if translucent else chrome.lighter(110).name()
 
         text_hex = text.name()
         muted_hex = muted.name()
         border_hex = border.name()
-        window_hex = window.name()
         success_hex = success.name()
         warning_hex = warning.name()
         error_hex = error.name()
@@ -731,11 +740,11 @@ class SettingsService(QObject):
 
         stylesheet = f"""
             QWidget {{
-                background-color: {window_hex};
+                background-color: {window_rgba};
                 color: {text_hex};
             }}
             QMainWindow, QDialog {{
-                background-color: {window_hex};
+                background-color: {window_rgba};
                 color: {text_hex};
             }}
             QToolTip {{
@@ -778,6 +787,11 @@ class SettingsService(QObject):
                 background-color: {glass_rgba};
                 border-radius: 18px;
                 border: 1px solid {border_hex};
+            }}
+            QWidget#corpusPane, QWidget#chatPane, QWidget#evidencePanel {{
+                background-color: {glass_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 22px;
             }}
             QLabel#bubbleMeta, QLabel#typingIndicator {{
                 color: {muted_hex};

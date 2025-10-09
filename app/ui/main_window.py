@@ -1936,11 +1936,33 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _apply_theme(self, theme: str) -> None:
         self.settings_service.apply_theme()
+        normalized = str(theme).lower()
+        glass_enabled = (
+            normalized == "futuristic" and self.settings_service.glass_translucency_enabled
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, glass_enabled)
+        panes: list[QWidget] = []
+        central = self.centralWidget()
+        if central is not None:
+            panes.append(central)
+        for candidate in (
+            getattr(self, "_corpus_panel", None),
+            getattr(self, "_evidence_panel", None),
+        ):
+            if isinstance(candidate, QWidget):
+                panes.append(candidate)
+        fill_background = not glass_enabled
+        self.setAutoFillBackground(fill_background)
+        for widget in panes:
+            widget.setAutoFillBackground(fill_background)
         self._sync_theme_actions(theme)
-        if theme == "futuristic":
-            message = "Futuristic glass theme enabled."
+        if normalized == "futuristic":
+            if glass_enabled:
+                message = "Futuristic glass theme enabled."
+            else:
+                message = "Futuristic theme enabled (translucency unavailable)."
         else:
-            message = f"{theme.title()} theme enabled."
+            message = f"{normalized.title()} theme enabled."
         self._show_toast(message, level="info", duration_ms=1500)
 
     def _apply_font_scale(self, *_args: object) -> None:

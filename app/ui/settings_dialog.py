@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QVBoxLayout,
     QColorDialog,
+    QRadioButton,
 )
 
 from ..services.settings_service import ChatStyleSettings, SettingsService
@@ -84,11 +85,13 @@ class SettingsDialog(QDialog):
         self._font_combo: QFontComboBox | None = None
         self._font_size_spin: QDoubleSpinBox | None = None
         self._preview_label: QLabel | None = None
+        self._theme_radios: dict[str, QRadioButton] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(16)
 
+        layout.addWidget(self._build_theme_group())
         layout.addWidget(self._build_typography_group())
 
         chat_group = QGroupBox("Chat style", self)
@@ -119,15 +122,50 @@ class SettingsDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("Close")
         layout.addWidget(buttons)
 
+        self._settings.theme_changed.connect(self._sync_theme_radios)
         self._settings.chat_style_changed.connect(self._on_chat_style_changed)
         self._settings.font_family_changed.connect(self._sync_font_family)
         self._settings.font_point_size_changed.connect(self._sync_font_point_size)
         self._settings.font_scale_changed.connect(self._update_font_preview)
 
+        self._sync_theme_radios(self._settings.theme)
         self._sync_font_family(self._settings.font_family)
         self._sync_font_point_size(self._settings.font_point_size)
 
     # ------------------------------------------------------------------
+    def _build_theme_group(self) -> QGroupBox:
+        group = QGroupBox("Theme", self)
+        group_layout = QVBoxLayout(group)
+        group_layout.setSpacing(8)
+
+        description = QLabel(
+            "Choose between the classic solid interface and the layered glass experience.",
+            group,
+        )
+        description.setWordWrap(True)
+        description.setObjectName("themeDescription")
+        group_layout.addWidget(description)
+
+        options = (
+            ("Standard – Light", "light", "Bright neutral surfaces with warm highlights."),
+            ("Standard – Dark", "dark", "Low-glare layout with rich contrast."),
+            (
+                "Futuristic Glass",
+                "futuristic",
+                "Translucent panes, neon accents, and depth-aware lighting.",
+            ),
+        )
+        for label, value, hint in options:
+            radio = QRadioButton(label, group)
+            radio.setToolTip(hint)
+            radio.toggled.connect(
+                lambda checked, theme=value: self._on_theme_selected(theme, checked)
+            )
+            group_layout.addWidget(radio)
+            self._theme_radios[value] = radio
+
+        return group
+
     def _build_typography_group(self) -> QGroupBox:
         group = QGroupBox("Typography", self)
         group_layout = QVBoxLayout(group)
@@ -198,6 +236,22 @@ class SettingsDialog(QDialog):
     def _on_chat_style_changed(self, style: ChatStyleSettings) -> None:  # pragma: no cover - UI update
         for attribute, swatch in self._swatches.items():
             swatch.set_color(getattr(style, attribute))
+
+    def _on_theme_selected(self, theme: str, checked: bool) -> None:
+        if not checked:
+            return
+        normalized = theme.lower()
+        if normalized == "futuristic":
+            self._settings.use_futuristic_theme(True)
+        elif normalized in {"light", "dark"}:
+            self._settings.set_theme(normalized)
+
+    def _sync_theme_radios(self, theme: str) -> None:
+        normalized = theme.lower()
+        for key, radio in self._theme_radios.items():
+            radio.blockSignals(True)
+            radio.setChecked(key == normalized)
+            radio.blockSignals(False)
 
     def _on_font_family_selected(self, font: QFont) -> None:
         self._settings.set_font_preferences(family=font.family())

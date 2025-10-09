@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, asdict
+import os
 from typing import Any, Iterable
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -18,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_THEME = "light"
+STANDARD_THEMES = {"light", "dark"}
+ALL_THEMES = {"light", "dark", "futuristic"}
 DEFAULT_DENSITY = "comfortable"
 DEFAULT_SPLITTER_SIZES = (280, 720, 360)
 MIN_FONT_SCALE = 0.5
@@ -68,6 +71,7 @@ class UISettings:
     """Container for persisted UI settings."""
 
     theme: str = DEFAULT_THEME
+    standard_theme: str = DEFAULT_THEME
     font_scale: float = 1.0
     font_family: str | None = None
     font_point_size: float | None = None
@@ -95,6 +99,11 @@ class SettingsService(QObject):
         self._settings = UISettings()
         self._base_font_point_size: float | None = None
         self.reload()
+        self._previous_standard_theme = (
+            self._settings.standard_theme
+            if self._settings.standard_theme in STANDARD_THEMES
+            else DEFAULT_THEME
+        )
 
     # ------------------------------------------------------------------
     # Persistence helpers
@@ -109,8 +118,15 @@ class SettingsService(QObject):
         if not isinstance(ui_settings, dict):
             ui_settings = {}
         theme = str(ui_settings.get("theme", DEFAULT_THEME)).lower()
-        if theme not in {"light", "dark"}:
+        if theme not in ALL_THEMES:
             theme = DEFAULT_THEME
+        standard_theme_value = str(ui_settings.get("standard_theme", theme)).lower()
+        if standard_theme_value not in STANDARD_THEMES:
+            standard_theme_value = DEFAULT_THEME
+        if theme not in ALL_THEMES:
+            theme = DEFAULT_THEME
+        if theme not in STANDARD_THEMES and standard_theme_value not in STANDARD_THEMES:
+            standard_theme_value = DEFAULT_THEME
         font_scale = ui_settings.get("font_scale", 1.0)
         try:
             font_scale = float(font_scale)
@@ -184,6 +200,7 @@ class SettingsService(QObject):
         )
         self._settings = UISettings(
             theme=theme,
+            standard_theme=standard_theme_value,
             font_scale=font_scale,
             font_family=font_family,
             font_point_size=font_point_size,
@@ -194,6 +211,12 @@ class SettingsService(QObject):
             chat_style=chat_style,
         )
         self._base_font_point_size = None
+        if hasattr(self, "_previous_standard_theme"):
+            self._previous_standard_theme = (
+                self._settings.standard_theme
+                if self._settings.standard_theme in STANDARD_THEMES
+                else DEFAULT_THEME
+            )
 
     @log_call(logger=logger)
     def save(self) -> None:
@@ -216,6 +239,7 @@ class SettingsService(QObject):
                 "show_corpus_panel": self._settings.show_corpus_panel,
                 "show_evidence_panel": self._settings.show_evidence_panel,
                 "chat_style": self._settings.chat_style.as_dict(),
+                "standard_theme": self._settings.standard_theme,
             }
         )
         data["ui"] = ui_data
@@ -226,6 +250,18 @@ class SettingsService(QObject):
     @property
     def theme(self) -> str:
         return self._settings.theme
+
+    @property
+    def standard_theme(self) -> str:
+        return self._settings.standard_theme
+
+    @property
+    def last_standard_theme(self) -> str:
+        """Return the cached non-futuristic theme used for fallbacks."""
+
+        if self._previous_standard_theme not in STANDARD_THEMES:
+            self._previous_standard_theme = DEFAULT_THEME
+        return self._previous_standard_theme
 
     @property
     def font_scale(self) -> float:
@@ -271,7 +307,12 @@ class SettingsService(QObject):
     # Mutators
     @log_call(logger=logger)
     def set_theme(self, theme: str) -> None:
-        normalized = "dark" if str(theme).lower() == "dark" else "light"
+        normalized = str(theme).lower()
+        if normalized not in ALL_THEMES:
+            normalized = DEFAULT_THEME
+        if normalized in STANDARD_THEMES:
+            self._settings.standard_theme = normalized
+            self._previous_standard_theme = normalized
         if normalized == self._settings.theme:
             return
         self._settings.theme = normalized
@@ -281,7 +322,21 @@ class SettingsService(QObject):
 
     @log_call(logger=logger)
     def toggle_theme(self) -> None:
-        self.set_theme("dark" if self._settings.theme == "light" else "light")
+        current = self._settings.theme
+        if current == "futuristic":
+            target = "dark" if self.last_standard_theme == "light" else "light"
+        else:
+            target = "dark" if current == "light" else "light"
+        self.set_theme(target)
+
+    @log_call(logger=logger)
+    def use_futuristic_theme(self, enabled: bool) -> None:
+        """Enable or disable the layered glass theme."""
+
+        if enabled:
+            self.set_theme("futuristic")
+        else:
+            self.set_theme(self.last_standard_theme)
 
     @log_call(logger=logger)
     def set_font_scale(self, scale: float) -> None:
@@ -432,8 +487,19 @@ class SettingsService(QObject):
         app = app or QApplication.instance()
         if app is None:
             return
+        if self._settings.theme == "futuristic":
+            palette, stylesheet = self._build_futuristic_theme(app)
+        else:
+            palette, stylesheet = self._build_standard_theme(app, dark=self._settings.theme == "dark")
+        app.setPalette(palette)
+        app.setStyleSheet(stylesheet)
+
+    # ------------------------------------------------------------------
+    def _build_standard_theme(
+        self, app: QApplication, *, dark: bool
+    ) -> tuple[QPalette, str]:
         palette = QPalette()
-        if self._settings.theme == "dark":
+        if dark:
             window = QColor("#10131a")
             surface = QColor("#1a1f29")
             border = QColor("#2b3240")
@@ -474,9 +540,9 @@ class SettingsService(QObject):
         palette.setColor(QPalette.ColorRole.Mid, border)
         palette.setColor(QPalette.ColorRole.Dark, border)
         palette.setColor(QPalette.ColorRole.Shadow, border.darker(140))
-        app.setPalette(palette)
 
         accent_hex = accent.name()
+        accent_hover_hex = accent.darker(110).name()
         text_hex = text.name()
         muted_hex = muted.name()
         border_hex = border.name()
@@ -486,9 +552,7 @@ class SettingsService(QObject):
         warning_hex = warning.name()
         error_hex = error.name()
         tooltip_background_hex = (
-            surface.lighter(115).name()
-            if self._settings.theme == "dark"
-            else surface.darker(105).name()
+            surface.lighter(115).name() if dark else surface.darker(105).name()
         )
         tooltip_font = QFont(app.font())
         tooltip_font_size = tooltip_font.pointSizeF()
@@ -568,7 +632,7 @@ class SettingsService(QObject):
                 border: none;
             }}
             QPushButton#accent:hover, QToolButton#accent:hover {{
-                background-color: {accent.darker(110).name()};
+                background-color: {accent_hover_hex};
             }}
             QLabel#statusPill {{
                 border-radius: 14px;
@@ -598,7 +662,243 @@ class SettingsService(QObject):
                 border-color: {error_hex};
             }}
         """
-        app.setStyleSheet(stylesheet)
+        return palette, stylesheet
+
+    def _build_futuristic_theme(self, app: QApplication) -> tuple[QPalette, str]:
+        palette = QPalette()
+        window = QColor("#05070d")
+        surface = QColor("#0f1a2a")
+        chrome = QColor("#18263b")
+        border = QColor("#233145")
+        text = QColor("#edf6ff")
+        muted = QColor("#8fa4c9")
+        accent_cyan = QColor("#52e0ff")
+        accent_blue = QColor("#4f75ff")
+        accent_violet = QColor("#b17dff")
+        warm_warning = QColor("#ff8c5c")
+        success = QColor("#63ffc8")
+        warning = QColor("#ffc35b")
+        error = QColor("#ff6b9d")
+
+        palette.setColor(QPalette.ColorRole.Window, window)
+        palette.setColor(QPalette.ColorRole.WindowText, text)
+        palette.setColor(QPalette.ColorRole.Base, surface)
+        palette.setColor(QPalette.ColorRole.AlternateBase, surface)
+        palette.setColor(QPalette.ColorRole.ToolTipBase, chrome)
+        palette.setColor(QPalette.ColorRole.ToolTipText, text)
+        palette.setColor(QPalette.ColorRole.Text, text)
+        palette.setColor(QPalette.ColorRole.PlaceholderText, muted)
+        palette.setColor(QPalette.ColorRole.Button, chrome)
+        palette.setColor(QPalette.ColorRole.ButtonText, text)
+        palette.setColor(QPalette.ColorRole.Highlight, accent_cyan)
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#051119"))
+        palette.setColor(QPalette.ColorRole.BrightText, error)
+        palette.setColor(QPalette.ColorRole.Link, accent_blue)
+        palette.setColor(QPalette.ColorRole.LinkVisited, accent_violet)
+        palette.setColor(QPalette.ColorRole.Light, chrome.lighter(110))
+        palette.setColor(QPalette.ColorRole.Midlight, border)
+        palette.setColor(QPalette.ColorRole.Mid, border)
+        palette.setColor(QPalette.ColorRole.Dark, border.darker(140))
+        palette.setColor(QPalette.ColorRole.Shadow, QColor(0, 0, 0, 180))
+
+        translucent = _supports_translucency(app)
+        glass_rgba = "rgba(18, 30, 49, 0.72)" if translucent else "#121e31"
+        film_rgba = "rgba(18, 30, 49, 0.55)" if translucent else "#101a2b"
+        chrome_rgba = "rgba(24, 38, 59, 0.92)" if translucent else chrome.name()
+        toolbar_rgba = "rgba(8, 13, 22, 0.85)" if translucent else "#080d16"
+        selection_rgba = "rgba(82, 224, 255, 0.25)"
+        chrome_hover_rgba = "rgba(28, 44, 66, 0.95)" if translucent else chrome.lighter(110).name()
+
+        text_hex = text.name()
+        muted_hex = muted.name()
+        border_hex = border.name()
+        window_hex = window.name()
+        success_hex = success.name()
+        warning_hex = warning.name()
+        error_hex = error.name()
+        accent_cyan_hex = accent_cyan.name()
+        accent_blue_hex = accent_blue.name()
+        accent_violet_hex = accent_violet.name()
+        warm_warning_hex = warm_warning.name()
+
+        tooltip_font = QFont(app.font())
+        tooltip_font_size = tooltip_font.pointSizeF()
+        if tooltip_font_size <= 0:
+            tooltip_font_size = float(tooltip_font.pointSize())
+        if tooltip_font_size <= 0:
+            tooltip_font_size = 10.0
+        tooltip_font_size_css = f"{tooltip_font_size:.1f}pt"
+
+        stylesheet = f"""
+            QWidget {{
+                background-color: {window_hex};
+                color: {text_hex};
+            }}
+            QMainWindow, QDialog {{
+                background-color: {window_hex};
+                color: {text_hex};
+            }}
+            QToolTip {{
+                background-color: {chrome_rgba};
+                color: {text_hex};
+                border: 1px solid {border_hex};
+                border-radius: 10px;
+                padding: 8px 10px;
+                font-size: {tooltip_font_size_css};
+            }}
+            QMenu, QToolBar {{
+                background-color: {film_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 14px;
+            }}
+            QToolBar {{
+                background-color: {toolbar_rgba};
+                spacing: 6px;
+            }}
+            QStatusBar {{
+                background-color: {toolbar_rgba};
+                border-top: 1px solid {border_hex};
+            }}
+            QGroupBox {{
+                background-color: {glass_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 18px;
+                margin-top: 18px;
+                padding: 12px 14px 14px 14px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 16px;
+                padding: 0 6px;
+                background-color: transparent;
+                color: {muted_hex};
+            }}
+            QFrame#planSection, QFrame#chatBubble_user, QFrame#chatBubble_assistant,
+            QFrame#codeBlock {{
+                background-color: {glass_rgba};
+                border-radius: 18px;
+                border: 1px solid {border_hex};
+            }}
+            QLabel#bubbleMeta, QLabel#typingIndicator {{
+                color: {muted_hex};
+            }}
+            QTextBrowser, QPlainTextEdit, QTreeWidget, QTableView, QListView, QListWidget {{
+                background-color: {glass_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 14px;
+                selection-background-color: {selection_rgba};
+                selection-color: {text_hex};
+            }}
+            QHeaderView::section {{
+                background-color: {chrome_rgba};
+                border: 0px;
+                border-bottom: 1px solid {border_hex};
+                color: {muted_hex};
+                padding: 6px 8px;
+            }}
+            QPushButton, QToolButton {{
+                background-color: {chrome_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 18px;
+                padding: 6px 14px;
+                color: {text_hex};
+            }}
+            QPushButton:hover, QToolButton:hover {{
+                border-color: {accent_cyan_hex};
+                background-color: {chrome_hover_rgba};
+            }}
+            QPushButton:pressed, QToolButton:pressed {{
+                background-color: {accent_cyan_hex};
+                color: #041018;
+                border-color: {accent_cyan_hex};
+            }}
+            QPushButton:disabled, QToolButton:disabled {{
+                color: {muted_hex};
+                border-color: {border_hex};
+            }}
+            QPushButton:focus, QToolButton:focus {{
+                border: 2px solid {accent_cyan_hex};
+                padding: 5px 13px;
+                background-color: {chrome_hover_rgba};
+            }}
+            QPushButton#accent, QToolButton#accent {{
+                background-color: {accent_blue_hex};
+                border: none;
+                color: #05070d;
+            }}
+            QPushButton#accent:hover, QToolButton#accent:hover {{
+                background-color: {accent_violet_hex};
+                color: {text_hex};
+            }}
+            QPushButton#warn, QToolButton#warn {{
+                background-color: {warm_warning_hex};
+                color: #05070d;
+            }}
+            QPushButton#warn:hover, QToolButton#warn:hover {{
+                border: 2px solid {warm_warning_hex};
+                padding: 5px 13px;
+            }}
+            QScrollBar::handle {{
+                background: {accent_blue_hex};
+                border-radius: 8px;
+                min-height: 24px;
+            }}
+            QScrollBar::handle:hover {{
+                background: {accent_cyan_hex};
+            }}
+            QScrollBar::add-page, QScrollBar::sub-page {{
+                background: transparent;
+            }}
+            QTreeView::item:selected, QListView::item:selected, QTableView::item:selected {{
+                background-color: {selection_rgba};
+                color: {text_hex};
+            }}
+            QLabel#statusPill {{
+                border-radius: 16px;
+                padding: 4px 12px;
+                border: 1px solid {border_hex};
+                background-color: {glass_rgba};
+                color: {muted_hex};
+            }}
+            QLabel#statusPill[state="info"] {{
+                background-color: {accent_cyan_hex};
+                color: #041018;
+                border-color: {accent_cyan_hex};
+            }}
+            QLabel#statusPill[state="connected"] {{
+                background-color: {success_hex};
+                color: #041018;
+                border-color: {success_hex};
+            }}
+            QLabel#statusPill[state="warning"] {{
+                background-color: {warning_hex};
+                color: #041018;
+                border-color: {warning_hex};
+            }}
+            QLabel#statusPill[state="error"] {{
+                background-color: {error_hex};
+                color: #041018;
+                border-color: {error_hex};
+            }}
+            QWidget#toast {{
+                background-color: {chrome_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 16px;
+                color: {text_hex};
+            }}
+            QProgressBar {{
+                background-color: {film_rgba};
+                border: 1px solid {border_hex};
+                border-radius: 10px;
+                color: {text_hex};
+            }}
+            QProgressBar::chunk {{
+                background: QLinearGradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 {accent_cyan_hex}, stop:0.5 {accent_blue_hex}, stop:1 {accent_violet_hex});
+                border-radius: 8px;
+            }}
+        """
+        return palette, stylesheet
 
     def apply_font_preferences(self, app: QApplication | None = None) -> None:
         """Apply the configured font family and size to the application."""
@@ -649,4 +949,21 @@ class SettingsService(QObject):
 
 
 __all__ = ["SettingsService", "UISettings", "DEFAULT_THEME"]
+
+def _supports_translucency(app: QApplication) -> bool:
+    """Best effort check for platform translucency support."""
+
+    override = os.environ.get("DATAMINER_DISABLE_GLASS", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return False
+    platform = (app.platformName() or "").lower()
+    if platform in {"offscreen", "minimal", "minimalistic"}:
+        return False
+    screen = app.primaryScreen()
+    if screen is None:
+        return False
+    try:
+        return screen.depth() >= 24
+    except Exception:  # pragma: no cover - defensive fallback
+        return True
 

@@ -165,6 +165,7 @@ class MainWindow(QMainWindow):
         self._setup_window()
         self._create_actions()
         self._create_menus_and_toolbar()
+        self._sync_theme_actions(self.settings_service.theme)
         self._create_status_bar()
         self.conversation_settings = ConversationSettings()
         self._conversation_manager = ConversationManager(self.lmstudio_client)
@@ -220,8 +221,14 @@ class MainWindow(QMainWindow):
         self.help_action = QAction("Help", self)
         self.help_action.triggered.connect(self._open_help)
 
-        self.toggle_theme_action = QAction("Toggle Theme", self)
+        self.toggle_theme_action = QAction("Toggle Light/Dark", self)
+        self.toggle_theme_action.setToolTip("Switch between the standard light and dark palettes.")
         self.toggle_theme_action.triggered.connect(self._on_toggle_theme_triggered)
+
+        self._theme_group: QActionGroup | None = None
+        self.light_theme_action: QAction | None = None
+        self.dark_theme_action: QAction | None = None
+        self.futuristic_theme_action: QAction | None = None
 
         self.view_logs_action = QAction("View Logs…", self)
         self.view_logs_action.triggered.connect(self._open_log_viewer)
@@ -306,7 +313,28 @@ class MainWindow(QMainWindow):
         view_menu = QMenu("View", self)
         view_menu.addAction(self.view_logs_action)
         view_menu.addSeparator()
-        view_menu.addAction(self.toggle_theme_action)
+
+        theme_menu = view_menu.addMenu("Theme")
+        theme_menu.addAction(self.toggle_theme_action)
+        theme_menu.addSeparator()
+        self._theme_group = QActionGroup(self)
+        self._theme_group.setExclusive(True)
+        self.light_theme_action = QAction("Standard – Light", self, checkable=True)
+        self.light_theme_action.setData("light")
+        self._theme_group.addAction(self.light_theme_action)
+        theme_menu.addAction(self.light_theme_action)
+        self.dark_theme_action = QAction("Standard – Dark", self, checkable=True)
+        self.dark_theme_action.setData("dark")
+        self._theme_group.addAction(self.dark_theme_action)
+        theme_menu.addAction(self.dark_theme_action)
+        self.futuristic_theme_action = QAction(
+            "Futuristic Glass", self, checkable=True
+        )
+        self.futuristic_theme_action.setData("futuristic")
+        self._theme_group.addAction(self.futuristic_theme_action)
+        theme_menu.addAction(self.futuristic_theme_action)
+        self._theme_group.triggered.connect(self._on_theme_group_triggered)
+
         view_menu.addSeparator()
 
         self.toggle_corpus_panel_action = QAction("Show corpus pane", self, checkable=True)
@@ -579,6 +607,13 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_theme_triggered(self, _: bool) -> None:
         self.settings_service.toggle_theme()
+
+    def _on_theme_group_triggered(self, action: QAction) -> None:
+        data = str(action.data()).lower()
+        if data == "futuristic":
+            self.settings_service.use_futuristic_theme(action.isChecked())
+        elif data in {"light", "dark"} and action.isChecked():
+            self.settings_service.set_theme(data)
 
     def _toggle_corpus_panel(self, visible: bool) -> None:
         if visible:
@@ -1901,7 +1936,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _apply_theme(self, theme: str) -> None:
         self.settings_service.apply_theme()
-        self._show_toast(f"Theme set to {theme.title()}.", level="info", duration_ms=1500)
+        self._sync_theme_actions(theme)
+        if theme == "futuristic":
+            message = "Futuristic glass theme enabled."
+        else:
+            message = f"{theme.title()} theme enabled."
+        self._show_toast(message, level="info", duration_ms=1500)
 
     def _apply_font_scale(self, *_args: object) -> None:
         self.settings_service.apply_font_scale()
@@ -1933,6 +1973,30 @@ class MainWindow(QMainWindow):
             data = action.data()
             if isinstance(data, AnswerLength):
                 action.setChecked(data is preset)
+
+    def _sync_theme_actions(self, theme: str) -> None:
+        group = getattr(self, "_theme_group", None)
+        if group is None:
+            return
+        light_action = getattr(self, "light_theme_action", None)
+        dark_action = getattr(self, "dark_theme_action", None)
+        futuristic_action = getattr(self, "futuristic_theme_action", None)
+        normalized = str(theme).lower()
+        if normalized == "futuristic" and isinstance(futuristic_action, QAction):
+            futuristic_action.setChecked(True)
+            self.toggle_theme_action.setText("Switch to Standard Theme")
+            self.toggle_theme_action.setToolTip(
+                "Return to the standard light or dark palette."
+            )
+        elif normalized == "dark" and isinstance(dark_action, QAction):
+            dark_action.setChecked(True)
+            self.toggle_theme_action.setText("Switch to Light")
+            self.toggle_theme_action.setToolTip("Switch to the light standard palette.")
+        else:
+            if isinstance(light_action, QAction):
+                light_action.setChecked(True)
+            self.toggle_theme_action.setText("Switch to Dark")
+            self.toggle_theme_action.setToolTip("Switch to the dark standard palette.")
 
     def _prompt_model_name(self) -> None:
         current = self.conversation_settings.model_name

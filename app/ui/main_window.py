@@ -11,7 +11,16 @@ from pathlib import Path
 import threading
 from typing import Any, Callable, Iterable
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, QUrl
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QMetaObject,
+    QPropertyAnimation,
+    Qt,
+    QTimer,
+    QUrl,
+    Q_ARG,
+    pyqtSlot,
+)
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -66,6 +75,7 @@ from ..services.project_service import ProjectRecord, ProjectService
 from ..services.backup_service import BackupService
 from ..services.export_service import ExportService
 from ..services.settings_service import SettingsService, ChatStyleSettings
+from ..services.working_memory import WorkingMemoryService
 from ..storage import DatabaseError
 from ..logging import get_log_file_path
 from .answer_view import AnswerView, ChatTurnWidget
@@ -167,7 +177,11 @@ class MainWindow(QMainWindow):
         self._create_menus_and_toolbar()
         self._create_status_bar()
         self.conversation_settings = ConversationSettings()
-        self._conversation_manager = ConversationManager(self.lmstudio_client)
+        self.working_memory_service = WorkingMemoryService(project_service.working_memory)
+        self._conversation_manager = ConversationManager(
+            self.lmstudio_client,
+            working_memory=self.working_memory_service,
+        )
         self.search_service = SearchService(
             project_service.ingest,
             project_service.documents,
@@ -1554,61 +1568,106 @@ class MainWindow(QMainWindow):
         progress_message = "Refreshing evidence..." if triggered_by_scope else "Submitting question..."
         self.progress_service.start("chat-send", progress_message)
         asked_at = datetime.now()
-        step_context_provider = self._build_step_context_provider(question)
-        context_snippets, retrieval_documents = self._prepare_retrieval_context(question)
-        extra_options = self._build_extra_request_options(
-            question, retrieval_documents=retrieval_documents or None
-        )
-        try:
-            turn = self._conversation_manager.ask(
-                question,
-                context_snippets=context_snippets or None,
-                reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
-                response_mode=self.conversation_settings.response_mode,
-                preset=self.conversation_settings.answer_length,
-                extra_options=extra_options or None,
-                context_provider=step_context_provider,
-            )
-        except LMStudioError as exc:
+        scope_snapshot = {
+            "include": list(self._current_retrieval_scope.get("include", [])),
+            "exclude": list(self._current_retrieval_scope.get("exclude", [])),
+        }
+        def _handle_error(exc: LMStudioError) -> None:
             self.progress_service.finish("chat-send", "Send failed")
             self.progress_service.notify(str(exc) or "Failed to contact LMStudio", level="error")
             self.question_input.set_busy(False)
             self._update_question_prerequisites(self._conversation_manager.connection_state)
-            return
 
-        answered_at = datetime.now()
-        turn.asked_at = asked_at
-        turn.answered_at = answered_at
-        turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
-        turn.token_usage = self._extract_token_usage(turn)
-        review = getattr(turn, "adversarial_review", None)
-        if review and getattr(review, "revised", False):
-            self._show_toast(
-                "Answer revised for accuracy/clarity.",
-                level="info",
-                duration_ms=3500,
+        def _handle_success(turn: ConversationTurn, answered_at: datetime) -> None:
+            turn.asked_at = asked_at
+            turn.answered_at = answered_at
+            turn.latency_ms = int((answered_at - asked_at).total_seconds() * 1000)
+            turn.token_usage = self._extract_token_usage(turn)
+            review = getattr(turn, "adversarial_review", None)
+            if review and getattr(review, "revised", False):
+                self._show_toast(
+                    "Answer revised for accuracy/clarity.",
+                    level="info",
+                    duration_ms=3500,
+                )
+            self._turns.append(turn)
+            self._update_session(turns=list(self._turns))
+            card = self.answer_view.add_turn(turn)
+            self._active_card = card
+            self._update_evidence_panel(turn)
+            self._update_export_actions()
+            finish_message = "Evidence refreshed" if triggered_by_scope else "Answer received"
+            self.progress_service.finish("chat-send", finish_message)
+            self.question_input.set_busy(False)
+            self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+        def worker() -> None:
+            try:
+                context_snippets, retrieval_documents = self._prepare_retrieval_context(
+                    question, scope=scope_snapshot
+                )
+                step_context_provider = self._build_step_context_provider(
+                    question, scope=scope_snapshot
+                )
+                extra_options = self._build_extra_request_options(
+                    question,
+                    retrieval_documents=retrieval_documents or None,
+                    scope=scope_snapshot,
+                )
+                try:
+                    active_project_id = self.project_service.active_project_id
+                except RuntimeError:
+                    active_project_id = None
+                turn = self._conversation_manager.ask(
+                    question,
+                    context_snippets=context_snippets or None,
+                    reasoning_verbosity=self.conversation_settings.reasoning_verbosity,
+                    response_mode=self.conversation_settings.response_mode,
+                    preset=self.conversation_settings.answer_length,
+                    extra_options=extra_options or None,
+                    context_provider=step_context_provider,
+                    project_id=active_project_id,
+                )
+            except LMStudioError as exc:
+                QMetaObject.invokeMethod(
+                    self,
+                    "_invoke_on_ui",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(object, lambda exc=exc: _handle_error(exc)),
+                )
+                return
+
+            answered_at = datetime.now()
+            QMetaObject.invokeMethod(
+                self,
+                "_invoke_on_ui",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG(
+                    object,
+                    lambda turn=turn, answered_at=answered_at: _handle_success(
+                        turn, answered_at
+                    ),
+                ),
             )
-        self._turns.append(turn)
-        self._update_session(turns=list(self._turns))
-        card = self.answer_view.add_turn(turn)
-        self._active_card = card
-        self._update_evidence_panel(turn)
-        self._update_export_actions()
-        finish_message = "Evidence refreshed" if triggered_by_scope else "Answer received"
-        self.progress_service.finish("chat-send", finish_message)
-        self.question_input.set_busy(False)
-        self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @pyqtSlot(object)
+    def _invoke_on_ui(self, callback: object) -> None:
+        if callable(callback):
+            callback()
 
     def _build_extra_request_options(
         self,
         question: str | None = None,
         *,
         retrieval_documents: list[dict[str, Any]] | None = None,
+        scope: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {}
-        scope = self._current_retrieval_scope
-        include = list(scope.get("include", [])) if scope else []
-        exclude = list(scope.get("exclude", [])) if scope else []
+        scope_data = scope or self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope_data.get("include", []))
+        exclude = list(scope_data.get("exclude", []))
         retrieval: dict[str, Any] = {}
         if question and question.strip():
             retrieval["query"] = question.strip()
@@ -1623,7 +1682,9 @@ class MainWindow(QMainWindow):
         return options
 
     def _build_step_context_provider(
-        self, question: str
+        self,
+        question: str,
+        scope: dict[str, list[str]] | None = None,
     ) -> Callable[[PlanItem, int, int], Iterable[StepContextBatch]]:
         normalized = question.strip()
         try:
@@ -1631,9 +1692,9 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             return lambda *_args, **_kwargs: []
 
-        scope = self._current_retrieval_scope or {"include": [], "exclude": []}
-        include = list(scope.get("include") or [])
-        exclude = list(scope.get("exclude") or [])
+        scope_data = scope or self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope_data.get("include") or [])
+        exclude = list(scope_data.get("exclude") or [])
         chunk_size = 3
         limit = 9
 
@@ -1649,6 +1710,20 @@ class MainWindow(QMainWindow):
                 exclude_identifiers=exclude,
                 limit=limit,
             )
+            memory_records: list[dict[str, Any]] = []
+            try:
+                memory_records = self.working_memory_service.collect_context_records(
+                    combined_query,
+                    project_id=project_id,
+                    limit=max(3, limit // 3) or 3,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "Working memory retrieval failed",
+                    extra={"project_id": project_id, "step_index": step_index},
+                )
+            if memory_records:
+                records.extend(memory_records)
             batches: list[StepContextBatch] = []
             for chunk in self._chunk_records(records, chunk_size):
                 snippets, documents = self._context_payload_from_records(
@@ -1663,7 +1738,7 @@ class MainWindow(QMainWindow):
         return provider
 
     def _prepare_retrieval_context(
-        self, question: str
+        self, question: str, scope: dict[str, list[str]] | None = None
     ) -> tuple[list[str], list[dict[str, Any]]]:
         if not question.strip():
             return [], []
@@ -1671,15 +1746,29 @@ class MainWindow(QMainWindow):
             project_id = self.project_service.active_project_id
         except RuntimeError:
             return [], []
-        scope = self._current_retrieval_scope or {"include": [], "exclude": []}
-        include = scope.get("include") or []
-        exclude = scope.get("exclude") or []
+        scope_data = scope or self._current_retrieval_scope or {"include": [], "exclude": []}
+        include = list(scope_data.get("include") or [])
+        exclude = list(scope_data.get("exclude") or [])
         records = self.search_service.collect_context_records(
             question,
             project_id=project_id,
             include_identifiers=include,
             exclude_identifiers=exclude,
         )
+        try:
+            memory_records = self.working_memory_service.collect_context_records(
+                question,
+                project_id=project_id,
+                limit=5,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Working memory retrieval failed",
+                extra={"project_id": project_id},
+            )
+            memory_records = []
+        if memory_records:
+            records.extend(memory_records)
         return self._context_payload_from_records(records, project_id)
 
     def _context_payload_from_records(
@@ -1737,32 +1826,53 @@ class MainWindow(QMainWindow):
                 payload["path"] = str(source_path)
             document_id = document.get("id")
             if document_id is not None:
-                payload["document_id"] = int(document_id)
+                self._store_numeric(payload, "document_id", document_id, fallback_to_string=True)
             chunk_id = chunk.get("id") if isinstance(chunk, dict) else None
             if chunk_id is not None:
-                payload["chunk_id"] = int(chunk_id)
+                self._store_numeric(payload, "chunk_id", chunk_id, fallback_to_string=True)
             chunk_index = chunk.get("index") if isinstance(chunk, dict) else None
             if chunk_index is not None:
-                payload["chunk_index"] = int(chunk_index)
+                self._store_numeric(payload, "chunk_index", chunk_index, fallback_to_string=True)
             start_offset = chunk.get("start_offset") if isinstance(chunk, dict) else None
             if start_offset is not None:
-                payload["start_offset"] = int(start_offset)
+                self._store_numeric(payload, "start_offset", start_offset)
             end_offset = chunk.get("end_offset") if isinstance(chunk, dict) else None
             if end_offset is not None:
-                payload["end_offset"] = int(end_offset)
+                self._store_numeric(payload, "end_offset", end_offset)
             highlight = record.get("highlight")
             if highlight:
                 payload["snippet"] = str(highlight)
             ingest_doc = record.get("ingest_document") or {}
             ingest_id = ingest_doc.get("id")
             if ingest_id is not None:
-                payload["ingest_document_id"] = int(ingest_id)
+                self._store_numeric(payload, "ingest_document_id", ingest_id)
             ingest_version = ingest_doc.get("version")
             if ingest_version is not None:
-                payload["ingest_version"] = int(ingest_version)
+                self._store_numeric(payload, "ingest_version", ingest_version)
             retrieval_documents.append(payload)
 
         return snippets, retrieval_documents
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _store_numeric(
+        payload: dict[str, Any],
+        key: str,
+        value: Any,
+        *,
+        fallback_to_string: bool = False,
+    ) -> None:
+        numeric = MainWindow._coerce_int(value)
+        if numeric is not None:
+            payload[key] = numeric
+        elif fallback_to_string:
+            payload[key] = str(value)
 
     @staticmethod
     def _chunk_records(

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import re
 import socket
 import time
 from collections.abc import Iterable, Sequence
@@ -170,14 +172,12 @@ class LMStudioClient:
                     status = response.getcode()
                     body = response.read()
                 if status >= 400:
-                    message = body.decode("utf-8", errors="replace") if body else ""
-                    raise LMStudioResponseError(
-                        f"LMStudio returned HTTP {status}: {message.strip()}"
-                    )
+                    message = self._build_http_error_message(status, body)
+                    raise LMStudioResponseError(message)
                 return body
             except error.HTTPError as exc:
                 body = exc.read() if hasattr(exc, "read") else b""
-                message = body.decode("utf-8", errors="replace") if body else str(exc)
+                message = self._build_http_error_message(getattr(exc, "code", None), body)
                 last_error = LMStudioResponseError(message)
                 if not self._should_retry(exc.code):
                     break
@@ -218,9 +218,17 @@ class LMStudioClient:
         if not body:
             raise LMStudioResponseError("Empty response from LMStudio")
         try:
-            return json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+            text = body.decode("utf-8")
+        except UnicodeDecodeError as exc:  # pragma: no cover - defensive
             raise LMStudioResponseError("Invalid JSON from LMStudio") from exc
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            fallback = self._coalesce_streamed_response(text)
+            if fallback is not None:
+                return fallback
+            raise LMStudioResponseError("Invalid JSON from LMStudio") from None
 
     @staticmethod
     @log_call(logger=logger, include_result=True)
@@ -256,11 +264,336 @@ class LMStudioClient:
         )
 
     @staticmethod
+    def _build_http_error_message(
+        status: int | None, body: bytes | str | None
+    ) -> str:
+        summary = LMStudioClient._summarize_error_body(body)
+        if status is not None:
+            if summary:
+                return f"LMStudio returned HTTP {status}: {summary}"
+            return f"LMStudio returned HTTP {status}"
+        return summary or "LMStudio request failed"
+
+    @staticmethod
+    def _summarize_error_body(body: bytes | str | None) -> str:
+        if body is None:
+            return ""
+        if isinstance(body, bytes):
+            text = body.decode("utf-8", errors="replace")
+        else:
+            text = str(body)
+        text = text.strip()
+        if not text:
+            return ""
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return LMStudioClient._normalize_error_message(text)
+        if isinstance(data, dict):
+            buckets: list[dict[str, Any]] = []
+            error_payload = data.get("error")
+            if isinstance(error_payload, dict):
+                buckets.append(error_payload)
+            buckets.append(data)
+            for bucket in buckets:
+                if not isinstance(bucket, dict):
+                    continue
+                message = bucket.get("message") or bucket.get("detail") or ""
+                if not isinstance(message, str):
+                    message = str(message)
+                hints = [
+                    str(bucket[key]).strip()
+                    for key in ("hint", "help")
+                    if isinstance(bucket.get(key), str) and str(bucket[key]).strip()
+                ]
+                normalized = LMStudioClient._normalize_error_message(
+                    message,
+                    code=bucket.get("code"),
+                    hints=hints,
+                )
+                if normalized:
+                    return normalized
+        return LMStudioClient._normalize_error_message(text)
+
+    @staticmethod
+    def _normalize_error_message(
+        message: str, *, code: Any = None, hints: Sequence[str] | None = None
+    ) -> str:
+        clean = " ".join(str(message or "").split())
+        hint_text = ""
+        if hints:
+            parts = [" ".join(str(hint).split()) for hint in hints if str(hint).strip()]
+            hint_text = " ".join(parts).strip()
+        crash_message = LMStudioClient._humanize_model_crash(clean, code=code)
+        if crash_message:
+            if hint_text:
+                return f"{crash_message} Details: {hint_text}"
+            return crash_message
+        if hint_text:
+            if clean:
+                return f"{clean} ({hint_text})"
+            return hint_text
+        return clean
+
+    @staticmethod
+    def _humanize_model_crash(message: str, *, code: Any = None) -> str | None:
+        crash_hint = False
+        numeric_code = LMStudioClient._coerce_int(code)
+        if numeric_code is None:
+            numeric_code = LMStudioClient._extract_large_number(message)
+        elif numeric_code >= 1 << 31:
+            crash_hint = True
+        normalized_message = message.strip()
+        lower = normalized_message.lower()
+        if "model crash" in lower or "model crashed" in lower:
+            crash_hint = True
+        if isinstance(code, str) and code.lower() == "model_crash":
+            crash_hint = True
+        if numeric_code is not None and numeric_code >= 1 << 31:
+            crash_hint = True
+        if not crash_hint:
+            return None
+        formatted_code = None
+        if numeric_code is not None and numeric_code >= 1 << 31:
+            formatted_code = LMStudioClient._format_crash_code(numeric_code)
+        details = normalized_message
+        if formatted_code and numeric_code is not None and details:
+            digits = str(numeric_code)
+            if digits in details:
+                details = details.replace(digits, formatted_code)
+        details = details.strip(" .")
+        friendly = (
+            "The response generation process reported that the model crashed"
+        )
+        if formatted_code:
+            friendly += f" (error {formatted_code})"
+        friendly += ". Restart the model backend and try again."
+        if details and details.lower() not in {"model crash", "model crash error"}:
+            friendly += f" Details: {details}"
+        return friendly
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            try:
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return int(stripped)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _extract_large_number(text: str) -> int | None:
+        for match in re.finditer(r"\d{9,}", text):
+            try:
+                value = int(match.group(0))
+            except ValueError:
+                continue
+            if value >= 1 << 31:
+                return value
+        return None
+
+    @staticmethod
+    def _format_crash_code(value: int) -> str:
+        if value >= 1 << 63:
+            signed = value - (1 << 64)
+            hex_value = f"0x{value & ((1 << 64) - 1):016X}"
+        else:
+            signed = value - (1 << 32)
+            hex_value = f"0x{value & ((1 << 32) - 1):08X}"
+        return f"{signed} / {hex_value}"
+
+    @staticmethod
+    def _coalesce_streamed_response(payload: str) -> dict[str, Any] | None:
+        """Merge Server-Sent Event chunks into a standard chat payload."""
+
+        events: list[dict[str, Any]] = []
+        for block in payload.split("\n\n"):
+            if not block.strip():
+                continue
+            for line in block.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith(":"):
+                    continue
+                if not stripped.startswith("data:"):
+                    continue
+                data = stripped[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    events.append(json.loads(data))
+                except json.JSONDecodeError:  # pragma: no cover - defensive
+                    return None
+
+        if not events:
+            return None
+
+        return LMStudioClient._merge_sse_events(events)
+
+    @staticmethod
+    def _merge_sse_events(events: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+        choices: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] | None = None
+        meta: dict[str, Any] = {}
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_usage = event.get("usage")
+            if isinstance(event_usage, dict):
+                usage = event_usage
+            for key in ("id", "object", "model", "created"):
+                value = event.get(key)
+                if value is not None:
+                    meta[key] = value
+
+            raw_choices = event.get("choices")
+            if not isinstance(raw_choices, Iterable):
+                continue
+            for choice in raw_choices:
+                if not isinstance(choice, dict):
+                    continue
+                index_raw = choice.get("index", 0)
+                try:
+                    index = int(index_raw)
+                except (TypeError, ValueError):
+                    index = 0
+                entry = choices.setdefault(
+                    index,
+                    {"index": index, "message": {"role": "assistant", "content": ""}},
+                )
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None:
+                    entry["finish_reason"] = finish_reason
+                logprobs = choice.get("logprobs")
+                if isinstance(logprobs, dict):
+                    entry["logprobs"] = copy.deepcopy(logprobs)
+
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    message = entry.setdefault("message", {"role": "assistant", "content": ""})
+                    LMStudioClient._merge_choice_delta(message, delta)
+
+                message_block = choice.get("message")
+                if isinstance(message_block, dict):
+                    message = entry.setdefault("message", {"role": "assistant", "content": ""})
+                    LMStudioClient._deep_merge_dicts(message, message_block)
+
+        if not choices:
+            return None
+
+        aggregated: dict[str, Any] = dict(meta)
+        aggregated["choices"] = [choices[index] for index in sorted(choices)]
+        if usage is not None:
+            aggregated["usage"] = usage
+        return aggregated
+
+    @staticmethod
+    def _merge_choice_delta(message: dict[str, Any], delta: dict[str, Any]) -> None:
+        for key, value in delta.items():
+            if key == "content":
+                if isinstance(value, str):
+                    existing = message.get("content", "")
+                    if not isinstance(existing, str):
+                        existing = LMStudioClient._normalize_message_content(existing)
+                    message["content"] = f"{existing}{value}"
+                elif isinstance(value, Iterable):
+                    normalized = LMStudioClient._normalize_message_content(value)
+                    existing = message.get("content", "")
+                    if not isinstance(existing, str):
+                        existing = LMStudioClient._normalize_message_content(existing)
+                    message["content"] = f"{existing}{normalized}"
+            elif key == "role":
+                if isinstance(value, str):
+                    message["role"] = value
+            elif isinstance(value, dict):
+                target = message.get(key)
+                if isinstance(target, dict):
+                    LMStudioClient._deep_merge_dicts(target, value)
+                else:
+                    message[key] = copy.deepcopy(value)
+            elif isinstance(value, list):
+                target_list = message.get(key)
+                if isinstance(target_list, list):
+                    target_list.extend(copy.deepcopy(value))
+                else:
+                    message[key] = copy.deepcopy(value)
+            else:
+                message[key] = value
+
+    @staticmethod
+    def _deep_merge_dicts(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if key == "content":
+                normalized = value
+                if not isinstance(normalized, str):
+                    normalized = LMStudioClient._normalize_message_content(value)
+                existing = target.get(key)
+                if isinstance(existing, str) and existing:
+                    target[key] = existing + str(normalized)
+                else:
+                    target[key] = str(normalized)
+            elif isinstance(value, dict):
+                current = target.get(key)
+                if isinstance(current, dict):
+                    LMStudioClient._deep_merge_dicts(current, value)
+                else:
+                    target[key] = copy.deepcopy(value)
+            elif isinstance(value, list):
+                current_list = target.get(key)
+                if isinstance(current_list, list):
+                    current_list.extend(copy.deepcopy(value))
+                else:
+                    target[key] = copy.deepcopy(value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    @staticmethod
     def _normalize_message_content(content: Any) -> str:
         """Return a usable string from ``content`` or raise an error."""
 
         if isinstance(content, str):
             return content
+        if isinstance(content, dict):
+            pieces: list[str] = []
+            text_value = content.get("text")
+            if isinstance(text_value, str):
+                pieces.append(text_value)
+            elif isinstance(text_value, Iterable) and not isinstance(
+                text_value, (str, bytes)
+            ):
+                pieces.append(LMStudioClient._normalize_message_content(text_value))
+            alt = content.get("content")
+            if isinstance(alt, str):
+                pieces.append(alt)
+            elif isinstance(alt, Iterable) and not isinstance(alt, (str, bytes)):
+                pieces.append(LMStudioClient._normalize_message_content(alt))
+            if pieces:
+                return "".join(pieces)
+            nested_parts: list[str] = []
+            for value in content.values():
+                if isinstance(value, str):
+                    nested_parts.append(value)
+                elif isinstance(value, Iterable) and not isinstance(
+                    value, (str, bytes)
+                ):
+                    nested_parts.append(
+                        LMStudioClient._normalize_message_content(value)
+                    )
+            if nested_parts:
+                return "".join(nested_parts)
+            return ""
         if isinstance(content, Iterable):
             parts: list[str] = []
             for item in content:

@@ -11,7 +11,8 @@ import json
 import logging
 import re
 import textwrap
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from difflib import SequenceMatcher
 from enum import Enum
@@ -19,6 +20,7 @@ from html.parser import HTMLParser
 from typing import Any, Literal
 
 from ..logging import log_call
+from .working_memory import WorkingMemoryService
 
 
 logger = logging.getLogger(__name__)
@@ -199,6 +201,9 @@ class ReasoningArtifacts:
     assumptions: list[str] = field(default_factory=list)
     assumption_decision: AssumptionDecision | None = None
     self_check: SelfCheckResult | None = None
+    task_charter: TaskCharter | None = None
+    state_digest: list[StateDigestEntry] = field(default_factory=list)
+    evidence_log: list[EvidenceRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -252,6 +257,24 @@ class ConversationTurn:
             return None
         return self.reasoning_artifacts.self_check
 
+    @property
+    def task_charter(self) -> TaskCharter | None:
+        if self.reasoning_artifacts is None:
+            return None
+        return self.reasoning_artifacts.task_charter
+
+    @property
+    def state_digest(self) -> list[StateDigestEntry]:
+        if self.reasoning_artifacts is None:
+            return []
+        return list(self.reasoning_artifacts.state_digest)
+
+    @property
+    def evidence_log(self) -> list[EvidenceRecord]:
+        if self.reasoning_artifacts is None:
+            return []
+        return list(self.reasoning_artifacts.evidence_log)
+
 
 @dataclass(frozen=True)
 class ConnectionState:
@@ -280,6 +303,40 @@ class StepResult:
     contexts: list[StepContextBatch] = field(default_factory=list)
     citation_indexes: list[int] = field(default_factory=list)
     insufficient: bool = False
+
+
+@dataclass
+class TaskCharter:
+    """Structured snapshot of the framed user task."""
+
+    goal: str
+    deliverable: str
+    audience: str
+    constraints: list[str] = field(default_factory=list)
+    success_criteria: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    clarifying_questions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StateDigestEntry:
+    """Condensed memory of a completed plan step."""
+
+    step_index: int
+    summary: str
+    citation_indexes: list[int] = field(default_factory=list)
+    pending_questions: list[str] = field(default_factory=list)
+    decisions: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EvidenceRecord:
+    """Trace of retrieval intent and supporting documents for a step."""
+
+    step_index: int
+    intent: str
+    documents: list[dict[str, Any]] = field(default_factory=list)
+    snippets: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1425,6 +1482,7 @@ class ConversationManager:
         *,
         system_prompt: str | None = None,
         context_window: int = 4,
+        working_memory: WorkingMemoryService | None = None,
     ) -> None:
         self.client = client
         self.system_prompt = system_prompt
@@ -1437,6 +1495,8 @@ class ConversationManager:
         self._judge = _AdversarialJudge()
         self._plan_critic = _PlanCritic()
         self._judge_log: deque[dict[str, Any]] = deque(maxlen=50)
+        self._lock = threading.RLock()
+        self._working_memory = working_memory
 
     def add_connection_listener(
         self, listener: Callable[[ConnectionState], None]
@@ -1481,39 +1541,52 @@ class ConversationManager:
         response_mode: ResponseMode = ResponseMode.GENERATIVE,
         extra_options: dict[str, Any] | None = None,
         context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]] | None = None,
+        project_id: int | None = None,
     ) -> ConversationTurn:
         """Send ``question`` to LMStudio and append the resulting turn."""
 
-        sanitized_question = question.strip()
-        preview = sanitized_question[:120]
-        logger.info(
-            "Received question",
-            extra={
-                "question_preview": preview,
-                "preset": preset.value,
-                "response_mode": response_mode.value,
-                "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
-                "context_snippet_count": len(context_snippets or []),
-                "planning_enabled": context_provider is not None,
-            },
-        )
+        with self._lock:
+            sanitized_question = question.strip()
+            preview = sanitized_question[:120]
+            logger.info(
+                "Received question",
+                extra={
+                    "question_preview": preview,
+                    "preset": preset.value,
+                    "response_mode": response_mode.value,
+                    "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
+                    "context_snippet_count": len(context_snippets or []),
+                    "planning_enabled": context_provider is not None,
+                },
+            )
 
-        if not self._connected:
-            message = self._connection_error or "LMStudio is disconnected."
-            raise LMStudioConnectionError(message)
+            if not self._connected:
+                message = self._connection_error or "LMStudio is disconnected."
+                raise LMStudioConnectionError(message)
 
-        if context_provider is not None:
-            try:
-                turn = self._ask_with_plan(
-                    question,
-                    context_snippets=context_snippets,
-                    preset=preset,
-                    reasoning_verbosity=reasoning_verbosity,
-                    response_mode=response_mode,
-                    extra_options=extra_options,
-                    context_provider=context_provider,
-                )
-            except DynamicPlanningError:
+            if context_provider is not None:
+                try:
+                    turn = self._ask_with_plan(
+                        question,
+                        context_snippets=context_snippets,
+                        preset=preset,
+                        reasoning_verbosity=reasoning_verbosity,
+                        response_mode=response_mode,
+                        extra_options=extra_options,
+                        context_provider=context_provider,
+                        project_id=project_id,
+                    )
+                except DynamicPlanningError:
+                    turn = self._ask_single_shot(
+                        question,
+                        context_snippets=context_snippets,
+                        preset=preset,
+                        reasoning_verbosity=reasoning_verbosity,
+                        response_mode=response_mode,
+                        extra_options=extra_options,
+                        project_id=project_id,
+                    )
+            else:
                 turn = self._ask_single_shot(
                     question,
                     context_snippets=context_snippets,
@@ -1521,27 +1594,19 @@ class ConversationManager:
                     reasoning_verbosity=reasoning_verbosity,
                     response_mode=response_mode,
                     extra_options=extra_options,
+                    project_id=project_id,
                 )
-        else:
-            turn = self._ask_single_shot(
-                question,
-                context_snippets=context_snippets,
-                preset=preset,
-                reasoning_verbosity=reasoning_verbosity,
-                response_mode=response_mode,
-                extra_options=extra_options,
+            logger.info(
+                "Completed question",
+                extra={
+                    "question_preview": preview,
+                    "response_mode": response_mode.value,
+                    "plan_step_count": len(turn.plan),
+                    "step_result_count": len(getattr(turn, "step_results", [])),
+                    "citation_count": len(turn.citations),
+                },
             )
-        logger.info(
-            "Completed question",
-            extra={
-                "question_preview": preview,
-                "response_mode": response_mode.value,
-                "plan_step_count": len(turn.plan),
-                "step_result_count": len(getattr(turn, "step_results", [])),
-                "citation_count": len(turn.citations),
-            },
-        )
-        return turn
+            return turn
 
     @log_call(logger=logger, level=logging.DEBUG, include_args=False)
     def _ask_single_shot(
@@ -1553,9 +1618,14 @@ class ConversationManager:
         reasoning_verbosity: ReasoningVerbosity | None,
         response_mode: ResponseMode,
         extra_options: dict[str, Any] | None,
+        project_id: int | None,
     ) -> ConversationTurn:
         question_preview = question.strip()[:120]
-        messages = self._build_messages(question, context_snippets)
+        messages = self._build_messages(
+            question,
+            context_snippets,
+            extra_system_prompts=[CONSOLIDATION_SYSTEM_PROMPT],
+        )
         logger.info(
             "Dispatching single-shot query",
             extra={
@@ -1583,7 +1653,25 @@ class ConversationManager:
             raise
 
         self._update_connection(True, None)
+        turn_id = len(self.turns) + 1
         turn = self._register_turn(question, response, response_mode, preset)
+        if self._working_memory and project_id is not None:
+            try:
+                self._working_memory.store_turn_memory(
+                    project_id=project_id,
+                    turn_index=turn_id,
+                    question=question,
+                    answer=turn.answer,
+                    plan=[],
+                    step_results=[],
+                    state_digest=turn.state_digest,
+                    evidence_log=turn.evidence_log,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist working memory for single-shot turn",
+                    extra={"project_id": project_id},
+                )
         logger.info(
             "Single-shot query completed",
             extra={
@@ -1603,6 +1691,7 @@ class ConversationManager:
         scope: dict[str, Any] | None,
         preset: AnswerLength,
         response_mode: ResponseMode,
+        step_results: Sequence["StepResult"] | None = None,
     ) -> tuple[ConsolidationOutput, list[Any], dict[int, int], JudgeReport]:
         original_consolidation = copy.deepcopy(consolidation)
         cycles = 0
@@ -1613,6 +1702,7 @@ class ConversationManager:
             index: index for index in range(1, len(citations) + 1)
         }
         last_verdict: _JudgeVerdict | None = None
+        attempted_replan_fix = False
 
         while True:
             cycles += 1
@@ -1653,8 +1743,20 @@ class ConversationManager:
                 revisions = True
                 break
             if verdict.decision == "replan":
+                if attempted_replan_fix or not step_results:
+                    revisions = True
+                    break
+                fallback = self._build_fallback_consolidation_from_steps(
+                    step_results,
+                    citations,
+                )
+                if fallback is None:
+                    revisions = True
+                    break
+                consolidation, citations, mapping_overall = fallback
+                attempted_replan_fix = True
                 revisions = True
-                break
+                continue
             if cycles >= self._judge.max_cycles:
                 metrics = verdict.metrics if verdict else {}
                 sanitized = self._judge._sanitize_consolidation_without_citations(
@@ -1884,6 +1986,7 @@ class ConversationManager:
         response_mode: ResponseMode,
         extra_options: dict[str, Any] | None,
         context_provider: Callable[[PlanItem, int, int], Iterable[StepContextBatch]],
+        project_id: int | None,
     ) -> ConversationTurn:
         normalized_question = question.strip()
         question_preview = normalized_question[:120]
@@ -1896,6 +1999,9 @@ class ConversationManager:
         self._ledger.clear_turn(turn_id)
         shared_context = "\n\n".join(context_snippets or [])
         base_options = copy.deepcopy(extra_options) if extra_options else {}
+        task_charter = self._frame_task(question)
+        state_digest_pairs: list[tuple[StepResult, StateDigestEntry]] = []
+        evidence_log_entries: list[EvidenceRecord] = []
         executed_plan: list[PlanItem] = [
             PlanItem(description=item.description, status="queued") for item in plan_items
         ]
@@ -1913,6 +2019,10 @@ class ConversationManager:
 
         for index, plan_item in enumerate(executed_plan, start=1):
             plan_item.status = "running"
+            intent_note = self._build_retrieval_intent(
+                plan_item.description, index, total_steps
+            )
+            step_assumptions: list[str] = []
             try:
                 batches = list(context_provider(plan_item, index, total_steps))
             except Exception as exc:  # pragma: no cover - fallback to single shot
@@ -2007,6 +2117,48 @@ class ConversationManager:
             plan_item.status = "done"
             combined_answer = "\n\n".join(answer_parts).strip()
             insufficient = self._text_declares_insufficient_evidence(combined_answer)
+            context_references = self._references_from_contexts(used_contexts)
+            if not insufficient and context_references:
+                answer_references = self._references_from_answer(combined_answer)
+                if not answer_references:
+                    message = (
+                        "INSUFFICIENT_EVIDENCE: Step "
+                        f"{index} did not cite any provided snippets."
+                    )
+                    combined_answer = message
+                    insufficient = True
+                    citations = []
+                    assumptions.append(message)
+                    logger.info(
+                        "Plan step missing citations",
+                        extra={
+                            "step_index": index,
+                            "description": plan_item.description,
+                        },
+                    )
+                else:
+                    unknown_references = sorted(answer_references - context_references)
+                    if unknown_references:
+                        preview = ", ".join(unknown_references[:3])
+                        if len(unknown_references) > 3:
+                            preview = f"{preview}, ..."
+                        message = (
+                            "INSUFFICIENT_EVIDENCE: Step "
+                            f"{index} cited snippets outside the retrieved context "
+                            f"({preview})."
+                        )
+                        combined_answer = message
+                        insufficient = True
+                        citations = []
+                        assumptions.append(message)
+                        logger.info(
+                            "Plan step cited unknown snippets",
+                            extra={
+                                "step_index": index,
+                                "description": plan_item.description,
+                                "unknown_references": unknown_references,
+                            },
+                        )
             result = StepResult(
                 index=index,
                 description=plan_item.description,
@@ -2018,6 +2170,8 @@ class ConversationManager:
             if result.insufficient:
                 if combined_answer not in assumptions:
                     assumptions.append(combined_answer)
+                if combined_answer not in step_assumptions:
+                    step_assumptions.append(combined_answer)
                 result.citations = []
                 logger.info(
                     "Removed citations from insufficient step",
@@ -2027,21 +2181,33 @@ class ConversationManager:
                     },
                 )
             elif not result.citations:
-                inferred = self._fallback_citations_from_contexts(used_contexts)
-                if inferred:
-                    result.citations = inferred
-                else:
-                    assumptions.append(
-                        f"No citations available for step {index}: {plan_item.description}"
-                    )
-                    logger.info(
-                        "Recorded citation assumption",
-                        extra={
-                            "step_index": index,
-                            "description": plan_item.description,
-                        },
-                    )
+                note = (
+                    "INSUFFICIENT_EVIDENCE: Step "
+                    f"{index} ({plan_item.description}) returned no supported citations."
+                )
+                result.answer = note
+                result.insufficient = True
+                assumptions.append(note)
+                step_assumptions.append(note)
+                logger.info(
+                    "Marked plan step as unsupported due to missing citations",
+                    extra={
+                        "step_index": index,
+                        "description": plan_item.description,
+                    },
+                )
             step_results.append(result)
+
+            evidence_log_entries.append(
+                self._build_evidence_record(index, intent_note, used_contexts)
+            )
+            digest_entry = StateDigestEntry(
+                step_index=index,
+                summary=self._summarize_step_result(result),
+                pending_questions=list(step_assumptions),
+                decisions=[self._summarize_plan_decision(plan_item.description)],
+            )
+            state_digest_pairs.append((result, digest_entry))
 
             logger.info(
                 "Plan step completed",
@@ -2068,6 +2234,11 @@ class ConversationManager:
             if not result.insufficient:
                 self._ledger.record_step(turn_id, result)
 
+        finalized_digest_entries: list[StateDigestEntry] = []
+        for result, entry in state_digest_pairs:
+            entry.citation_indexes = list(result.citation_indexes)
+            finalized_digest_entries.append(entry)
+
         consolidation = self._compose_final_answer(
             step_results, ledger=self._ledger, turn_id=turn_id
         )
@@ -2087,6 +2258,7 @@ class ConversationManager:
             scope=retrieval_scope,
             preset=preset,
             response_mode=response_mode,
+            step_results=step_results,
         )
         logger.info(
             "Adversarial review completed",
@@ -2117,17 +2289,24 @@ class ConversationManager:
         ledger_snapshot = self._ledger.snapshot_for_turn(turn_id)
         answer = consolidation.text
         summary = f"Executed {total_steps} dynamic step{'s' if total_steps != 1 else ''}."
+        charter_assumptions = list(task_charter.assumptions) if task_charter else []
+        combined_assumptions = list(
+            dict.fromkeys(assumptions + charter_assumptions)
+        )
         artifacts = ReasoningArtifacts(
             summary_bullets=[summary],
             plan_items=executed_plan,
-            assumptions=assumptions,
+            assumptions=combined_assumptions,
+            task_charter=task_charter,
+            state_digest=finalized_digest_entries,
+            evidence_log=evidence_log_entries,
         )
         reasoning_payload = {
             "plan": [
                 {"description": item.description, "status": item.status}
                 for item in executed_plan
             ],
-            "assumptions": assumptions,
+            "assumptions": combined_assumptions,
             "steps": [
                 {
                     "index": result.index,
@@ -2185,12 +2364,32 @@ class ConversationManager:
                             }
                             for variant in note.variants
                         ]
+        if task_charter is not None:
+            reasoning_payload["task_charter"] = asdict(task_charter)
+        if finalized_digest_entries:
+            reasoning_payload["state_digest"] = [
+                asdict(entry) for entry in finalized_digest_entries
+            ]
+        if evidence_log_entries:
+            reasoning_payload["evidence_log"] = [
+                asdict(record) for record in evidence_log_entries
+            ]
         raw_response = {
             "dynamic_plan": {
                 "steps": reasoning_payload["steps"],
                 "citations": aggregated,
             }
         }
+        if task_charter is not None:
+            raw_response["dynamic_plan"]["task_charter"] = asdict(task_charter)
+        if finalized_digest_entries:
+            raw_response["dynamic_plan"]["state_digest"] = [
+                asdict(entry) for entry in finalized_digest_entries
+            ]
+        if evidence_log_entries:
+            raw_response["dynamic_plan"]["evidence_log"] = [
+                asdict(record) for record in evidence_log_entries
+            ]
         if ledger_snapshot:
             raw_response["dynamic_plan"]["ledger"] = ledger_snapshot
         turn = ConversationTurn(
@@ -2208,6 +2407,23 @@ class ConversationManager:
             adversarial_review=review_report,
         )
         self.turns.append(turn)
+        if self._working_memory and project_id is not None:
+            try:
+                self._working_memory.store_turn_memory(
+                    project_id=project_id,
+                    turn_index=turn_id,
+                    question=question,
+                    answer=answer,
+                    plan=executed_plan,
+                    step_results=step_results,
+                    state_digest=finalized_digest_entries,
+                    evidence_log=evidence_log_entries,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist working memory for dynamic plan",
+                    extra={"project_id": project_id},
+                )
         logger.info(
             "Dynamic plan completed",
             extra={
@@ -2228,6 +2444,7 @@ class ConversationManager:
 
         actions = self._split_question_into_actions(normalized)
         plan: list[PlanItem] = []
+        fallback_target = self._derive_fallback_target(normalized)
 
         keyword_list = self._extract_plan_keywords(normalized)
         if keyword_list:
@@ -2256,10 +2473,26 @@ class ConversationManager:
 
         if len(plan) > 8:
             plan = plan[:8]
-        if not plan:
-            plan = [PlanItem(description=normalized, status="queued")]
 
-        self._plan_critic.ensure(plan)
+        if len(plan) == 1:
+            plan.append(
+                self._build_structured_plan_item(
+                    input_hint="Evidence snippets and notes from completed steps",
+                    action=self._compose_action(
+                        "analyze", "evidence patterns to map answer requirements"
+                    ),
+                    output_hint="Summary table aligning requirements to cited evidence snippets",
+                )
+            )
+
+        if not plan:
+            plan = self._build_resilient_plan(fallback_target)
+
+        plan = self._ensure_resilient_plan(
+            plan,
+            fallback_target,
+            normalized[:120],
+        )
         logger.info(
             "Generated plan",
             extra={
@@ -2270,12 +2503,82 @@ class ConversationManager:
         )
         return plan
 
+    def _ensure_resilient_plan(
+        self,
+        plan: list[PlanItem],
+        fallback_target: str,
+        question_preview: str,
+    ) -> list[PlanItem]:
+        approved, reasons = self._plan_critic.review(plan)
+        if approved:
+            return plan
+
+        logger.warning(
+            "Plan critic rejected generated plan; attempting fallback",
+            extra={
+                "question_preview": question_preview,
+                "rejection_reasons": list(reasons),
+            },
+        )
+
+        fallback_plan = self._build_resilient_plan(fallback_target)
+        approved_fallback, fallback_reasons = self._plan_critic.review(fallback_plan)
+        if not approved_fallback:
+            logger.error(
+                "Fallback plan also rejected by critic; proceeding with best-effort plan",
+                extra={
+                    "question_preview": question_preview,
+                    "rejection_reasons": list(fallback_reasons),
+                },
+            )
+        return fallback_plan
+
+    def _build_resilient_plan(self, target: str) -> list[PlanItem]:
+        topic = (target or "the topic").strip()
+        if not topic:
+            topic = "the topic"
+
+        return [
+            self._build_structured_plan_item(
+                input_hint="Corpus context (retrieved corpus snippets with chunk IDs)",
+                action=self._compose_action(
+                    "collect", f"background references on {topic}"
+                ),
+                output_hint="Background reference list capturing document citations and snippet notes",
+            ),
+            self._build_structured_plan_item(
+                input_hint="Evidence snippets from Step 1 output",
+                action=self._compose_action(
+                    "analyze", f"key findings related to {topic}"
+                ),
+                output_hint="Summary table aligning findings to document citations",
+            ),
+            self._build_structured_plan_item(
+                input_hint="Findings table from Step 2 output",
+                action=self._compose_action(
+                    "map", f"answer requirements to cited evidence about {topic}"
+                ),
+                output_hint="Answer outline highlighting document citations for each requirement",
+            ),
+        ]
+
     @staticmethod
     def _compose_action(verb: str, target: str) -> str:
         cleaned_target = re.sub(r"\s+", " ", target).strip().rstrip("?.!")
         if not cleaned_target:
             return verb.capitalize()
         return f"{verb.capitalize()} {cleaned_target}"
+
+    def _derive_fallback_target(self, text: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", text)
+        filtered = [
+            token
+            for token in tokens
+            if token.lower() not in self._PLAN_STOPWORDS and len(token) > 2
+        ]
+        if not filtered:
+            return "the topic"
+        return " ".join(filtered[:3])
 
     def _normalize_plan_action(self, action: str) -> tuple[str, str] | None:
         text = action.strip()
@@ -2464,6 +2767,241 @@ class ConversationManager:
             f"Output: {output_hint.strip()} (include chunk IDs used)"
         )
         return PlanItem(description=description, status="queued")
+
+    def _frame_task(self, question: str) -> TaskCharter:
+        text = " ".join((question or "").split())
+        if not text:
+            text = "Respond to the question"
+        goal = text.rstrip("? ") or "Respond to the question"
+        deliverable, deliverable_assumption = self._infer_deliverable(text)
+        audience, audience_assumption = self._infer_audience(text)
+        constraints = self._extract_constraints(text)
+        success = self._derive_success_criteria(text, deliverable, constraints)
+        clarifying_questions = self._suggest_clarifying_questions(
+            text, deliverable, deliverable_assumption, constraints
+        )
+        assumptions: list[str] = [
+            "Grounding the response strictly in retrieved corpus evidence.",
+        ]
+        if deliverable_assumption:
+            assumptions.append(deliverable_assumption)
+        if audience_assumption:
+            assumptions.append(audience_assumption)
+        assumptions = list(dict.fromkeys(filter(None, assumptions)))
+        clarifying_questions = clarifying_questions[:2]
+        return TaskCharter(
+            goal=goal,
+            deliverable=deliverable,
+            audience=audience,
+            constraints=constraints,
+            success_criteria=success,
+            assumptions=assumptions,
+            clarifying_questions=clarifying_questions,
+        )
+
+    def _infer_deliverable(self, text: str) -> tuple[str, str | None]:
+        lower = text.lower()
+        mappings: list[tuple[str, str]] = [
+            (r"\btimeline\b", "Chronological timeline"),
+            (r"\btable\b", "Comparative table"),
+            (r"\bcompare\b", "Comparative summary"),
+            (r"\brecommend", "Recommendation memo"),
+            (r"\boutline\b", "Structured outline"),
+            (r"\bplan\b", "Action plan"),
+            (r"\bsummary\b|\bsummarise\b|\bsummarize\b", "Executive summary"),
+            (r"\blist\b|\bbullet\b", "Bullet list of findings"),
+        ]
+        for pattern, label in mappings:
+            if re.search(pattern, lower):
+                return label, None
+        return (
+            "Structured narrative summary with citations",
+            "Assuming a narrative summary format is acceptable.",
+        )
+
+    def _infer_audience(self, text: str) -> tuple[str, str | None]:
+        lower = text.lower()
+        audience_map: list[tuple[str, str]] = [
+            (r"\bexecutive\b|c-suite|\bboard\b", "Executive stakeholders"),
+            (r"\bcto\b|\bcfo\b|\bcio\b", "C-suite stakeholders"),
+            (
+                r"\bengineer\b|\bdeveloper\b|\barchitect\b|\btechnical\b",
+                "Technical stakeholders",
+            ),
+            (r"\bclient\b|\bcustomer\b|\bend[- ]user\b", "Customer audience"),
+            (r"\bmarketing\b|\bsales\b|\bbusiness\b", "Business stakeholders"),
+        ]
+        for pattern, label in audience_map:
+            if re.search(pattern, lower):
+                return label, None
+        return (
+            "General knowledge worker",
+            "Assuming the response is for a general knowledge worker audience.",
+        )
+
+    def _extract_constraints(self, text: str) -> list[str]:
+        lower = text.lower()
+        constraints: list[str] = ["Ground the answer in retrieved corpus evidence."]
+        seen: set[str] = set(constraints)
+
+        def _add(item: str | None) -> None:
+            if not item:
+                return
+            if item not in seen:
+                constraints.append(item)
+                seen.add(item)
+
+        length_match = re.search(
+            r"(?:within|under|no more than)\s+(\d+)\s+(words?|sentences?|paragraphs?)",
+            lower,
+        )
+        if length_match:
+            amount, unit = length_match.groups()
+            _add(f"Limit the response to {amount} {unit}.")
+
+        if "bullet" in lower or "list" in lower:
+            _add("Use bullet list formatting for key points.")
+        if "table" in lower:
+            _add("Present the information in a clearly labeled table.")
+        if "timeline" in lower:
+            _add("Organize events in chronological order.")
+        if re.search(r"\bcite\b|\bcitation\b|\breference\b", lower):
+            _add("Include explicit citation markers for each claim.")
+
+        focus_match = re.search(r"focus on ([^.;,]+)", lower)
+        if focus_match:
+            target = focus_match.group(1).strip()
+            if target:
+                _add(f"Prioritize coverage of {target}.")
+
+        return constraints
+
+    def _derive_success_criteria(
+        self, text: str, deliverable: str, constraints: Sequence[str]
+    ) -> list[str]:
+        lower = text.lower()
+        criteria: list[str] = []
+        if "compare" in lower:
+            criteria.append("Surface key similarities and differences.")
+        if re.search(r"recommend|advise|suggest", lower):
+            criteria.append("Provide actionable recommendations tied to evidence.")
+        if re.search(r"summar", lower):
+            criteria.append("Highlight the most important insights succinctly.")
+        if re.search(r"analy|assess|evaluate", lower):
+            criteria.append("Explain the drivers or implications found in the evidence.")
+        if "timeline" in lower:
+            criteria.append("Capture major milestones with associated dates.")
+        if not criteria:
+            criteria.append(
+                f"Deliver a {deliverable.lower()} that directly resolves the stated goal."
+            )
+        if not any("citation" in item.lower() for item in criteria):
+            criteria.append("Cite supporting documents for each substantive claim.")
+        for constraint in constraints:
+            criteria.append(f"Honor constraint: {constraint}")
+        # Deduplicate while preserving order
+        return list(dict.fromkeys(criteria))
+
+    def _suggest_clarifying_questions(
+        self,
+        text: str,
+        deliverable: str,
+        deliverable_assumption: str | None,
+        constraints: Sequence[str],
+    ) -> list[str]:
+        lower = text.lower()
+        questions: list[str] = []
+        if deliverable_assumption:
+            questions.append(
+                "Do you prefer the findings presented as a table, bullet list, or narrative paragraphs?"
+            )
+        if re.search(r"\brecent\b|\blast\b", lower) and not re.search(
+            r"last\s+\d+\s+(day|week|month|year)s?|20\d{2}", lower
+        ):
+            questions.append("What timeframe should 'recent' cover?")
+        if (
+            "Include explicit citation markers" not in " ".join(constraints)
+            and "citation" in lower
+        ):
+            questions.append("Do you require inline citation markers or a separate reference list?")
+        return questions[:2]
+
+    def _build_retrieval_intent(
+        self, description: str, index: int, total_steps: int
+    ) -> str:
+        normalized = description.strip()
+        match = _PlanCritic._STEP_PATTERN.match(normalized)
+        if match:
+            input_hint = match.group("input").strip()
+            action = match.group("action").strip().lower()
+            output = match.group("output").strip().lower()
+            return (
+                f"Step {index}/{total_steps}: use {input_hint.lower()} to {action} "
+                f"so we can deliver {output}."
+            )
+        return f"Step {index}/{total_steps}: gather evidence for '{normalized}'."
+
+    def _summarize_plan_decision(self, description: str) -> str:
+        normalized = description.strip()
+        match = _PlanCritic._STEP_PATTERN.match(normalized)
+        if match:
+            action = match.group("action").strip()
+            return f"Completed action: {action}"
+        return f"Completed step: {normalized}"
+
+    def _build_evidence_record(
+        self,
+        step_index: int,
+        intent: str,
+        contexts: Sequence[StepContextBatch],
+    ) -> EvidenceRecord:
+        documents: dict[str, dict[str, Any]] = {}
+        snippets: list[str] = []
+        for batch in contexts:
+            for snippet in batch.snippets:
+                cleaned = " ".join((snippet or "").split())
+                if cleaned and cleaned not in snippets:
+                    snippets.append(cleaned)
+            for doc in batch.documents:
+                doc_id_raw = (
+                    doc.get("id")
+                    or doc.get("document_id")
+                    or doc.get("source")
+                    or doc.get("title")
+                )
+                doc_id = str(doc_id_raw) if doc_id_raw is not None else None
+                if not doc_id:
+                    doc_id = f"step-{step_index}-doc-{len(documents) + 1}"
+                if doc_id not in documents:
+                    entry: dict[str, Any] = {"id": doc_id}
+                    source = doc.get("source") or doc.get("title")
+                    if source:
+                        entry["source"] = str(source)
+                    for key in ("chunk_id", "chunk", "page", "score"):
+                        value = doc.get(key)
+                        if value is not None:
+                            entry[key] = value
+                    documents[doc_id] = entry
+                else:
+                    existing = documents[doc_id]
+                    for key in ("chunk_id", "chunk", "page", "score"):
+                        if key not in existing and doc.get(key) is not None:
+                            existing[key] = doc.get(key)
+        return EvidenceRecord(
+            step_index=step_index,
+            intent=intent,
+            documents=list(documents.values()),
+            snippets=snippets,
+        )
+
+    def _summarize_step_result(self, result: StepResult) -> str:
+        stripped = self._strip_citation_markers(result.answer)
+        compact = " ".join(stripped.split())
+        if not compact:
+            return ""
+        if len(compact) <= 280:
+            return compact
+        return textwrap.shorten(compact, width=280, placeholder="…")
 
     def _register_turn(
         self,
@@ -2809,6 +3347,7 @@ class ConversationManager:
     _NUMERIC_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")
     _DOC_REFERENCE_PAREN_PATTERN = re.compile(r"\(([^()]*)\)")
+    _SNIPPET_IDENTIFIER_PATTERN = re.compile(r"\[([^\]]+)\]")
     _SENTENCE_FRAGMENT_PATTERN = re.compile(r"[^.!?\n]+[.!?]?")
     _STEP_PREFIX_PATTERN = re.compile(
         r"""
@@ -2865,6 +3404,40 @@ class ConversationManager:
         stripped = ConversationManager._strip_citation_markers(text).strip()
         normalized = ConversationManager._remove_step_prefix(stripped)
         return normalized.upper().startswith("INSUFFICIENT_EVIDENCE")
+
+    @staticmethod
+    def _normalize_reference_label(label: str) -> str:
+        cleaned = re.sub(r"[\[\]()]+", " ", str(label or ""))
+        cleaned = re.sub(r"[^0-9a-zA-Z]+", " ", cleaned)
+        normalized = " ".join(cleaned.lower().split())
+        return normalized
+
+    @classmethod
+    def _references_from_answer(cls, answer: str) -> set[str]:
+        references: set[str] = set()
+        for match in cls._DOC_REFERENCE_PAREN_PATTERN.finditer(answer or ""):
+            content = match.group(1)
+            if not content:
+                continue
+            parts = re.split(r"[,;/]|\band\b|\bor\b|&", content, flags=re.IGNORECASE)
+            for part in parts:
+                normalized = cls._normalize_reference_label(part)
+                if normalized:
+                    references.add(normalized)
+        return references
+
+    @classmethod
+    def _references_from_contexts(
+        cls, contexts: Sequence[StepContextBatch]
+    ) -> set[str]:
+        references: set[str] = set()
+        for batch in contexts:
+            for snippet in batch.snippets:
+                for match in cls._SNIPPET_IDENTIFIER_PATTERN.finditer(snippet or ""):
+                    normalized = cls._normalize_reference_label(match.group(1))
+                    if normalized:
+                        references.add(normalized)
+        return references
 
     @staticmethod
     def _normalize_answer_text(text: str) -> str:
@@ -3241,6 +3814,80 @@ class ConversationManager:
         return "\n\n".join(parts).strip()
 
     @staticmethod
+    def _build_fallback_consolidation_from_steps(
+        step_results: Sequence["StepResult"],
+        citations: Sequence[Any],
+    ) -> tuple[ConsolidationOutput, list[Any], dict[int, int]] | None:
+        usable: list[tuple[str, list[int]]] = []
+        for result in step_results:
+            answer_text = (result.answer or "").strip()
+            if result.insufficient or not answer_text:
+                continue
+            indexes = [
+                index
+                for index in result.citation_indexes
+                if 1 <= index <= len(citations)
+            ]
+            if not indexes:
+                continue
+            polished = ConversationManager._polish_sentence(answer_text)
+            usable.append((polished, indexes))
+
+        if not usable:
+            return None
+
+        ordered_indexes: list[int] = []
+        for _, indexes in usable:
+            for index in indexes:
+                if index not in ordered_indexes:
+                    ordered_indexes.append(index)
+
+        remapped_citations: list[Any] = []
+        mapping: dict[int, int] = {}
+        for new_index, original_index in enumerate(ordered_indexes, start=1):
+            if original_index < 1 or original_index > len(citations):
+                continue
+            mapping[original_index] = new_index
+            remapped_citations.append(copy.deepcopy(citations[original_index - 1]))
+
+        if not remapped_citations or not mapping:
+            return None
+
+        section_sentences: list[str] = []
+        section_indexes: set[int] = set()
+        for text, indexes in usable:
+            remapped = [mapping[index] for index in indexes if index in mapping]
+            if not remapped:
+                continue
+            sentence = text.strip()
+            if sentence and sentence[-1] not in ".!?":
+                sentence = f"{sentence.rstrip('.')}.".strip()
+            markers = "".join(f"[{index}]" for index in remapped)
+            sentence = f"{sentence} {markers}".strip()
+            section_sentences.append(sentence)
+            section_indexes.update(remapped)
+
+        if not section_sentences:
+            return None
+
+        section = ConsolidatedSection(
+            title="Findings",
+            sentences=section_sentences,
+            citation_indexes=sorted(section_indexes),
+        )
+        section_usage: dict[int, set[str]] = {
+            index: {section.title} for index in section.citation_indexes if index > 0
+        }
+        text = ConversationManager._assemble_answer_text([section], [])
+        consolidation = ConsolidationOutput(
+            text=text,
+            sections=[section],
+            conflicts=[],
+            section_usage=section_usage,
+        )
+        return consolidation, remapped_citations, mapping
+
+    @staticmethod
     def _fallback_citations_from_contexts(
         contexts: Sequence[StepContextBatch],
     ) -> list[dict[str, Any]]:
@@ -3577,7 +4224,28 @@ class ConversationManager:
             notes = str(notes_raw).strip() if isinstance(notes_raw, str) else None
             self_check = SelfCheckResult(passed=passed, flags=flags, notes=notes)
 
-        if not any([summary_bullets, plan_items, assumptions_list, self_check, decision]):
+        task_charter = ConversationManager._parse_task_charter(
+            reasoning.get("task_charter") or reasoning.get("charter")
+        )
+        state_digest_entries = ConversationManager._parse_state_digest(
+            reasoning.get("state_digest") or reasoning.get("memory")
+        )
+        evidence_log = ConversationManager._parse_evidence_log(
+            reasoning.get("evidence_log") or reasoning.get("retrieval_log")
+        )
+
+        if not any(
+            [
+                summary_bullets,
+                plan_items,
+                assumptions_list,
+                self_check,
+                decision,
+                task_charter,
+                state_digest_entries,
+                evidence_log,
+            ]
+        ):
             return None
 
         return ReasoningArtifacts(
@@ -3586,6 +4254,9 @@ class ConversationManager:
             assumptions=assumptions_list,
             assumption_decision=decision,
             self_check=self_check,
+            task_charter=task_charter,
+            state_digest=state_digest_entries,
+            evidence_log=evidence_log,
         )
 
     @staticmethod
@@ -3612,6 +4283,117 @@ class ConversationManager:
                 seen.add(value)
                 ordered.append(value)
         return ordered
+
+    @staticmethod
+    def _parse_task_charter(data: Any) -> TaskCharter | None:
+        if not isinstance(data, dict):
+            return None
+        goal = str(data.get("goal") or "").strip() or "Respond to the question"
+        deliverable = (
+            str(data.get("deliverable") or "").strip()
+            or "Structured narrative summary with citations"
+        )
+        audience = (
+            str(data.get("audience") or "").strip() or "General knowledge worker"
+        )
+        constraints = ConversationManager._coerce_str_list(data.get("constraints"))
+        if not constraints:
+            constraints = ["Ground the answer in retrieved corpus evidence."]
+        success = ConversationManager._coerce_str_list(
+            data.get("success_criteria") or data.get("success")
+        )
+        if not success:
+            success = [
+                f"Deliver a {deliverable.lower()} that directly resolves the stated goal.",
+                "Cite supporting documents for each substantive claim.",
+            ]
+        assumptions = ConversationManager._coerce_str_list(data.get("assumptions"))
+        clarifying_questions = ConversationManager._coerce_str_list(
+            data.get("clarifying_questions") or data.get("questions")
+        )
+        return TaskCharter(
+            goal=goal,
+            deliverable=deliverable,
+            audience=audience,
+            constraints=constraints,
+            success_criteria=success,
+            assumptions=assumptions,
+            clarifying_questions=clarifying_questions,
+        )
+
+    @staticmethod
+    def _parse_state_digest(data: Any) -> list[StateDigestEntry]:
+        entries: list[StateDigestEntry] = []
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes, dict)):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                step_index_raw = item.get("step_index") or item.get("step")
+                try:
+                    step_index = int(step_index_raw)
+                except (TypeError, ValueError):
+                    continue
+                summary = str(item.get("summary") or "").strip()
+                citation_indexes_raw = item.get("citation_indexes") or item.get("citations")
+                citations: list[int] = []
+                if isinstance(citation_indexes_raw, Sequence) and not isinstance(
+                    citation_indexes_raw, (str, bytes, dict)
+                ):
+                    for value in citation_indexes_raw:
+                        try:
+                            citations.append(int(value))
+                        except (TypeError, ValueError):
+                            continue
+                pending = ConversationManager._coerce_str_list(
+                    item.get("pending_questions") or item.get("questions")
+                )
+                decisions = ConversationManager._coerce_str_list(
+                    item.get("decisions") or item.get("decision")
+                )
+                entries.append(
+                    StateDigestEntry(
+                        step_index=step_index,
+                        summary=summary,
+                        citation_indexes=citations,
+                        pending_questions=pending,
+                        decisions=decisions,
+                    )
+                )
+        return entries
+
+    @staticmethod
+    def _parse_evidence_log(data: Any) -> list[EvidenceRecord]:
+        records: list[EvidenceRecord] = []
+        if isinstance(data, Sequence) and not isinstance(data, (str, bytes, dict)):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                step_index_raw = item.get("step_index") or item.get("step")
+                try:
+                    step_index = int(step_index_raw)
+                except (TypeError, ValueError):
+                    continue
+                intent = str(item.get("intent") or "").strip()
+                documents_raw = item.get("documents")
+                documents: list[dict[str, Any]] = []
+                if isinstance(documents_raw, Sequence) and not isinstance(
+                    documents_raw, (str, bytes)
+                ):
+                    for doc in documents_raw:
+                        if isinstance(doc, dict):
+                            documents.append(dict(doc))
+                snippets = ConversationManager._coerce_str_list(
+                    item.get("snippets") or item.get("evidence")
+                )
+                records.append(
+                    EvidenceRecord(
+                        step_index=step_index,
+                        intent=intent,
+                        documents=documents,
+                        snippets=snippets,
+                    )
+                )
+        return records
 
     def _build_messages(
         self,

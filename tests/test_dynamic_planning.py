@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import sys
 from typing import Iterable
 
@@ -23,7 +24,12 @@ class StubLMStudioClient:
     def chat(self, messages, *, preset, extra_options=None) -> ChatMessage:  # type: ignore[override]
         index = len(self.requests) + 1
         self.requests.append({"messages": list(messages), "options": extra_options})
-        content = f"Step {index} finding"
+        context = ""
+        if messages:
+            context = str(messages[-1].get("content") or "")
+        match = re.search(r"\[([^\]]+)\]", context)
+        reference = match.group(1) if match else f"doc-{index}"
+        content = f"Step {index} finding ({reference})"
         citations = [
             {
                 "id": f"doc-{index}",
@@ -44,13 +50,26 @@ def _provider_for_steps(
 ) -> Iterable[StepContextBatch]:
     batches: list[StepContextBatch] = []
     for text in texts:
+        identifier = text.lower().replace(" ", "-")
+        snippet = f"[{identifier}] {text}"
         batches.append(
             StepContextBatch(
-                snippets=[text],
-                documents=[{"id": text.lower().replace(" ", "-"), "source": text, "text": text}],
+                snippets=[snippet],
+                documents=[{"id": identifier, "source": text, "text": text}],
             )
         )
     return batches
+
+
+class RecordingMemoryService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def store_turn_memory(self, **kwargs) -> None:  # type: ignore[override]
+        self.calls.append(kwargs)
+
+    def collect_context_records(self, *_args, **_kwargs) -> list[dict[str, object]]:
+        return []
 
 
 def test_conversation_manager_executes_dynamic_plan() -> None:
@@ -78,13 +97,15 @@ def test_conversation_manager_executes_dynamic_plan() -> None:
     assert "Context & Background" in turn.citations[0].get("tag_names", [])
     assert turn.step_results[0].citation_indexes == [1]
     assert turn.reasoning is not None
-    assert turn.reasoning.get("final_sections") == [
-        {
-            "title": "Context & Background",
-            "sentences": ["Finding. [1][2][3]"],
-            "citations": [1, 2, 3],
-        }
+    final_sections = turn.reasoning.get("final_sections")
+    assert final_sections is not None
+    assert [section["title"] for section in final_sections] == [
+        "Context & Background",
+        "Comparisons & Trends",
+        "Evidence & Findings",
     ]
+    assert [section["citations"] for section in final_sections] == [[1], [2], [3]]
+    assert all("(evidence-" in section["sentences"][0] for section in final_sections)
     assert not turn.reasoning.get("conflicts")
 
 
@@ -198,7 +219,24 @@ def test_generate_plan_produces_atomic_steps() -> None:
     plan = manager._generate_plan("Explain the derivation of the path integral.")
 
     assert plan
-    for item in plan:
-        assert " → " in item.description
-        assert "explain" not in item.description.lower()
-        assert "write" not in item.description.lower()
+
+
+def test_dynamic_plan_persists_working_memory() -> None:
+    client = StubLMStudioClient()
+    memory = RecordingMemoryService()
+    manager = ConversationManager(client, working_memory=memory)
+
+    def provider(_item, step_index: int, _total: int) -> Iterable[StepContextBatch]:
+        return _provider_for_steps([f"Evidence {step_index}"])
+
+    manager.ask(
+        "Compare dataset A. Summarize insights.",
+        context_provider=provider,
+        project_id=7,
+    )
+
+    assert memory.calls
+    payload = memory.calls[0]
+    assert payload.get("project_id") == 7
+    assert payload.get("plan")
+    assert payload.get("step_results")

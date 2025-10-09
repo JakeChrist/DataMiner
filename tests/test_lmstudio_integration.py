@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import socket
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from urllib import error, request
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from app.services import (
     AnswerLength,
@@ -91,6 +97,33 @@ def _default_chat_response(payload: dict[str, object]) -> dict[str, object]:
         ],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+def test_lmstudio_client_formats_model_crash_error_json() -> None:
+    payload = {
+        "error": {
+            "code": "model_crash",
+            "message": "Model crash error code: 18446744072635812000",
+        }
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    message = LMStudioClient._build_http_error_message(500, body)
+
+    assert "model crashed" in message.lower()
+    assert "-1073739616" in message
+    assert "0xFFFFFFFFC00008A0" in message
+    assert "18446744072635812000" not in message
+
+
+def test_lmstudio_client_formats_model_crash_error_text() -> None:
+    body = "Model crash error code: 18446744072635812000"
+
+    message = LMStudioClient._build_http_error_message(500, body)
+
+    assert "model crashed" in message.lower()
+    assert "-1073739616" in message
+    assert "0xFFFFFFFFC00008A0" in message
 
 
 def test_lmstudio_client_parses_structured_content() -> None:
@@ -257,10 +290,19 @@ def _make_handler(state: dict[str, object]) -> type[BaseHTTPRequestHandler]:
 
             status = int(current.get("status", 200))
             body = current.get("body", {})
+            headers = current.get("headers")
             if not isinstance(body, (bytes, bytearray)):
                 body = json.dumps(body).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            content_type_set = False
+            if isinstance(headers, dict):
+                for key, value in headers.items():
+                    header_name = str(key)
+                    if header_name.lower() == "content-type":
+                        content_type_set = True
+                    self.send_header(header_name, str(value))
+            if not content_type_set:
+                self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body)
 
@@ -332,8 +374,10 @@ def test_lmstudio_client_and_conversation_manager_success(lmstudio_server: tuple
     assert payload["reasoning"]["include_plan"] is True
     messages = payload["messages"]
     assert isinstance(messages, list)
-    # Expect system prompt, plus user/assistant pairs (none yet), and new user message.
+    # Expect system prompts (base + consolidation), plus new user message.
     assert messages[0]["role"] == "system"
+    system_messages = [msg for msg in messages if msg.get("role") == "system"]
+    assert any("corpus" in str(msg.get("content", "")).lower() for msg in system_messages)
     assert "Context:" in messages[-1]["content"]
 
 
@@ -349,6 +393,11 @@ def test_conversation_manager_populates_retrieval_query(
 
     assert state["requests"] and isinstance(state["requests"], list)
     payload = state["requests"][-1]
+    messages = payload.get("messages")
+    assert isinstance(messages, list)
+    assert messages and messages[0]["role"] == "system"
+    system_messages = [msg for msg in messages if msg.get("role") == "system"]
+    assert any("corpus" in str(msg.get("content", "")).lower() for msg in system_messages)
     assert payload.get("retrieval", {}).get("query") == "Gather context please"
     assert payload.get("retrieval", {}).get("include") == ["doc-1"]
     assert "query" not in extra["retrieval"]
@@ -439,6 +488,54 @@ def test_lmstudio_client_reports_timeout_without_deadline(
     assert "timed out" in str(excinfo.value).lower()
 
 
+def test_lmstudio_client_merges_streaming_response(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    state["responses"] = [
+        {
+            "status": 200,
+            "headers": {"Content-Type": "text/event-stream"},
+            "body": (
+                "data: {\"id\": \"chatcmpl-stream\", \"object\": \"chat.completion.chunk\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Hello\"}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": \" world\"}}, {\"index\": 1, \"delta\": {\"content\": \"ignored\"}}], \"usage\": {\"prompt_tokens\": 5, \"completion_tokens\": 2, \"total_tokens\": 7}}\n\n"
+                "data: [DONE]\n\n"
+            ).encode("utf-8"),
+        }
+    ]
+
+    client = LMStudioClient(base_url=base_url)
+    message = client.chat([{"role": "user", "content": "Stream please"}])
+
+    assert message.content == "Hello world"
+    assert message.raw_response.get("usage", {}).get("total_tokens") == 7
+
+
+def test_lmstudio_client_merges_streaming_response_with_dict_content(
+    lmstudio_server: tuple[dict[str, object], str]
+) -> None:
+    state, base_url = lmstudio_server
+    state["responses"] = [
+        {
+            "status": 200,
+            "headers": {"Content-Type": "text/event-stream"},
+            "body": (
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"delta\": {\"content\": {\"type\": \"output_text\", \"text\": \"Hello\"}}}]}\n\n"
+                "data: {\"choices\": [{\"index\": 0, \"message\": {\"content\": {\"type\": \"output_text\", \"text\": \" world\"}}}], \"usage\": {\"prompt_tokens\": 2, \"completion_tokens\": 1, \"total_tokens\": 3}}\n\n"
+                "data: [DONE]\n\n"
+            ).encode("utf-8"),
+        }
+    ]
+
+    client = LMStudioClient(base_url=base_url)
+    message = client.chat([{"role": "user", "content": "Stream please"}])
+
+    assert message.content == "Hello world"
+    assert message.raw_response.get("usage", {}).get("total_tokens") == 3
+
+
 def test_conversation_manager_handles_failures_and_recovers(
     lmstudio_server: tuple[dict[str, object], str]
 ) -> None:
@@ -483,10 +580,12 @@ def test_conversation_manager_handles_failures_and_recovers(
     manager.ask("Follow-up?")
     payload = state["requests"][0]
     messages = payload["messages"]
-    assert len(messages) == 3  # previous user+assistant + new user
-    assert messages[0]["role"] == "user"
-    assert messages[0]["content"].startswith("First question?")
-    assert messages[1]["role"] == "assistant"
+    assert len(messages) == 4  # system prompt + previous user+assistant + new user
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].startswith("First question?")
+    assert messages[2]["role"] == "assistant"
+    assert messages[3]["role"] == "user"
 
 
 def test_reasoning_verbosity_controls_request_and_artifacts(

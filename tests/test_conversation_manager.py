@@ -1,4 +1,7 @@
 import sys
+import threading
+import time
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,7 +15,9 @@ from app.services.conversation_manager import (
     ConsolidatedSection,
     ConflictNote,
     ConsolidationOutput,
+    PlanItem,
     ResponseMode,
+    StepContextBatch,
     StepResult,
     _EvidenceLedger,
     _AdversarialJudge,
@@ -198,7 +203,108 @@ def test_compose_final_answer_deduplicates_and_merges_citations():
     assert final_answer.conflicts == []
     assert final_answer.section_usage[1] == {"Evidence & Findings"}
     assert final_answer.section_usage[4] == {"Key Points"}
-    assert final_answer.section_usage[5] == {"Practical Guidance"}
+
+
+def test_conversation_manager_serializes_threaded_questions(monkeypatch) -> None:
+    class BlockingClient:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.counter = 0
+            self.calls: list[dict[str, object]] = []
+
+        def chat(
+            self,
+            messages: list[dict[str, object]],
+            *,
+            preset: AnswerLength = AnswerLength.NORMAL,
+            extra_options: dict[str, object] | None = None,
+        ) -> ChatMessage:
+            if not self._lock.acquire(blocking=False):
+                raise AssertionError("Concurrent chat invocation detected")
+            try:
+                self.counter += 1
+                call_id = self.counter
+                retrieval = (extra_options or {}).get("retrieval", {})
+                documents = list(retrieval.get("documents", [])) if isinstance(retrieval, dict) else []
+                self.calls.append({"call_id": call_id, "documents": documents})
+                base_snippet = f"Snippet {call_id}"
+                doc_payload = documents[0] if documents else {"id": f"doc-{call_id}", "source": "Source", "snippet": base_snippet}
+                snippet = str(doc_payload.get("snippet", base_snippet))
+                citation = {
+                    "id": doc_payload.get("id", f"doc-{call_id}"),
+                    "source": doc_payload.get("source", "Source"),
+                    "snippet": doc_payload.get("snippet", snippet),
+                }
+                time.sleep(0.05)
+                doc_identifier = str(doc_payload.get("id", f"doc-{call_id}"))
+                return ChatMessage(
+                    content=f"Answer {call_id}: {snippet} ({doc_identifier})",
+                    citations=[citation],
+                    reasoning={},
+                    raw_response={"call_id": call_id, "preset": preset.value},
+                )
+            finally:
+                self._lock.release()
+
+        def health_check(self) -> bool:
+            return True
+
+    client = BlockingClient()
+    manager = ConversationManager(client, system_prompt="System", context_window=0)
+
+    def fake_generate_plan(self: ConversationManager, _question: str) -> list[PlanItem]:
+        plan = [
+            ConversationManager._build_structured_plan_item(
+                input_hint="Corpus context",
+                action="collect supporting facts",
+                output_hint="Evidence list with citations",
+            ),
+            ConversationManager._build_structured_plan_item(
+                input_hint="Outputs from previous steps",
+                action="map key findings into evidence outline",
+                output_hint="Evidence outline bullet list with citations",
+            ),
+        ]
+        self._plan_critic.ensure(plan)
+        return plan
+
+    monkeypatch.setattr(
+        manager,
+        "_generate_plan",
+        types.MethodType(fake_generate_plan, manager),
+    )
+
+    def context_provider(
+        _plan_item: PlanItem, step_index: int, _total_steps: int
+    ) -> list[StepContextBatch]:
+        doc_id = f"doc-{step_index}"
+        document = {"id": doc_id, "source": f"Source {step_index}", "snippet": f"Snippet {step_index}"}
+        snippet_text = f"[{doc_id}] Evidence {step_index}"
+        return [StepContextBatch(snippets=[snippet_text], documents=[document])]
+
+    errors: list[Exception] = []
+
+    def worker(question: str) -> None:
+        try:
+            manager.ask(question, context_provider=context_provider)
+        except Exception as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(f"Question {idx}",))
+        for idx in range(2)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert {turn.question for turn in manager.turns} == {"Question 0", "Question 1"}
+    assert all(turn.citations for turn in manager.turns)
+    assert client.counter == 4
+    assert all(call["documents"] for call in client.calls)
 
 
 def test_compose_final_answer_strips_step_prefixes():

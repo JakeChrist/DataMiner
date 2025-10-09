@@ -73,6 +73,9 @@ class QuestionInputWidget(QFrame):
         self._settings_menu: QMenu | None = None
         self._model_name = "lmstudio"
         self._answer_length = AnswerLength.NORMAL
+        self._default_ask_tooltip = "Send your question (Ctrl+Enter)"
+        self._empty_ask_tooltip = "Type a question to enable the Ask button"
+        self._busy_ask_tooltip = "Wait for the current response to finish"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -123,15 +126,20 @@ class QuestionInputWidget(QFrame):
         self.settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_button.setEnabled(False)
+        self.settings_button.setToolTip(
+            "Adjust model selection and answer length for responses"
+        )
         buttons_row.addWidget(self.settings_button)
 
         self.ask_button = QPushButton("Ask", self)
         self.ask_button.setDefault(True)
         self.ask_button.clicked.connect(self._trigger_ask)
+        self.ask_button.setToolTip(self._empty_ask_tooltip)
         buttons_row.addWidget(self.ask_button)
 
         self.clear_button = QPushButton("Clear", self)
         self.clear_button.clicked.connect(self.clear)
+        self.clear_button.setToolTip("Remove the current question text")
         buttons_row.addWidget(self.clear_button)
 
         self._update_button_state()
@@ -306,9 +314,14 @@ class QuestionInputWidget(QFrame):
         enabled = has_text and self._prerequisites_met and not self._busy
         self.ask_button.setEnabled(enabled)
         if not self._prerequisites_met and self._status_message:
-            self.ask_button.setToolTip(self._status_message)
+            tooltip = self._status_message
+        elif self._busy:
+            tooltip = self._busy_ask_tooltip
+        elif not has_text:
+            tooltip = self._empty_ask_tooltip
         else:
-            self.ask_button.setToolTip("")
+            tooltip = self._default_ask_tooltip
+        self.ask_button.setToolTip(tooltip)
 
 
 __all__ = ["QuestionInputWidget"]

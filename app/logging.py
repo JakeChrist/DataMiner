@@ -24,6 +24,22 @@ BACKUP_COUNT = 3
 _EXCEPTION_HOOK_INSTALLED = False
 _HOOK_LOCK = threading.Lock()
 
+class _EagerSyncRotatingFileHandler(RotatingFileHandler):
+    """A :class:`RotatingFileHandler` that fsyncs after each log record."""
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - thin wrapper
+        super().emit(record)
+        stream = getattr(self, "stream", None)
+        if stream is None:
+            return
+        try:
+            stream.flush()
+            os.fsync(stream.fileno())
+        except (OSError, ValueError):
+            # ``ValueError`` can be raised if the stream has been closed during
+            # interpreter shutdown; ``OSError`` covers platforms without fsync.
+            pass
+
 
 def setup_logging(
     app_name: str = "DataMiner",
@@ -50,7 +66,7 @@ def setup_logging(
     config_dir = get_user_config_dir(app_name)
     log_path = Path(config_dir) / (log_filename or LOG_FILENAME)
 
-    file_handler = RotatingFileHandler(
+    file_handler = _EagerSyncRotatingFileHandler(
         log_path,
         maxBytes=MAX_BYTES,
         backupCount=BACKUP_COUNT,
@@ -97,6 +113,16 @@ def get_log_file_path(logger: logging.Logger) -> Optional[Path]:
     return None
 
 
+def _flush_logger_handlers(logger: logging.Logger) -> None:
+    """Ensure all handlers attached to ``logger`` are flushed to disk."""
+
+    for handler in logger.handlers:
+        try:
+            handler.flush()
+        except Exception:  # pragma: no cover - defensive flush
+            pass
+
+
 def install_exception_hook(logger: logging.Logger) -> None:
     """Install handlers that log and surface unhandled exceptions."""
 
@@ -117,6 +143,7 @@ def install_exception_hook(logger: logging.Logger) -> None:
         logger.critical(
             "Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback)
         )
+        _flush_logger_handlers(logger)
         formatted = "".join(
             traceback.format_exception(exc_type, exc_value, exc_traceback)
         )
@@ -138,6 +165,7 @@ def install_exception_hook(logger: logging.Logger) -> None:
                 args.thread.name,
                 exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
             )
+            _flush_logger_handlers(logger)
             formatted_thread = "".join(
                 traceback.format_exception(
                     args.exc_type, args.exc_value, args.exc_traceback
@@ -153,6 +181,8 @@ def _show_log_dialog(
     logger: logging.Logger, traceback_text: str, log_path: Optional[Path]
 ) -> None:
     """Display a dialog containing the traceback and recent log output."""
+
+    _flush_logger_handlers(logger)
 
     try:
         from PyQt6.QtCore import QTimer

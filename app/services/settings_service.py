@@ -528,6 +528,15 @@ class SettingsService(QObject):
             warning = QColor("#d5881a")
             error = QColor("#c94b45")
 
+        if translucent:
+            window = QColor(window)
+            window.setAlpha(170)
+            surface = QColor(surface)
+            surface.setAlpha(185)
+            chrome = QColor(chrome)
+            chrome.setAlpha(200)
+            border = QColor(border)
+            border.setAlpha(160)
         palette.setColor(QPalette.ColorRole.Window, window)
         palette.setColor(QPalette.ColorRole.WindowText, text)
         palette.setColor(QPalette.ColorRole.Base, surface)
@@ -711,13 +720,13 @@ class SettingsService(QObject):
 
         translucent = _supports_translucency(app)
         self._glass_translucent = translucent
-        glass_rgba = "rgba(18, 30, 49, 0.72)" if translucent else "#121e31"
-        film_rgba = "rgba(18, 30, 49, 0.55)" if translucent else "#101a2b"
-        chrome_rgba = "rgba(24, 38, 59, 0.92)" if translucent else chrome.name()
-        toolbar_rgba = "rgba(8, 13, 22, 0.85)" if translucent else "#080d16"
-        window_rgba = "rgba(5, 7, 13, 0.55)" if translucent else window.name()
-        selection_rgba = "rgba(82, 224, 255, 0.25)"
-        chrome_hover_rgba = "rgba(28, 44, 66, 0.95)" if translucent else chrome.lighter(110).name()
+        glass_rgba = "rgba(18, 30, 49, 0.38)" if translucent else "#101a25"
+        film_rgba = "rgba(12, 20, 36, 0.28)" if translucent else "#0d1626"
+        chrome_rgba = "rgba(24, 38, 59, 0.68)" if translucent else chrome.lighter(115).name()
+        toolbar_rgba = "rgba(5, 9, 18, 0.30)" if translucent else "#0a121f"
+        window_rgba = "rgba(4, 6, 12, 0.22)" if translucent else window.darker(115).name()
+        selection_rgba = "rgba(82, 224, 255, 0.18)"
+        chrome_hover_rgba = "rgba(32, 50, 76, 0.82)" if translucent else chrome.lighter(120).name()
 
         text_hex = text.name()
         muted_hex = muted.name()

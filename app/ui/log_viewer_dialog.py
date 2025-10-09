@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QGridLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QTextEdit,
@@ -88,12 +89,12 @@ class LogViewerDialog(QDialog):
         layout.addWidget(log_label, row, 0)
         row += 1
 
-        log_view = QTextEdit(self)
-        log_view.setReadOnly(True)
-        log_view.setWordWrapMode(QTextOption.WrapMode.NoWrap)
-        log_view.setFont(monospaced)
-        log_view.setPlainText(self._load_log_preview())
-        layout.addWidget(log_view, row, 0)
+        self._log_view = QTextEdit(self)
+        self._log_view.setReadOnly(True)
+        self._log_view.setWordWrapMode(QTextOption.WrapMode.NoWrap)
+        self._log_view.setFont(monospaced)
+        self._refresh_log_preview()
+        layout.addWidget(self._log_view, row, 0)
         row += 1
 
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
@@ -105,6 +106,10 @@ class LogViewerDialog(QDialog):
             open_button = QPushButton("Open Log File", self)
             open_button.clicked.connect(self._open_log_location)
             button_box.addButton(open_button, QDialogButtonBox.ButtonRole.ActionRole)
+
+            clear_button = QPushButton("Clear Log File", self)
+            clear_button.clicked.connect(self._clear_log_file)
+            button_box.addButton(clear_button, QDialogButtonBox.ButtonRole.ActionRole)
 
         if self._traceback_text:
             copy_button = QPushButton("Copy Traceback", self)
@@ -142,6 +147,37 @@ class LogViewerDialog(QDialog):
     def _copy_traceback(self) -> None:
         clipboard = QGuiApplication.clipboard()
         clipboard.setText(self._traceback_text)
+
+    def _clear_log_file(self) -> None:
+        if not self._log_path:
+            QMessageBox.warning(self, "Unable to Clear Logs", "Log file location unknown.")
+            return
+
+        confirmation = QMessageBox.question(
+            self,
+            "Clear Log File",
+            "Are you sure you want to clear all log contents?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmation != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            self._log_path.write_text("", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Unable to Clear Logs",
+                f"Failed to clear log file: {exc}",
+            )
+            return
+
+        self._refresh_log_preview()
+        QMessageBox.information(self, "Logs Cleared", "Log file has been cleared.")
+
+    def _refresh_log_preview(self) -> None:
+        self._log_view.setPlainText(self._load_log_preview())
 
 try:  # pragma: no cover - optional import depending on Qt bindings
     from PyQt6.QtGui import QDesktopServices, QFontDatabase

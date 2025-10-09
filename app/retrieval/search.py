@@ -68,6 +68,14 @@ class SearchService:
             folder=scope_folder,
             recursive=recursive,
         )
+        logger.debug(
+            "Loaded candidate documents for RAG search",
+            extra={
+                "candidate_count": len(candidate_documents),
+                "scope_tags": scope_tags,
+                "scope_folder": scope_folder,
+            },
+        )
         documents_by_path = self._build_path_index(candidate_documents)
         seen_documents: set[int] = set()
         results: list[dict[str, Any]] = []
@@ -75,12 +83,30 @@ class SearchService:
             doc_payload = record.get("document") or {}
             path = record.get("path") or doc_payload.get("path")
             if not path:
+                logger.debug(
+                    "Skipping retrieval record without path",
+                    extra={"record_keys": sorted(record.keys())},
+                )
                 continue
             document = documents_by_path.get(self._normalize_path(path))
             if document is None:
+                logger.debug(
+                    "No project document matched retrieval record",
+                    extra={
+                        "path": path,
+                        "normalized_path": self._normalize_path(path),
+                    },
+                )
                 continue
             doc_id = int(document.get("id"))
             if doc_id in seen_documents:
+                logger.debug(
+                    "Skipping duplicate document in RAG search",
+                    extra={
+                        "document_id": doc_id,
+                        "path": document.get("source_path"),
+                    },
+                )
                 continue
             seen_documents.add(doc_id)
             chunk: dict[str, Any] = record.get("chunk") or {}
@@ -100,6 +126,15 @@ class SearchService:
                     "ingest_document": doc_payload,
                     "score": record.get("score"),
                 }
+            )
+            logger.debug(
+                "Appended RAG search result",
+                extra={
+                    "document_id": doc_id,
+                    "context_length": len(chunk_text or ""),
+                    "highlight_length": len(highlight or ""),
+                    "score": record.get("score"),
+                },
             )
             if len(results) >= limit:
                 break
@@ -153,6 +188,14 @@ class SearchService:
             folder=scope_folder,
             recursive=recursive,
         )
+        logger.debug(
+            "Loaded candidate documents for context collection",
+            extra={
+                "candidate_count": len(candidate_documents),
+                "scope_tags": scope_tags,
+                "scope_folder": scope_folder,
+            },
+        )
         documents_by_path = self._build_path_index(candidate_documents)
         include_set = {str(item) for item in include_list if str(item)}
         exclude_set = {str(item) for item in exclude_list if str(item)}
@@ -162,21 +205,62 @@ class SearchService:
             doc_payload = record.get("document") or {}
             path = record.get("path") or doc_payload.get("path")
             if not path:
+                logger.debug(
+                    "Skipping retrieval record without path during context collection",
+                    extra={"record_keys": sorted(record.keys())},
+                )
                 continue
             document = documents_by_path.get(self._normalize_path(path))
             if document is None:
+                logger.debug(
+                    "No document match for context record",
+                    extra={
+                        "path": path,
+                        "normalized_path": self._normalize_path(path),
+                    },
+                )
                 continue
             identifiers = self._document_identifiers(document)
             if include_set and include_set.isdisjoint(identifiers):
+                logger.debug(
+                    "Excluding document due to include filter",
+                    extra={
+                        "document_id": document.get("id"),
+                        "identifiers": sorted(identifiers),
+                        "include_filter": sorted(include_set),
+                    },
+                )
                 continue
             if exclude_set and not exclude_set.isdisjoint(identifiers):
+                logger.debug(
+                    "Excluding document due to exclude filter",
+                    extra={
+                        "document_id": document.get("id"),
+                        "identifiers": sorted(identifiers),
+                        "exclude_filter": sorted(exclude_set),
+                    },
+                )
                 continue
             chunk: dict[str, Any] = record.get("chunk") or {}
             chunk_id = int(chunk.get("id", -1)) if isinstance(chunk, dict) else -1
             if chunk_id in seen_chunks:
+                logger.debug(
+                    "Skipping duplicate chunk in context records",
+                    extra={
+                        "chunk_id": chunk_id,
+                        "document_id": document.get("id"),
+                    },
+                )
                 continue
             text = chunk.get("text") if isinstance(chunk, dict) else None
             if not text:
+                logger.debug(
+                    "Skipping chunk without text",
+                    extra={
+                        "chunk_id": chunk_id,
+                        "document_id": document.get("id"),
+                    },
+                )
                 continue
             highlight = self._build_evidence_snippet(
                 query,
@@ -198,6 +282,15 @@ class SearchService:
             }
             records.append(context_record)
             seen_chunks.add(chunk_id)
+            logger.debug(
+                "Collected context record",
+                extra={
+                    "chunk_id": chunk_id,
+                    "document_id": document.get("id"),
+                    "context_length": len(text or ""),
+                    "highlight_length": len(highlight or ""),
+                },
+            )
             if len(records) >= limit:
                 break
         logger.info(
@@ -268,6 +361,13 @@ class SearchService:
         stored_scope: dict[str, Any] = {}
         if chat_id is not None:
             stored_scope = self.chats.get_query_scope(chat_id) or {}
+            logger.debug(
+                "Loaded stored retrieval scope",
+                extra={
+                    "chat_id": chat_id,
+                    "stored_scope_keys": sorted(stored_scope.keys()),
+                },
+            )
 
         scope_tags = explicit_tags if explicit_tags is not None else stored_scope.get("tags")
         scope_folder = explicit_folder if folder is not None else stored_scope.get("folder")
@@ -399,6 +499,14 @@ class SearchService:
         snippet = self._normalize_whitespace(snippet)
         snippet = self._limit_length(snippet)
         highlighted = self._apply_highlights(snippet, keywords)
+        logger.debug(
+            "Constructed evidence snippet",
+            extra={
+                "base_length": len(base_text),
+                "keyword_count": len(keywords),
+                "snippet_length": len(highlighted or ""),
+            },
+        )
         return highlighted
 
     # ------------------------------------------------------------------
@@ -456,6 +564,14 @@ class SearchService:
         attempts: list[str] = []
         base_terms = [match.group(0) for match in self._TOKEN_PATTERN.finditer(normalized)]
         sanitized_terms = [self._escape_match_token(term) for term in base_terms if term]
+        logger.debug(
+            "Tokenised retrieval query",
+            extra={
+                "normalized_query": normalized,
+                "base_terms": base_terms,
+                "sanitized_terms": sanitized_terms,
+            },
+        )
         if sanitized_terms:
             attempts.append(" ".join(sanitized_terms))
         else:
@@ -469,6 +585,13 @@ class SearchService:
             if len(wildcard_tokens) > 1:
                 attempts.append(" ".join(wildcard_tokens))
 
+        logger.debug(
+            "Constructed retrieval attempts",
+            extra={
+                "attempts": attempts,
+                "token_count": len(tokens),
+            },
+        )
         logger.info(
             "Preparing retrieval query attempts",
             extra={
@@ -522,9 +645,23 @@ class SearchService:
                     "result_count": len(results),
                 },
             )
+            logger.debug(
+                "Processing ingest results",
+                extra={
+                    "attempt_query": candidate,
+                    "result_sample": results[:3],
+                },
+            )
             for record in results:
                 identity = _result_identity(record)
                 if identity in seen_results:
+                    logger.debug(
+                        "Skipping duplicate ingest result",
+                        extra={
+                            "attempt_query": candidate,
+                            "identity": identity,
+                        },
+                    )
                     continue
                 seen_results.add(identity)
                 yield record

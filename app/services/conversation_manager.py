@@ -1223,12 +1223,24 @@ class _PlanCritic:
     def ensure(self, plan: Sequence[PlanItem]) -> None:
         approved, reasons = self.review(plan)
         if not approved:
+            logger.debug(
+                "Plan critic rejection",
+                extra={
+                    "step_count": len(plan),
+                    "issues": reasons,
+                },
+            )
             reason_text = ", ".join(reasons)
             raise DynamicPlanningError(f"Plan critic rejection: {reason_text}")
 
     def review(self, plan: Sequence[PlanItem]) -> tuple[bool, list[str]]:
+        logger.debug(
+            "Reviewing plan for quality",
+            extra={"step_count": len(plan)},
+        )
         issues: list[str] = []
         if not plan:
+            logger.debug("Plan review failed: empty plan")
             return False, [self._format_issue("PLAN_EMPTY", "Plan has no steps.", "Generate 2–5 atomic plan steps before execution.")]
 
         if len(plan) < 2:
@@ -1390,6 +1402,19 @@ class _PlanCritic:
                         )
                     )
 
+        if issues:
+            logger.debug(
+                "Plan review identified issues",
+                extra={
+                    "step_count": len(plan),
+                    "issue_count": len(issues),
+                },
+            )
+        else:
+            logger.debug(
+                "Plan approved by critic",
+                extra={"step_count": len(plan)},
+            )
         return len(issues) == 0, issues
 
     @staticmethod
@@ -1498,12 +1523,30 @@ class ConversationManager:
                 "planning_enabled": context_provider is not None,
             },
         )
+        logger.debug(
+            "Prepared conversation context",
+            extra={
+                "turn_index": len(self.turns) + 1,
+                "question_length": len(sanitized_question),
+                "context_lengths": [
+                    len(snippet or "") for snippet in (context_snippets or [])
+                ],
+                "extra_option_keys": sorted((extra_options or {}).keys()),
+            },
+        )
 
         if not self._connected:
             message = self._connection_error or "LMStudio is disconnected."
             raise LMStudioConnectionError(message)
 
         if context_provider is not None:
+            logger.debug(
+                "Invoking dynamic planning pipeline",
+                extra={
+                    "question_preview": preview,
+                    "context_provider": getattr(context_provider, "__name__", None),
+                },
+            )
             try:
                 turn = self._ask_with_plan(
                     question,
@@ -1514,7 +1557,14 @@ class ConversationManager:
                     extra_options=extra_options,
                     context_provider=context_provider,
                 )
-            except DynamicPlanningError:
+            except DynamicPlanningError as exc:
+                logger.warning(
+                    "Dynamic planning failed, falling back to single-shot",
+                    extra={
+                        "question_preview": preview,
+                        "error": str(exc),
+                    },
+                )
                 turn = self._ask_single_shot(
                     question,
                     context_snippets=context_snippets,
@@ -1524,6 +1574,10 @@ class ConversationManager:
                     extra_options=extra_options,
                 )
         else:
+            logger.debug(
+                "Dynamic planning disabled; using single-shot mode",
+                extra={"question_preview": preview},
+            )
             turn = self._ask_single_shot(
                 question,
                 context_snippets=context_snippets,
@@ -1557,6 +1611,15 @@ class ConversationManager:
     ) -> ConversationTurn:
         question_preview = question.strip()[:120]
         messages = self._build_messages(question, context_snippets)
+        logger.debug(
+            "Prepared single-shot messages",
+            extra={
+                "question_preview": question_preview,
+                "message_roles": [message.get("role") for message in messages],
+                "context_included": bool(context_snippets),
+                "context_lengths": [len(snippet or "") for snippet in (context_snippets or [])],
+            },
+        )
         logger.info(
             "Dispatching single-shot query",
             extra={
@@ -1573,6 +1636,14 @@ class ConversationManager:
             response_mode,
             extra_options,
         )
+        logger.debug(
+            "Prepared single-shot request options",
+            extra={
+                "question_preview": question_preview,
+                "option_keys": sorted((request_options or {}).keys()),
+                "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
+            },
+        )
         try:
             response = self.client.chat(
                 messages,
@@ -1583,6 +1654,17 @@ class ConversationManager:
             self._update_connection(False, str(exc) or "Unable to reach LMStudio.")
             raise
 
+        logger.debug(
+            "Received single-shot response",
+            extra={
+                "question_preview": question_preview,
+                "answer_length": len(response.content or ""),
+                "citation_count": len(response.citations or []),
+                "reasoning_keys": sorted((response.reasoning or {}).keys())
+                if isinstance(response.reasoning, dict)
+                else None,
+            },
+        )
         self._update_connection(True, None)
         turn = self._register_turn(question, response, response_mode, preset)
         logger.info(
@@ -1897,6 +1979,17 @@ class ConversationManager:
         self._ledger.clear_turn(turn_id)
         shared_context = "\n\n".join(context_snippets or [])
         base_options = copy.deepcopy(extra_options) if extra_options else {}
+        logger.debug(
+            "Dynamic plan details",
+            extra={
+                "question_preview": question_preview,
+                "plan_step_count": total_steps,
+                "plan_descriptions": [item.description for item in plan_items],
+                "plan_has_rationales": [bool(item.rationale) for item in plan_items],
+                "base_option_keys": sorted(base_options.keys()),
+                "shared_context_length": len(shared_context),
+            },
+        )
         executed_plan: list[PlanItem] = [
             PlanItem(
                 description=item.description,
@@ -1925,6 +2018,15 @@ class ConversationManager:
                 raise DynamicPlanningError("Context provider failed") from exc
             if not batches:
                 batches = [StepContextBatch(snippets=[], documents=[])]
+            logger.debug(
+                "Prepared plan step batches",
+                extra={
+                    "step_index": index,
+                    "batch_count": len(batches),
+                    "snippet_totals": [len(batch.snippets) for batch in batches],
+                    "document_totals": [len(batch.documents) for batch in batches],
+                },
+            )
 
             answer_parts: list[str] = []
             citations: list[Any] = []
@@ -1936,6 +2038,20 @@ class ConversationManager:
                 if shared_context:
                     combined_snippets.append(shared_context)
                 combined_snippets.extend(batch.snippets)
+                logger.debug(
+                    "Compiled plan step context",
+                    extra={
+                        "step_index": index,
+                        "pass_index": pass_index,
+                        "combined_snippet_count": len(combined_snippets),
+                        "snippet_lengths": [len(snippet or "") for snippet in combined_snippets],
+                        "document_ids": [
+                            doc.get("id")
+                            for doc in (batch.documents or [])
+                            if isinstance(doc, dict)
+                        ],
+                    },
+                )
                 prompt = self._build_step_prompt(
                     question,
                     plan_item.description,
@@ -1957,6 +2073,16 @@ class ConversationManager:
                     plan_item.description,
                     reasoning_verbosity,
                     response_mode,
+                )
+                logger.debug(
+                    "Prepared plan step request",
+                    extra={
+                        "step_index": index,
+                        "pass_index": pass_index,
+                        "message_roles": [message.get("role") for message in messages],
+                        "option_keys": sorted((merged_options or {}).keys()),
+                        "reasoning_verbosity": getattr(reasoning_verbosity, "value", None),
+                    },
                 )
                 logger.info(
                     "Dispatching plan step",
@@ -1986,6 +2112,18 @@ class ConversationManager:
                     answer_parts.append(text)
                 if response.citations:
                     citations.extend(copy.deepcopy(response.citations))
+                logger.debug(
+                    "Received plan step response payload",
+                    extra={
+                        "step_index": index,
+                        "pass_index": pass_index,
+                        "answer_length": len(text),
+                        "citation_count": len(response.citations or []),
+                        "reasoning_keys": sorted((response.reasoning or {}).keys())
+                        if isinstance(response.reasoning, dict)
+                        else None,
+                    },
+                )
                 logger.info(
                     "Received plan step response",
                     extra={
@@ -2020,6 +2158,15 @@ class ConversationManager:
                 citations=self._deduplicate_citations(citations),
                 contexts=used_contexts,
                 insufficient=insufficient,
+            )
+            logger.debug(
+                "Compiled plan step result",
+                extra={
+                    "step_index": index,
+                    "answer_length": len(combined_answer),
+                    "insufficient": insufficient,
+                    "citation_count": len(result.citations),
+                },
             )
             if result.insufficient:
                 if combined_answer not in assumptions:
@@ -2058,8 +2205,24 @@ class ConversationManager:
                     "citation_count": len(result.citations),
                 },
             )
+            logger.debug(
+                "Plan step ledger snapshot",
+                extra={
+                    "step_index": index,
+                    "assumption_count": len(assumptions),
+                    "contexts_recorded": len(used_contexts),
+                },
+            )
 
         aggregated, citation_index_map = self._aggregate_citations(step_results)
+        logger.debug(
+            "Aggregated plan step citations",
+            extra={
+                "question_preview": question_preview,
+                "unique_citations": len(aggregated),
+                "citation_index_map_size": len(citation_index_map),
+            },
+        )
         logger.info(
             "Aggregated dynamic plan citations",
             extra={
@@ -2081,6 +2244,17 @@ class ConversationManager:
         if extra_options and isinstance(extra_options.get("retrieval"), dict):
             retrieval_scope = copy.deepcopy(extra_options["retrieval"])
         ledger_snapshot_initial = self._ledger.snapshot_for_turn(turn_id)
+        logger.debug(
+            "Invoking adversarial review",
+            extra={
+                "question_preview": question_preview,
+                "initial_citation_count": len(aggregated),
+                "step_count": len(step_results),
+                "retrieval_scope_keys": sorted((retrieval_scope or {}).keys())
+                if isinstance(retrieval_scope, dict)
+                else None,
+            },
+        )
         (
             consolidation,
             aggregated,
@@ -2093,6 +2267,16 @@ class ConversationManager:
             scope=retrieval_scope,
             preset=preset,
             response_mode=response_mode,
+        )
+        logger.debug(
+            "Adversarial review outcome",
+            extra={
+                "question_preview": question_preview,
+                "revised_citation_count": len(aggregated),
+                "citation_mapping_size": len(citation_mapping),
+                "review_cycles": review_report.cycles,
+                "revised": review_report.revised,
+            },
         )
         logger.info(
             "Adversarial review completed",
@@ -2236,10 +2420,25 @@ class ConversationManager:
         if not normalized:
             return []
 
+        logger.debug(
+            "Generating dynamic plan",
+            extra={
+                "question_preview": normalized[:120],
+                "question_length": len(normalized),
+            },
+        )
         actions = self._split_question_into_actions(normalized)
         plan: list[PlanItem] = []
 
         keyword_list = self._extract_plan_keywords(normalized)
+        logger.debug(
+            "Plan keyword extraction",
+            extra={
+                "question_preview": normalized[:120],
+                "keyword_count": len(keyword_list),
+                "actions_detected": len(actions),
+            },
+        )
         if keyword_list:
             keyword_text = " ".join(keyword_list)
             plan.append(
@@ -2255,6 +2454,10 @@ class ConversationManager:
         for action in actions:
             normalized_action = self._normalize_plan_action(action)
             if normalized_action is None:
+                logger.debug(
+                    "Discarded unstructured action",
+                    extra={"action": action},
+                )
                 continue
             verb, target = normalized_action
             input_hint = "Corpus context" if not plan else "Targeted corpus snippets for this step"
@@ -2285,6 +2488,14 @@ class ConversationManager:
                 "question_preview": normalized[:120],
                 "plan_step_count": len(plan),
                 "plan_descriptions": [item.description for item in plan],
+            },
+        )
+        logger.debug(
+            "Dynamic plan construction complete",
+            extra={
+                "plan_step_count": len(plan),
+                "plan_has_rationales": [bool(item.rationale) for item in plan],
+                "actions_considered": len(actions),
             },
         )
         return plan
@@ -2406,7 +2617,16 @@ class ConversationManager:
             if len(text) < 3:
                 continue
             actions.extend(self._split_segment_on_connectors(text))
-        return [action for action in actions if action]
+        filtered = [action for action in actions if action]
+        logger.debug(
+            "Split question into actions",
+            extra={
+                "segment_count": len(segments),
+                "action_count": len(filtered),
+                "actions": filtered,
+            },
+        )
+        return filtered
 
     def _split_segment_on_connectors(self, segment: str) -> list[str]:
         """Split a sentence on conjunctions that likely denote separate actions."""
@@ -2446,6 +2666,14 @@ class ConversationManager:
             stripped = part.strip(" ,;:-")
             if stripped:
                 normalized_parts.append(stripped)
+        logger.debug(
+            "Split segment on connectors",
+            extra={
+                "original_segment": segment,
+                "part_count": len(normalized_parts),
+                "parts": normalized_parts,
+            },
+        )
         return normalized_parts
 
     def _looks_like_action(self, text: str) -> bool:
@@ -2867,6 +3095,15 @@ class ConversationManager:
     ) -> tuple[list[Any], dict[str, int]]:
         aggregated: list[Any] = []
         index_map: dict[str, int] = {}
+        logger.debug(
+            "Starting citation aggregation",
+            extra={
+                "step_count": len(step_results),
+                "total_citation_candidates": sum(
+                    len(result.citations) for result in step_results
+                ),
+            },
+        )
         for result in step_results:
             for citation in result.citations:
                 key = self._citation_key(citation)
@@ -2885,6 +3122,13 @@ class ConversationManager:
                     citation["steps"] = sorted(set(steps))  # type: ignore[index]
                 except TypeError:
                     pass
+        logger.debug(
+            "Completed citation aggregation",
+            extra={
+                "unique_citations": len(aggregated),
+                "index_map_size": len(index_map),
+            },
+        )
         return aggregated, index_map
 
     @staticmethod
@@ -2896,7 +3140,15 @@ class ConversationManager:
             for key in (ConversationManager._citation_key(citation) for citation in citations)
             if key in index_map
         }
-        return sorted(indexes)
+        sorted_indexes = sorted(indexes)
+        logger.debug(
+            "Resolved citation indexes",
+            extra={
+                "citation_count": len(citations),
+                "resolved_indexes": sorted_indexes,
+            },
+        )
+        return sorted_indexes
 
     _NUMERIC_CITATION_PATTERN = re.compile(r"\[(\d+)\]")
     _CITATION_PATTERN = re.compile(r"\[(?:\d+|[a-zA-Z]+)\]")

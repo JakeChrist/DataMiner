@@ -288,18 +288,20 @@ class IngestService:
 
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
-            job = self._jobs.get(job_id)
-            if job and job.status in TaskStatus.FINAL:
-                return True
             record = self.repo.get(job_id)
             if record is None:
                 return False
-            if record["status"] in TaskStatus.FINAL:
+
+            status = record.get("status")
+            if status in TaskStatus.FINAL:
+                job = self._jobs.get(job_id)
                 if job is not None:
-                    job.status = record["status"]
+                    job.status = status
                 return True
+
             if deadline is not None and time.monotonic() >= deadline:
                 return False
+
             time.sleep(0.05)
 
     @log_call(logger=logger)

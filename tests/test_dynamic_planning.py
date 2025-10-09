@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services import ChatMessage, ConversationManager, PlanItem, StepContextBatch
+from app.services.conversation_manager import CONSOLIDATION_SYSTEM_PROMPT
 
 
 class StubLMStudioClient:
@@ -123,6 +124,54 @@ def test_dynamic_plan_notes_missing_citations() -> None:
         if not result.insufficient
     )
     assert all(turn.citations)
+
+
+def test_single_shot_context_enforces_grounding() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+
+    manager.ask(
+        "Summarize the evidence.",
+        context_snippets=["Document A: Evidence snippet."],
+    )
+
+    assert len(client.requests) == 1
+    user_message = client.requests[0]["messages"][-1]["content"]
+    assert "Context:" in user_message
+    assert "Document A: Evidence snippet." in user_message
+    assert "Use only the provided corpus context snippets" in user_message
+
+
+def test_dynamic_plan_passes_context_and_retrieval_metadata() -> None:
+    client = StubLMStudioClient()
+    manager = ConversationManager(client)
+
+    shared_context = ["Shared corpus note"]
+
+    def provider(_item, step_index: int, _total: int) -> Iterable[StepContextBatch]:
+        return _provider_for_steps([f"Step {step_index} snippet"])
+
+    manager.ask(
+        "Compare dataset A. Summarize insights.",
+        context_snippets=shared_context,
+        context_provider=provider,
+    )
+
+    first_request = client.requests[0]
+    user_message = first_request["messages"][-1]["content"]
+    assert "Context:" in user_message
+    assert shared_context[0] in user_message
+    assert "Step 1 snippet" in user_message
+    assert "Use only the provided corpus context snippets" in user_message
+
+    retrieval = first_request.get("options", {}).get("retrieval", {})
+    documents = retrieval.get("documents", [])
+    assert documents and documents[0]["text"] == "Step 1 snippet"
+
+    final_request = client.requests[-1]
+    system_prompts = [msg["content"] for msg in final_request["messages"] if msg["role"] == "system"]
+    headline = CONSOLIDATION_SYSTEM_PROMPT.strip().splitlines()[0]
+    assert any(headline in prompt for prompt in system_prompts)
 
 
 def test_plan_critic_rejects_meta_steps() -> None:

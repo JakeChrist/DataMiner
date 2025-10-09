@@ -3737,7 +3737,17 @@ class ConversationManager:
         user_content = question
         if context_snippets:
             formatted_context = "\n\n".join(context_snippets)
-            user_content = f"{question}\n\nContext:\n{formatted_context}"
+            instructions = "\n".join(
+                [
+                    "Instructions:",
+                    "- Use only the provided corpus context snippets to answer.",
+                    "- If the context lacks the necessary details, reply exactly with \"INSUFFICIENT_EVIDENCE: <brief reason>\".",
+                    "- Do not rely on outside knowledge or speculate beyond the snippets.",
+                ]
+            )
+            user_content = (
+                f"{question}\n\nContext:\n{formatted_context}\n\n{instructions}"
+            )
         messages.append({"role": "user", "content": user_content})
         return messages
 

@@ -35,10 +35,15 @@ def test_build_messages_appends_context_snippets_to_user_prompt() -> None:
 
     assert messages[0] == {"role": "system", "content": "System instructions"}
     assert messages[-1]["role"] == "user"
-    assert messages[-1]["content"].startswith("Summarise the findings")
-    assert "Context:\nDoc1: Important discovery\n\nDoc2: Follow-up validation" in messages[-1][
-        "content"
-    ]
+    content = messages[-1]["content"]
+    assert content.startswith("Summarise the findings")
+    assert "Context:\nDoc1: Important discovery\n\nDoc2: Follow-up validation" in content
+    assert (
+        "\n\nInstructions:\n- Use only the provided corpus context snippets to answer.\n"
+        "- If the context lacks the necessary details, reply exactly with \"INSUFFICIENT_EVIDENCE: <brief reason>\".\n"
+        "- Do not rely on outside knowledge or speculate beyond the snippets."
+        in content
+    )
 
 
 def test_ensure_answer_citation_markers_aligns_citations_with_sentences():

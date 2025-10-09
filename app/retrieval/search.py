@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -357,7 +358,9 @@ class SearchService:
 
         remainder = re.sub(r"/+", "/", remainder)
         normalized = prefix + remainder
-        return normalized.lower()
+        if os.name == "nt":
+            return normalized.lower()
+        return normalized
 
     @staticmethod
     def _normalize_folder(folder: str | Path | None) -> str | None:

@@ -1154,6 +1154,8 @@ class AssistantBubbleWidget(ChatBubbleWidget):
         for index, item in enumerate(self.turn.plan, start=1):
             status = (item.status or "pending").replace("_", " ")
             plan_rows.append(f"{index}. {item.description} [{status}]")
+            if item.rationale:
+                plan_rows.append(f"    ↳ {item.rationale}")
         self._plan_has_rows = bool(plan_rows)
 
         assumptions: list[str] = list(self.turn.assumptions)

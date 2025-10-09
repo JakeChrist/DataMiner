@@ -394,9 +394,8 @@ class MainWindow(QMainWindow):
         controls_header.addStretch(1)
         collapse_left = QPushButton("Collapse", controls_frame)
         collapse_left.setObjectName("collapseCorpus")
-        collapse_left.clicked.connect(
-            lambda: self.toggle_corpus_panel_action.setChecked(False)
-        )
+        collapse_left.clicked.connect(self._collapse_corpus_panel)
+        collapse_left.setToolTip("Hide the corpus panel")
         controls_header.addWidget(collapse_left)
         controls_layout.addLayout(controls_header)
 
@@ -404,24 +403,25 @@ class MainWindow(QMainWindow):
             self.add_folder_action.text(), controls_frame
         )
         add_folder_button.setObjectName("indexFolderButton")
-        add_folder_button.clicked.connect(
-            lambda _checked=False: self.add_folder_action.trigger()
-        )
+        add_folder_button.setToolTip("Index a new folder of documents")
+        add_folder_button.clicked.connect(self._on_index_folder_clicked)
         controls_layout.addWidget(add_folder_button)
 
-        add_files_button = QPushButton("Index Files…", controls_frame)
-        add_files_button.setObjectName("indexFilesButton")
-        add_files_button.clicked.connect(
-            lambda _checked=False: self.add_files_action.trigger()
+        add_files_button = QPushButton(
+            self.add_files_action.text(), controls_frame
         )
+        add_files_button.setObjectName("indexFilesButton")
+        add_files_button.setToolTip("Index specific files into the corpus")
+        add_files_button.clicked.connect(self._on_index_files_clicked)
         controls_layout.addWidget(add_files_button)
 
-        self._rescan_button = QPushButton("Rescan Indexed Folders", controls_frame)
+        self._rescan_button = QPushButton(
+            self.rescan_corpus_action.text(), controls_frame
+        )
         self._rescan_button.setObjectName("rescanCorpusButton")
         self._rescan_button.setEnabled(False)
-        self._rescan_button.clicked.connect(
-            lambda _checked=False: self.rescan_corpus_action.trigger()
-        )
+        self._rescan_button.setToolTip("Refresh the indexed folders for new or changed files")
+        self._rescan_button.clicked.connect(self._on_rescan_corpus_clicked)
         controls_layout.addWidget(self._rescan_button)
 
         controls_layout.addStretch(1)
@@ -482,6 +482,32 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_corpus)
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self._copy_chat_text)
         self._update_question_prerequisites(self._conversation_manager.connection_state)
+
+    # ------------------------------------------------------------------
+    def _collapse_corpus_panel(self) -> None:
+        """Hide the corpus panel while keeping action state in sync."""
+        if not hasattr(self, "toggle_corpus_panel_action"):
+            return
+        action = self.toggle_corpus_panel_action
+        if action.isChecked():
+            action.setChecked(False)
+        else:
+            self._set_panel_visibility(0, False)
+
+    def _on_index_folder_clicked(self) -> None:
+        """Open a folder picker to add documents to the corpus."""
+        if self.add_folder_action.isEnabled():
+            self.add_folder_action.trigger()
+
+    def _on_index_files_clicked(self) -> None:
+        """Open a file picker to add specific files to the corpus."""
+        if self.add_files_action.isEnabled():
+            self.add_files_action.trigger()
+
+    def _on_rescan_corpus_clicked(self) -> None:
+        """Rescan previously indexed folders for changes."""
+        if self.rescan_corpus_action.isEnabled():
+            self.rescan_corpus_action.trigger()
 
     # ------------------------------------------------------------------
     def _apply_splitter_preferences(self) -> None:

@@ -11,34 +11,15 @@ import sys
 import threading
 import time
 import traceback
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import get_user_config_dir
 
 LOG_FILENAME = "dataminer.log"
-MAX_BYTES = 1_048_576  # 1 MiB
-BACKUP_COUNT = 3
 
 _EXCEPTION_HOOK_INSTALLED = False
 _HOOK_LOCK = threading.Lock()
-
-class _EagerSyncRotatingFileHandler(RotatingFileHandler):
-    """A :class:`RotatingFileHandler` that fsyncs after each log record."""
-
-    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - thin wrapper
-        super().emit(record)
-        stream = getattr(self, "stream", None)
-        if stream is None:
-            return
-        try:
-            stream.flush()
-            os.fsync(stream.fileno())
-        except (OSError, ValueError):
-            # ``ValueError`` can be raised if the stream has been closed during
-            # interpreter shutdown; ``OSError`` covers platforms without fsync.
-            pass
 
 
 def setup_logging(
@@ -47,17 +28,18 @@ def setup_logging(
     level: int = logging.INFO,
     log_filename: Optional[str] = None,
 ) -> logging.Logger:
-    """Configure logging for the application and return the root logger.
+    """Configure logging using the standard :mod:`logging` machinery.
 
-    Logging output is directed to both the console and a rotating file located
-    in the user's configuration directory. This utility avoids any external
-    telemetry by keeping all logs on the local filesystem.
+    The configuration attaches both console and file handlers to the *root*
+    logger so that loggers created throughout the application inherit the
+    handlers automatically. This keeps log output live in the console while
+    still persisting it to disk.
     """
-    logger = logging.getLogger(app_name)
-    if logger.handlers:
-        return logger
 
-    logger.setLevel(level)
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        return logging.getLogger(app_name)
+
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -66,20 +48,21 @@ def setup_logging(
     config_dir = get_user_config_dir(app_name)
     log_path = Path(config_dir) / (log_filename or LOG_FILENAME)
 
-    file_handler = _EagerSyncRotatingFileHandler(
-        log_path,
-        maxBytes=MAX_BYTES,
-        backupCount=BACKUP_COUNT,
-        encoding="utf-8",
-    )
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
 
-    setattr(logger, "log_path", log_path)
+    logging.basicConfig(
+        level=level,
+        handlers=[console_handler, file_handler],
+    )
+
+    root_logger.log_path = log_path  # type: ignore[attr-defined]
+    logger = logging.getLogger(app_name)
+    logger.log_path = log_path  # type: ignore[attr-defined]
+
     logger.info(
         "Logging initialised",
         extra={

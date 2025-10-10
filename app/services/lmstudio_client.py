@@ -145,6 +145,10 @@ class LMStudioClient:
         data = self._request_json("POST", CHAT_COMPLETIONS_PATH, payload)
         response = self._parse_chat_response(data)
         logger.info(
+            "LMStudio inbound messages: %s",
+            self._summarize_response_messages(data.get("choices")),
+        )
+        logger.info(
             "LMStudio response message: %s | citations: %s",
             self._truncate_text(response.content),
             response.citations,
@@ -389,6 +393,71 @@ class LMStudioClient:
             if isinstance(raw_message.get("tool_call_id"), str):
                 summary["tool_call_id"] = raw_message["tool_call_id"]
             summaries.append(summary)
+        return summaries
+
+    @staticmethod
+    def _summarize_response_messages(
+        choices: Any,
+        *,
+        preview_length: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return a log-friendly summary of inbound LMStudio choices."""
+
+        if not isinstance(choices, Iterable):
+            return []
+
+        summaries: list[dict[str, Any]] = []
+        for index, raw_choice in enumerate(choices):
+            if not isinstance(raw_choice, dict):
+                summaries.append(
+                    {
+                        "index": index,
+                        "content": LMStudioClient._truncate_text(
+                            repr(raw_choice), limit=preview_length
+                        ),
+                    }
+                )
+                continue
+
+            message = raw_choice.get("message")
+            summary: dict[str, Any] = {
+                "index": index,
+                "finish_reason": raw_choice.get("finish_reason"),
+            }
+
+            if isinstance(message, dict):
+                role = message.get("role")
+                if isinstance(role, str):
+                    summary["role"] = role
+
+                content_preview = LMStudioClient._coerce_message_text(
+                    message.get("content")
+                )
+                summary["content"] = LMStudioClient._truncate_text(
+                    content_preview, limit=preview_length
+                )
+
+                metadata = (
+                    message.get("metadata")
+                    if isinstance(message.get("metadata"), dict)
+                    else {}
+                )
+                citations = LMStudioClient._extract_citations(
+                    raw_choice, message, metadata
+                )
+                if citations:
+                    summary["citations"] = citations
+
+                reasoning = metadata.get("reasoning")
+                if isinstance(reasoning, dict):
+                    summary["reasoning_keys"] = sorted(reasoning.keys())
+            else:
+                summary["message"] = LMStudioClient._truncate_text(
+                    repr(message), limit=preview_length
+                )
+
+            summaries.append(summary)
+
         return summaries
 
     @staticmethod

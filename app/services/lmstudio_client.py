@@ -131,6 +131,10 @@ class LMStudioClient:
         if extra_options:
             payload.update(extra_options)
         logger.info(
+            "LMStudio request messages: %s",
+            self._summarize_request_messages(payload["messages"]),
+        )
+        logger.info(
             "Dispatching LMStudio chat request",
             extra={
                 "message_count": len(payload["messages"]),
@@ -139,7 +143,15 @@ class LMStudioClient:
             },
         )
         data = self._request_json("POST", CHAT_COMPLETIONS_PATH, payload)
-        return self._parse_chat_response(data)
+        response = self._parse_chat_response(data)
+        logger.info(
+            "LMStudio response message: %s | citations: %s",
+            self._truncate_text(response.content),
+            response.citations,
+        )
+        if response.reasoning:
+            logger.debug("LMStudio response reasoning: %s", response.reasoning)
+        return response
 
     @log_call(logger=logger, include_result=True)
     def _request(
@@ -337,6 +349,90 @@ class LMStudioClient:
             if resolved:
                 return list(resolved)
         return []
+
+    @staticmethod
+    def _summarize_request_messages(
+        messages: Sequence[dict[str, Any]] | Sequence[Any],
+        *,
+        preview_length: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return a log-friendly summary of the outbound chat messages."""
+
+        summaries: list[dict[str, Any]] = []
+        for index, raw_message in enumerate(messages):
+            if not isinstance(raw_message, dict):
+                summaries.append(
+                    {
+                        "index": index,
+                        "role": None,
+                        "content": LMStudioClient._truncate_text(
+                            repr(raw_message), limit=preview_length
+                        ),
+                    }
+                )
+                continue
+
+            role = raw_message.get("role")
+            content_preview = LMStudioClient._coerce_message_text(
+                raw_message.get("content")
+            )
+            summary: dict[str, Any] = {
+                "index": index,
+                "role": role,
+                "content": LMStudioClient._truncate_text(
+                    content_preview, limit=preview_length
+                ),
+            }
+
+            if isinstance(raw_message.get("name"), str):
+                summary["name"] = raw_message["name"]
+            if isinstance(raw_message.get("tool_call_id"), str):
+                summary["tool_call_id"] = raw_message["tool_call_id"]
+            summaries.append(summary)
+        return summaries
+
+    @staticmethod
+    def _coerce_message_text(content: Any) -> str:
+        """Coerce message ``content`` into a readable string for logging."""
+
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            text = content.get("text")
+            if isinstance(text, str):
+                return text
+            try:
+                return json.dumps(content, default=str)
+            except TypeError:  # pragma: no cover - defensive
+                return repr(content)
+        if isinstance(content, Iterable):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                    continue
+                if isinstance(item, dict):
+                    item_text = item.get("text")
+                    if isinstance(item_text, str):
+                        parts.append(item_text)
+                        continue
+                    try:
+                        parts.append(json.dumps(item, default=str))
+                    except TypeError:  # pragma: no cover - defensive
+                        parts.append(repr(item))
+                    continue
+                parts.append(repr(item))
+            if parts:
+                return "".join(parts)
+        return repr(content)
+
+    @staticmethod
+    def _truncate_text(value: str, *, limit: int = 500) -> str:
+        """Return ``value`` truncated to ``limit`` characters for logs."""
+
+        if len(value) <= limit:
+            return value
+        return f"{value[: limit - 3]}..."
 
 
 __all__ = [

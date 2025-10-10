@@ -63,7 +63,10 @@ class ProgressService(QObject):
     @log_call(logger=logger)
     def start(self, task_id: str, message: str = "") -> None:
         update = ProgressUpdate(task_id=task_id, message=message, percent=0.0)
-        logger.info("Progress started", extra={"task_id": task_id, "message": message})
+        logger.info(
+            "Progress started",
+            extra={"task_id": task_id, "progress_message": message},
+        )
         self.progress_started.emit(update)
         self._dispatch(update)
 
@@ -86,7 +89,7 @@ class ProgressService(QObject):
             "Progress updated",
             extra={
                 "task_id": task_id,
-                "message": update.message,
+                "progress_message": update.message,
                 "percent": percent,
                 "indeterminate": update.indeterminate,
             },
@@ -99,7 +102,7 @@ class ProgressService(QObject):
         update = ProgressUpdate(task_id=task_id, message=message, percent=100.0)
         logger.info(
             "Progress finished",
-            extra={"task_id": task_id, "message": message},
+            extra={"task_id": task_id, "progress_message": message},
         )
         self.progress_finished.emit(update)
         self._dispatch(update)
@@ -110,7 +113,11 @@ class ProgressService(QObject):
 
         logger.info(
             "Toast notification requested",
-            extra={"message": message, "level": level, "duration_ms": duration_ms},
+            extra={
+                "toast_message": message,
+                "level": level,
+                "duration_ms": duration_ms,
+            },
         )
         self.toast_requested.emit(message, level, duration_ms)
 

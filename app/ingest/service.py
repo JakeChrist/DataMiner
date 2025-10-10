@@ -351,7 +351,11 @@ class IngestService:
         self._emit(job.job_id)
         logger.info(
             "Created ingest job",
-            extra={"job_id": job.job_id, "job_type": job_type, "message": message},
+            extra={
+                "job_id": job.job_id,
+                "job_type": job_type,
+                "job_message": message,
+            },
         )
         return job.job_id
 
